@@ -1,0 +1,258 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    SecondRevision - Direct3D 12 render device for Deus Ex: Revision (engine 1.112fm).
+
+    Build constraints are dictated by the game, not by taste (see docs/spec-01 section 6):
+      - Win32 only: the game is a 32-bit process
+      - packing   : NOT set globally. The SDK needs 4-byte packing but the
+                    Windows/D3D12 headers require the default; Pch.h wraps only
+                    the engine includes in a pack region. See Pch.h.
+      - /Zc:wchar_t- : the engine's TCHAR handling predates native wchar_t
+    Changing any of these produces a DLL that loads and then corrupts memory.
+  -->
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7B2E9D51-4C63-4A18-B0F5-2D9A6C31E874}</ProjectGuid>
+    <RootNamespace>RevisionDX12</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)'==''">v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <SdkRoot>$(MSBuildThisFileDirectory)..\..\external\Games\DeusEx\</SdkRoot>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>SecondRevision</TargetName>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(IntDir);$(SdkRoot)Core\Inc;$(SdkRoot)Engine\Inc;$(ProjectDir)..\..\external\FidelityFX-SDK\include;$(ProjectDir)..\..\external\AGS_SDK\ags_lib\inc;$(ProjectDir)..\..\external\NVAPI;$(ProjectDir)..\..\external\IGCL\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;DEUSEX;NOMINMAX;_REALLY_WANT_DEBUG;$(RdxDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <TreatWChar_tAsBuiltInType>false</TreatWChar_tAsBuiltInType>
+      <ConformanceMode>false</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(SdkRoot)Core\Lib\Core.lib;$(SdkRoot)Engine\Lib\Engine.lib;d3d12.lib;dxgi.lib;dxguid.lib;d3dcompiler.lib;psapi.lib;$(ProjectDir)..\..\external\FidelityFX-SDK\lib\ffx_fsr3upscaler_x86.lib;$(ProjectDir)..\..\external\FidelityFX-SDK\lib\ffx_backend_dx12_x86.lib;$(ProjectDir)..\..\external\NVAPI\x86\nvapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <Link>
+      <AdditionalDependencies>$(ProjectDir)..\..\external\AGS_SDK\ags_lib\lib\amd_ags_x86_2026_MDd.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <Link>
+      <AdditionalDependencies>$(ProjectDir)..\..\external\AGS_SDK\ags_lib\lib\amd_ags_x86_2026_MD.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClInclude Include="Pch.h" />
+    <ClInclude Include="Backend.h" />
+    <ClInclude Include="Log.h" />
+    <ClInclude Include="ViewGeneration.h" />
+    <ClInclude Include="SolidPass.h" />
+    <ClInclude Include="PomMaps.h" />
+    <ClInclude Include="TextureCache.h" />
+    <ClInclude Include="RenderDevice.h" />
+    <ClInclude Include="FinalPass.h" />
+    <ClInclude Include="PresentWatch.h" />
+    <ClInclude Include="GpuConvert.h" />
+    <ClInclude Include="Volumetrics.h" />
+    <ClInclude Include="MotionBlur.h" />
+    <ClInclude Include="BeamBounce.h" />
+    <ClInclude Include="FilmLook.h" />
+    <ClInclude Include="Bloom.h" />
+    <ClInclude Include="FieldVolume.h" />
+    <ClInclude Include="HoloShell.h" />
+    <ClInclude Include="FogRooms.h" />
+    <ClInclude Include="ShadowMaps.h" />
+    <ClInclude Include="DustShader.h" />
+    <ClInclude Include="GrassShader.h" />
+    <ClInclude Include="TreeGen.h" />
+    <ClInclude Include="TreeShader.h" />
+    <ClInclude Include="RenderMath.h" />
+    <ClInclude Include="Fsr3Pass.h" />
+    <ClInclude Include="HostUpscale.h" />
+    <ClInclude Include="HostRays.h" />
+    <ClInclude Include="FramePacer.h" />
+    <ClInclude Include="AntiLag2.h" />
+    <ClInclude Include="Reflex.h" />
+    <ClInclude Include="CpuSampler.h" />
+    <ClInclude Include="ReflexLink.h" />
+    <ClInclude Include="..\Host64\Host64Link.h" />
+    <ClInclude Include="..\Host64\Host64Protocol.h" />
+    <ClInclude Include="CrashLog.h" />
+    <ClInclude Include="SystemReport.h" />
+    <ClInclude Include="RtPass.h" />
+    <ClInclude Include="RenderLimits.h" />
+    <ClInclude Include="ShaderCache.h" />
+    <ClInclude Include="DepthOfField.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Backend.cpp" />
+    <ClCompile Include="Log.cpp" />
+    <ClCompile Include="SolidPass.cpp" />
+    <ClCompile Include="PomMaps.cpp" />
+    <ClCompile Include="TextureCache.cpp" />
+    <ClCompile Include="RenderDevice.cpp" />
+    <ClCompile Include="FinalPass.cpp" />
+    <ClCompile Include="PresentWatch.cpp" />
+    <ClCompile Include="GpuConvert.cpp" />
+    <ClCompile Include="Volumetrics.cpp" />
+    <ClCompile Include="MotionBlur.cpp" />
+    <ClCompile Include="BeamBounce.cpp" />
+    <ClCompile Include="FilmLook.cpp" />
+    <ClCompile Include="Bloom.cpp" />
+    <ClCompile Include="FieldVolume.cpp" />
+    <ClCompile Include="HoloShell.cpp" />
+    <ClCompile Include="FogRooms.cpp" />
+    <ClCompile Include="ShadowMaps.cpp" />
+    <ClCompile Include="Fsr3Pass.cpp" />
+    <ClCompile Include="HostUpscale.cpp" />
+    <ClCompile Include="HostRays.cpp" />
+    <ClCompile Include="FramePacer.cpp" />
+    <ClCompile Include="..\Host64\Host64Link.cpp" />
+    <ClCompile Include="VrrProbe.cpp" />
+    <ClCompile Include="CpuSampler.cpp" />
+    <ClCompile Include="ReflexLink.cpp" />
+    <ClCompile Include="WaterProbe.cpp" />
+    <ClCompile Include="CrashLog.cpp" />
+    <ClCompile Include="SystemReport.cpp" />
+    <ClCompile Include="RtPass.cpp" />
+    <ClCompile Include="ShaderCache.cpp" />
+    <ClCompile Include="DepthOfField.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="SecondRevision.int" />
+    <None Include="ShadowFactorSurface.hlsli" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The shadow factor (ShadowFactor.hlsl, and the statements it includes): its text goes into the DLL for the maps'
+         factor, compiled at run time like every other pass (FinalPass.cpp). The rays' factor and occlusion of the same
+         source (RDX_RT=1) are the 64-bit host's to build (Host64.vcxproj). -->
+    <CustomBuild Include="ShadowFactor.hlsl">
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\..\scripts\embed-text.ps1" -Out "$(IntDir)ShadowFactorText.h" -Pairs "GShadowFactorText=%(FullPath);GShadowFactorSurfaceText=$(ProjectDir)ShadowFactorSurface.hlsli"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)ShadowFactorSurface.hlsli;$(ProjectDir)RenderLimits.h;$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
+      <Outputs>$(IntDir)ShadowFactorText.h</Outputs>
+      <Message>Shader: ShadowFactor.hlsl (its text)</Message>
+    </CustomBuild>
+    <!-- The geometry pass's shaders: one source for two builds (SolidPass.hlsl). Its text goes into the DLL, compiled at run
+         time like every other pass (SolidPass.cpp); and dxc makes the stages of the runs on rays of it (RDX_RT=1), as
+         DXIL - the run-time compiler (FXC) knows no shader model 6, and the SDK's dxc signs what it builds, with the
+         dxil.dll beside it: nothing is shipped with the game for it. The stages before the pixel shader, the water's
+         first go over a run, and for each run on rays - the water's, the sludge mirror layer's, the splashes', the
+         glass mirror layer's, the panes' - the pixel shader that writes its rays down for the 64-bit host
+         (RDX_RT_ASK=1) and the one that reads the host's answers (RDX_RT_HOST=1). -->
+    <CustomBuild Include="SolidPass.hlsl">
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\..\scripts\embed-text.ps1" -Out "$(IntDir)SolidPassText.h" -Pairs "GSolidPassText=%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T vs_6_5 -E VSWater -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtVS.h" -Vn GSolidPassRtVS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T hs_6_5 -E HSWater -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHS.h" -Vn GSolidPassRtHS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ds_6_5 -E DSWater -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtDS.h" -Vn GSolidPassRtDS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterMark -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtMarkPS.h" -Vn GSolidPassRtMarkPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterMarkLit -D RDX_RT=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtMarkPSLit.h" -Vn GSolidPassRtMarkPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T vs_6_5 -E FlashVS -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtFlashVS.h" -Vn GSolidPassRtFlashVS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T vs_6_5 -E VSMain -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtMainVS.h" -Vn GSolidPassRtMainVS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSGlassMirrorAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskGlassMirrorPS.h" -Vn GSolidPassRtAskGlassMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSGlassMirror -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostGlassMirrorPS.h" -Vn GSolidPassRtHostGlassMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSGlassMirrorLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostGlassMirrorPSLit.h" -Vn GSolidPassRtHostGlassMirrorPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWater -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostPS.h" -Vn GSolidPassRtHostPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostPSLit.h" -Vn GSolidPassRtHostPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskPS.h" -Vn GSolidPassRtAskPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSludgeMirror -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostSludgeMirrorPS.h" -Vn GSolidPassRtHostSludgeMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSludgeMirrorLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostSludgeMirrorPSLit.h" -Vn GSolidPassRtHostSludgeMirrorPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSludgeMirrorAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskSludgeMirrorPS.h" -Vn GSolidPassRtAskSludgeMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSplash -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostSplashPS.h" -Vn GSolidPassRtHostSplashPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSplashLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostSplashPSLit.h" -Vn GSolidPassRtHostSplashPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSSplashAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskSplashPS.h" -Vn GSolidPassRtAskSplashPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterMarkAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskMarkPS.h" -Vn GSolidPassRtAskMarkPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSPaneKeep -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostPaneKeepPS.h" -Vn GSolidPassRtHostPaneKeepPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSPaneKeepAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskPaneKeepPS.h" -Vn GSolidPassRtAskPaneKeepPS "%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)RenderLimits.h;$(ProjectDir)RayListSlots.hlsli;$(ProjectDir)RtTables.hlsli;$(ProjectDir)RtLampLight.hlsli;$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
+      <Outputs>$(IntDir)SolidPassText.h;$(IntDir)SolidPassRtVS.h;$(IntDir)SolidPassRtHS.h;$(IntDir)SolidPassRtDS.h;$(IntDir)SolidPassRtMarkPS.h;$(IntDir)SolidPassRtMarkPSLit.h;$(IntDir)SolidPassRtFlashVS.h;$(IntDir)SolidPassRtMainVS.h;$(IntDir)SolidPassRtAskGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPSLit.h;$(IntDir)SolidPassRtHostPS.h;$(IntDir)SolidPassRtHostPSLit.h;$(IntDir)SolidPassRtAskPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPSLit.h;$(IntDir)SolidPassRtAskSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSplashPS.h;$(IntDir)SolidPassRtHostSplashPSLit.h;$(IntDir)SolidPassRtAskSplashPS.h;$(IntDir)SolidPassRtAskMarkPS.h;$(IntDir)SolidPassRtHostPaneKeepPS.h;$(IntDir)SolidPassRtAskPaneKeepPS.h</Outputs>
+      <Message>Shader: SolidPass.hlsl (its text, and the DXIL of the runs on rays: each one's asking and its reading of the 64-bit host's answers)</Message>
+    </CustomBuild>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

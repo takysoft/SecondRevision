@@ -1,0 +1,9 @@
+[Public]
+Object=(Name=SecondRevision.RevisionRenderDevice,Class=Class,MetaClass=Engine.RenderDevice,Autodetect=d3d12.dll)
+Preferences=(Caption="Rendering",Parent="Advanced Options")
+Preferences=(Caption="SecondRevision(DX12)",Parent="Rendering",Class=SecondRevision.RevisionRenderDevice,Immediate=True)
+
+[RevisionRenderDevice]
+ClassCaption="SecondRevision(DX12)"
+AskInstalled=Do you want to use the SecondRevision renderer?
+AskUse=

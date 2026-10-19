@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    SecondRevisionHost64.exe - the 64-bit host (docs/terv-fsr4.md). The libraries it hosts exist only as 64-bit DLLs, so
+    this is the one x64 program of the project. The C runtime is linked in statically: a player's machine needs nothing
+    installed for it. Built beside the renderer's DLL, and shipped beside it.
+  -->
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3E8B5F21-9C47-4A6D-B2E0-7D14C6A93F58}</ProjectGuid>
+    <RootNamespace>SecondRevisionHost64</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)'==''">v145</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\Release\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\host64\</IntDir>
+    <TargetName>SecondRevisionHost64</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <!-- _WINDOWS: the FSR API's loader header only builds for a platform it knows by this name. -->
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\..\external\FidelityFX-SDK-2.3\Kits\FidelityFX\api\include;$(MSBuildThisFileDirectory)..\..\external\FidelityFX-SDK-2.3\Kits\FidelityFX\upscalers\include;$(MSBuildThisFileDirectory)..\..\external\FidelityFX-SDK-2.3\Kits\FidelityFX\framegeneration\include;$(MSBuildThisFileDirectory)..\..\external\DLSS-310.9.1\include;$(MSBuildThisFileDirectory)..\..\external\XeSS-SDK\3.0.2\inc;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <!-- A window subsystem with no window: started with CREATE_NO_WINDOW, and never a console that flashes. -->
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>wmainCRTStartup</EntryPointSymbol>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- NGX, for the DLSS backend: the library for the static C runtime (the DLSS SDK's _s), and version.lib for the
+           DLSS DLL's version - delay-loaded, so that the host chooses which version.dll it gets (TakeVersionDll). -->
+      <AdditionalDependencies>$(MSBuildThisFileDirectory)..\..\external\DLSS-310.9.1\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib;version.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>version.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+    <!-- AMD's signed DLLs beside the host, where it loads them from - as they are shipped; NVIDIA's DLSS models - the
+         upscaler's and frame generation's - where NGX looks for them; and Intel's XeSS library, loaded at run time. -->
+    <PostBuildEvent>
+      <Command>for %%D in (loader upscaler framegeneration) do copy /Y "$(MSBuildThisFileDirectory)..\..\external\FidelityFX-SDK-2.3\Kits\FidelityFX\signedbin\amd_fidelityfx_%%D_dx12.dll" "$(OutDir)" &gt;nul
+for %%D in (nvngx_dlss nvngx_dlssg) do copy /Y "$(MSBuildThisFileDirectory)..\..\external\DLSS-310.9.1\lib\Windows_x86_64\rel\%%D.dll" "$(OutDir)" &gt;nul
+copy /Y "$(MSBuildThisFileDirectory)..\..\external\XeSS-SDK\3.0.2\bin\libxess.dll" "$(OutDir)" &gt;nul
+copy /Y "$(MSBuildThisFileDirectory)..\..\external\XeSS-SDK\3.0.2\LICENSE.txt" "$(OutDir)libxess-LICENSE.txt" &gt;nul
+copy /Y "$(MSBuildThisFileDirectory)..\..\external\XeSS-SDK\3.0.2\third-party-programs.txt" "$(OutDir)libxess-third-party-programs.txt" &gt;nul</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="Host64Main.cpp" />
+    <ClCompile Include="Host64Fsr.cpp" />
+    <ClCompile Include="Host64Dlss.cpp" />
+    <ClCompile Include="Host64Xess.cpp" />
+    <ClCompile Include="Host64Rays.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Host64Protocol.h" />
+    <ClInclude Include="Host64Camera.h" />
+    <ClInclude Include="Host64Fsr.h" />
+    <ClInclude Include="Host64Dlss.h" />
+    <ClInclude Include="Host64Xess.h" />
+    <ClInclude Include="Host64Rays.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The rays' passes (Host64Rays.cpp), as DXIL: built by the Windows SDK's own dxc into one header an entry point,
+         which the host carries. Inline ray tracing is shader model 6.5; the SDK's dxc signs what it builds, with the
+         dxil.dll beside it. -->
+    <CustomBuild Include="RayList.hlsl">
+      <Command>"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T cs_6_5 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)RayListCS.h" -Vn GRayListCS "%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)..\RevisionDX12\RenderLimits.h;$(ProjectDir)..\RevisionDX12\RayListSlots.hlsli;$(ProjectDir)..\RevisionDX12\RtTables.hlsli;$(ProjectDir)..\RevisionDX12\RtLampLight.hlsli</AdditionalInputs>
+      <Outputs>$(IntDir)RayListCS.h</Outputs>
+      <Message>DXIL: RayList.hlsl</Message>
+    </CustomBuild>
+    <!-- The shadows' factor and the occlusion: the RENDERER's own source, built here exactly as the renderer builds its
+         RT factor (RevisionDX12.vcxproj) - where the renderer's process cannot trace, this one runs the same shader. -->
+    <CustomBuild Include="..\RevisionDX12\ShadowFactor.hlsl">
+      <Command>"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T vs_6_5 -E VSMain -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)ShadowFactorRtVS.h" -Vn GShadowFactorRtVS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSMain -D RDX_RT=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)ShadowFactorRtPS.h" -Vn GShadowFactorRtPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E AoPS -D RDX_RT=1 -D RDX_RT_AO=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)ShadowFactorRtAoPS.h" -Vn GShadowFactorRtAoPS "%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)..\RevisionDX12\ShadowFactorSurface.hlsli;$(ProjectDir)..\RevisionDX12\RenderLimits.h</AdditionalInputs>
+      <Outputs>$(IntDir)ShadowFactorRtVS.h;$(IntDir)ShadowFactorRtPS.h;$(IntDir)ShadowFactorRtAoPS.h</Outputs>
+      <Message>DXIL: ShadowFactor.hlsl (the RT factor's and the RT occlusion's, for the host)</Message>
+    </CustomBuild>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

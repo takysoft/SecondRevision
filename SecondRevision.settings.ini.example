@@ -1,0 +1,462 @@
+; ---------------------------------------------------------------------------
+; SecondRevision - the Direct3D 12 renderer's settings
+; ---------------------------------------------------------------------------
+; This file was written by the renderer on its first start.
+; Setting changes are also dynamically saved here every time.
+;
+; Introduction
+; This is an attempt to create a DirectX 12 renderer for the game.
+; There are visual improvements in this renderer, but you
+; are not obligated to use them. The Vanilla preset exists
+; exactly for this reason.
+; Ideally, the ONLY thing you want to edit here is the Preset.
+; Recommended is awesome, but set it to INeverAskedForThis
+; for that extra oomph... (strong GPU required)
+;
+; Even though the renderer works with the original game too,
+; I highly recommend installing the Revision mod for the game.
+; It is an awesome improvement for the game, including stability
+; and compatibility.
+; It does include modified artwork, but HDTP (new models), New Vision
+; and the modified Revision levels can all be turned off in the game,
+; if you choose so. So please install the Revision mod!
+; It can be found on GOG and Steam too!
+;
+; Requirements:
+; - Windows 11 (it may work on older ones too, but I will never test it,
+;   and I don't care... don't use an OS without proper support!)
+; - A DirectX 12 capable graphics card (this is a DX12 renderer, after all).
+; - An HDR display for the HDR mode.
+; - A ray tracing capable GPU for the RT options.
+; - The 64-bit companion app for the RT options, FSR4, DLSS, XeSS and
+;   frame generation.
+;
+; In case of a startup crash, try:
+; Preset=Vanilla
+; HdtpHoloFix=Off
+; RevisionSplashScreenFix=Off
+; LoadFix=Off
+; MonitorFix=Off
+; DPIFix=Off
+;
+; If all else fails, try: SafeMode=On
+;
+; In case of an error, it would help me a LOT if you could:
+; - set LogLevel=Debug,
+; - reproduce the crash or the bug,
+; - send the log files, the savegames and a description of how to
+;   reproduce the issue to takysoft@gmail.com.
+;
+; PLEASE NOTE!
+; The project is mainly being developed on an RX 9070 XT.
+; It may not even start on an NVIDIA card
+; (the last time I tested that was weeks ago).
+; I do not accept NVIDIA-related issues yet!
+;
+; Again, please note! For certain features like FSR4, DLSS and
+; ray tracing, the renderer needs to start a 64-bit companion app.
+; Windows may block this companion from starting.
+; As of now, the only solution I can give you is to
+; disable "Smart App Control".
+; Just search for "disable smart app control",
+; and you'll find ways to do it.
+;
+; Also please note! Although this game is old, the renderer adds features
+; that can be demanding for your hardware, and they are not perfectly
+; optimized either. Some areas are even more demanding: the Ocean Lab,
+; for example, is full of glass windows, and RT reflections on those
+; decimate the FPS :D What you can try instead of turning those off:
+; - select a lower Upscale setting, Performance for example,
+; - try FrameGeneration together with AntiLag (Reflex on NVIDIA).
+;
+; - Why a separate INI file?
+; - Because the game rewrites its own ini files, and loses the order of
+;   the settings and every comment in them.
+
+[SecondRevision.RevisionRenderDevice]
+
+; DebugKey (default ScrollLock)
+;   The key that opens the renderer's own menu.
+;   For a keyboard without Scroll Lock, you can set this
+;   to Delete or Insert, or whichever key you want.
+DebugKey=ScrollLock
+
+; Preset (default Recommended)
+;   Vanilla | Recommended | INeverAskedForThis | Custom
+;   Visual setting presets. Setting it to Vanilla, Recommended or
+;   INeverAskedForThis makes the renderer overwrite every setting below
+;   that is not marked as independent of the presets.
+;
+;     Vanilla             The original, stock image - or at least that is
+;                         the aim. For the fans of the original look,
+;                         and for slower computers.
+;
+;     Recommended         The game will look much nicer, but hopefully it
+;                         will stay reasonably fast and well playable.
+;
+;     INeverAskedForThis  Pretty much the best the renderer can do:
+;                         ray-traced reflections, shadows and AO,
+;                         and proper 3D displacement mapping.
+;                         You are going to need a strong GPU, though...
+;
+;     Custom              Whatever you set in the settings below.
+Preset=Recommended
+
+; GAME FIXES! (independent of the presets)
+; These 5 fixes are hacky workarounds for some bugs of the original game.
+; Turn them off if needed, but they should generally work okay.
+;
+; HdtpHoloFix (default On)   -   Off | On | Old
+;   Somehow, the new HDTP models look weird when they are used as holograms.
+;   This option fixes that. In case of trouble, just turn it off.
+;   (The Old setting just loads the non-HDTP models for the holograms.)
+HdtpHoloFix=On
+
+; RevisionSplashScreenFix (default On)
+;   The Revision mod has awesome splash screens when you load a map or a
+;   savegame. They were designed for a 720p screen, though, and on higher
+;   resolutions they look bad. On a 4K screen they don't even show up.
+;   This fixes that, and they are shown in their awesome 720p glory :)
+;   I was thinking long and hard whether to default it to On or Off, as
+;   1: the Revision mod may fix this itself one day... and that may clash
+;      with this fix,
+;   2: it kinda involves lying to the game engine about the current
+;      resolution...
+;   But for now it works fantastically, so I left it On...
+RevisionSplashScreenFix=On
+
+; LoadFix (default On)
+;   Sometimes the game can crash when you load a level.
+;   It's rare, and it happens when you load a save after loading another
+;   one, and the two saves are from two different playthroughs: some item
+;   names cannot be overwritten, and the game crashes.
+;   This fix forces a memory flush while a game is loading.
+;   It may make loading a tiny bit slower, but also a tiny bit more stable.
+;   Unless it causes issues, I recommend using it.
+LoadFix=On
+
+; DPIFix (default On)
+;   In borderless windowed mode (recommended), Windows' display scaling
+;   stretches the game, and it looks blurry.
+;   I cannot make the game scaling-aware, so Windows' scaling needs to be
+;   turned off for it. When the fix is active, it does exactly that:
+;   it adds the needed Windows registry entry for the game.
+;   A rather bothersome sign on the screen will then kindly ask you
+;   to restart the game for it to take effect.
+DPIFix=On
+
+; MonitorFix (default On)
+;   The game was not designed for multi-monitor setups.
+;   With this fix, the game always opens on the main monitor.
+;   (Without it... it was... crashy, and it sometimes started on
+;   the wrong one, depending on the resolutions.)
+;   You can switch monitors properly in the renderer's menu
+;   (in a borderless window).
+MonitorFix=On
+
+;---------------------------------------------------------
+; RENDERING OPTIONS
+;---------------------------------------------------------
+; Unless stated otherwise, these lines are only read when the preset is Custom.
+
+; AntiAliasing (default Auto)
+;   Auto | Off | FSR3 | FSR4 | DLSS | XeSS | FXAA | SMAA | SSAA4X | SSAA9X
+;        | SSAA16X | MSAA2X | MSAA4X | MSAA8X | MSAA16X
+;
+;   You have options to experiment with, but generally you should stick to Auto.
+;
+;     Auto          This switches to FSR4 on compatible AMD cards, to DLSS on
+;                   compatible NVIDIA cards, and to FSR3 in any other case.
+;     FSR3          AMD's FSR 3.1, built into the renderer. It should work on
+;                   any DirectX 12 capable card.
+;     FSR4          AMD's own FSR DLLs, included. Please note: the 64-bit
+;                   companion app is used to talk to these 64-bit DLLs.
+;     DLSS          NVIDIA's DLSS, included. Please note: the 64-bit companion
+;                   app is used to talk to these 64-bit DLLs.
+;     XeSS          Intel's XeSS, on any card that runs it (most recent ones),
+;                   through the 64-bit companion app as well.
+;   Where FSR4, DLSS or XeSS cannot run, FSR3 is the fallback method.
+;   The other options work, but they are not recommended.
+AntiAliasing=Auto
+
+; Upscale (default NativeAA)   -   NativeAA | Quality | Balanced | Performance
+;   These only work with FSR3, FSR4, DLSS and XeSS.
+;   NativeAA doesn't scale, it only does antialiasing (best quality).
+;   Quality, Balanced and Performance draw the scene
+;   1.5,     1.7 and      2 times smaller each way, for speed.
+Upscale=NativeAA
+
+; HDR (default 10bitSDR)   -   Off | 10bitSDR | On
+;   Uses what the display is capable of. HDR falls back to 10bitSDR if the
+;   display is not HDR capable, and 10bitSDR falls back to Off (which is
+;   technically 8-bit SDR).
+;   Please note: HDR is not thoroughly tested, as only my TV is HDR ready,
+;   and I don't play shooters on my TV :D
+;   The HDR mode is not a true re-rendering of the whole scene; it is just an
+;   improvement on the darkening compensation (more on this at the shadows),
+;   but it can look good, according to the tests I've run.
+HDR=10bitSDR
+
+; FsrSharpness (default 0.5)
+;   Independent of the presets: they don't write this,
+;   and neither should you. Don't mess with it unless you have a good reason.
+FsrSharpness=0.5
+
+; FrameGeneration (default Off)
+;   Only works with FSR4 or DLSS, on compatible hardware.
+;   After every rendered frame, it uses AMD's or NVIDIA's own method to create
+;   another one. Pros: more FPS. Cons: input lag.
+;   The input lag can be partly mitigated with AntiLag (see below).
+FrameGeneration=Off
+
+; AntiLag (default Off)
+;   On | Off. The graphics driver's help against the mouse's delay: AMD Radeon
+;   Anti-Lag 2 on AMD's cards (the RX 5000s and later, driver 24.7.1 or later),
+;   NVIDIA Reflex on NVIDIA's. At the end of each frame the driver holds the
+;   game back until the graphics card is nearly through, so the mouse is read
+;   as late as it can be and the frame made from it does not wait behind
+;   others. It helps where the card is the slower one; it can cost a few frames
+;   a second. Where the driver has neither, it does nothing.
+AntiLag=Off
+
+; DebugReadout (default Off)   -   Off | FPS | On
+;   Independent of the presets. Shows all kinds of information on the screen
+;   that can be useful if you have some issues to debug, or if you are a
+;   modder. The FPS mode only shows the FPS :)
+DebugReadout=Off
+
+; BorderlessWindow (default On)
+;   Independent of the presets. Runs the game in a borderless window - this is
+;   the modern option. It makes Alt+Tab easy, lets other apps' notifications
+;   show, etc.
+BorderlessWindow=On
+
+; ExclusiveFullscreen (default Off)
+;   Independent of the presets. In fullscreen, it puts the swap chain into
+;   DXGI's own fullscreen state, the way the stock renderer does. Ignored
+;   while BorderlessWindow is On.
+ExclusiveFullscreen=Off
+
+; GpuTextureConvert (default On)
+;   Independent of the presets. Converts big palettised textures on the GPU
+;   instead of the CPU. The result is identical byte for byte; this only
+;   moves the work.
+GpuTextureConvert=On
+
+; GPU (default Auto)
+;   Independent of the presets. Which graphics card the renderer runs on.
+;   Auto selects Windows' default high-performance card (so the better one
+;   on a laptop). You can give a number (1, 2, 3...) or a part of the card's
+;   name too - SecondRevision.log lists the cards at its start. Auto should
+;   work just fine, though.
+GPU=Auto
+
+; FPSLimit (default Auto)   -   Off | Auto | a number (60, for example)
+;   Generally, you should stick with Auto. It detects your display's maximum
+;   refresh rate and runs the game a bit under it, to make sure VRR
+;   (FreeSync/G-Sync) works fine.
+FPSLimit=Auto
+
+; VSync (default Off)
+;   Prevents screen tearing, but adds input lag. I find it obsolete with VRR,
+;   but if your display lacks FreeSync/G-Sync, you may want to turn it on
+;   (or get a new monitor... VRR is really a basic feature now).
+VSync=Off
+
+;---------------------------------------------------------
+; VISUAL IMPROVEMENTS!
+;---------------------------------------------------------
+; Unless stated otherwise, these lines are only read when the preset is Custom.
+
+; ShadowQuality (default High)
+;   Off | Low | Medium | High | RTLow | RTMedium | RTHigh
+;   This one adds shadows to the game. Please note that the game was not
+;   designed to have shadows: adding them on top of it makes it darker.
+;   We compensate for that by making the light sources stronger or, if that
+;   is not enough, by reducing the shadows' strength a bit. The compensation
+;   runs dynamically all the time.
+;   The settings starting with 'RT' use ray tracing. These shadows look a bit
+;   better, but they need RT capable hardware and the 64-bit companion app.
+;   Where RT cannot be used, the fallback is the normal shadow of the same
+;   level (RTLow -> Low, RTMedium -> Medium, RTHigh -> High).
+;   Low, Medium and High work with the 10, 14 and 20 closest* light sources;
+;   the farther half of them does not get full strength, to avoid sudden
+;   flashes. Some flashing is sadly inevitable while walking; High mitigates
+;   it the most. Adding even more light sources actually darkens the image
+;   too much, so High really is the best option here.
+;   (* see ShadowVerticalWeight below)
+ShadowQuality=High
+
+; ShadowVerticalWeight (default 2.0, clamped to 1..8)
+;   Independent of the presets. The game doesn't write this, and neither
+;   should you. When the shadows look for the closest light sources, a
+;   light's height difference counts this many times its horizontal
+;   distance, so the lights on your own floor come first. (The light sources
+;   above or below you are usually upstairs or downstairs, and they should
+;   not count that much.)
+ShadowVerticalWeight=2.0
+
+; AmbientOcclusion (default SSAO)   -   Off | SSAO | RT
+;   Light doesn't get into corners that much - like that bouncing DVD logo on
+;   your TV :D This creates those shadows, and makes the look more realistic.
+;     SSAO  A good solution, it works on all computers.
+;     RT    The ray-traced solution. Nicer. It needs RT capable hardware and
+;           the 64-bit companion app; where it cannot run, SSAO runs instead.
+AmbientOcclusion=SSAO
+
+; WaterQuality (default High)   -   Off | Low | High
+;   This one gives you much better looking 3D water, with waves.
+;   It also replaces some other water sources, like fountains.
+;   Raindrops interact with the waves too!
+;   The High option also gives you caustics: an imitation of the light rays
+;   on the bottom of the water. It looks really nice!
+WaterQuality=High
+
+; EndlessWater (default On)
+;   With reflections, the water looks nice, but the end of the level is
+;   painfully visible. This renders the water all the way to the horizon.
+;   Originally, the level ends with an ugly black bar on the water; this
+;   removes that too. Visually only: you still can't swim any farther.
+EndlessWater=On
+
+; Reflections (default High)   -   Default | High | RTHalf | RT
+;   Adds some extra reflections to the game. The game has reflections on
+;   mirrors and floors by default; this adds reflections to the water and to
+;   glass surfaces too. Glass surfaces only get reflections in the ray tracing
+;   modes. In RTHalf mode, only 1 of every 4 pixels gets its own reflection,
+;   and the other 3 share it, but it looks pretty close to the RT mode, with
+;   much better performance. The RT modes need RT capable hardware and the
+;   64-bit companion app; without them, High runs.
+Reflections=High
+
+; Geometry (default POM)   -   Off | POM | DisplacementMapping
+;   Turns flat 2D surfaces into 3D ones.
+;   Please note! This only works with the "New Vision" textures, as I have
+;   only included height maps for those. The reasons:
+;   - only those have a resolution where this makes sense,
+;   - the New Vision textures' licence allowed me to make height maps of them.
+;
+;   POM: Parallax Occlusion Mapping
+;   This draws the flat textures with an awesome 3D depth effect, while the
+;   surfaces themselves stay flat: look at them from the side, and you'll see
+;   they are still 2D, with that 'sunken' 3D effect.
+;
+;   DisplacementMapping
+;   This one actually creates new 3D geometry. I think it looks even better,
+;   but one could argue, as it has to 'go down' at the edges of the textures.
+;   It requires more calculations, and it lowers your FPS more.
+Geometry=POM
+
+; SoftParticles (default On)
+;   Smoke, steam and fire are flat pictures (sprites) standing in the air.
+;   Where one cuts into the floor or a wall, it ends in a straight line,
+;   which looks really bad. This fixes that by fading the sprites out there.
+SoftParticles=On
+
+; Volumetrics (default On)
+;   This gives you volumetric 3D smoke and gas.
+;   They look nice, but they take a toll on your FPS.
+Volumetrics=On
+
+; DepthOfField (default On)
+;   Blurs the parts of the screen that are out of focus.
+;   It only takes effect in conversations! It looks nice.
+DepthOfField=On
+
+; Fire3D (default On)
+;   Replaces the game's own fire and plasma effects with
+;   new volumetric 3D ones. They look better.
+Fire3D=On
+
+; Grass3D (default High)   -   Off | Low | Medium | High
+;   Procedurally generated grass. High has more grass :)
+Grass3D=High
+
+; Trees3D (default On)
+;   Procedurally generated trees. They look nice :)
+Trees3D=On
+
+; Wind (default On)
+;   A wind effect that interacts with the trees and the grass, and gives you
+;   floating dust particles in the air.
+Wind=On
+
+; Fog (default Fixed)   -   Original | Fixed
+;   Fog is buggy in the original game: it goes through walls, and its shading
+;   is sometimes off. This fixes that.
+Fog=Fixed
+
+; ForceField (default 3D)   -   Original | 3D
+;   Gives the game nice 3D force fields. They are pretty far off from the
+;   original force fields, but they look nice, and I worked so-so many
+;   hours on them :D
+ForceField=3D
+
+; Flashlight (default Fixed)   -   Original | Fixed | Everybody
+;   Replaces the game's original, buggy flashlight with a new one that casts
+;   a real beam. 'Everybody' also gives flashlights to the other soldiers
+;   when they are in combat mode.
+Flashlight=Fixed
+
+;---------------------------------------------------------
+; USELESS MORONIC STUFF!
+;---------------------------------------------------------
+; Unless stated otherwise, these lines are only read when the preset is Custom.
+
+; GodRays (default Off)
+;   Under implementation and testing, don't use!
+GodRays=Off
+
+; MotionBlur (default Off)
+;   Dishonor!
+MotionBlur=Off
+
+; ChromaticAberration (default Off)
+;   DISHONOR!
+ChromaticAberration=Off
+
+; Vignette (default Off)
+;   Dishonor on you!
+Vignette=Off
+
+; FilmGrain (default Off)
+;   Dishonor on your cow!
+FilmGrain=Off
+
+; LensFlare (default Off)   -   Off | On
+;   Dishonor on your whole family!
+LensFlare=Off
+
+; Bloom (default Off)   -   Off | On
+;   This one kinda looks okay...
+Bloom=Off
+
+;---------------------------------------------------------
+; DEBUG STUFF
+;---------------------------------------------------------
+
+; SafeMode (default Off)
+;   For a game that will not start, or falls over at once, on a machine the
+;   renderer has not met: it starts with as little as can go wrong. The
+;   game's fixes are off (DPIFix, RevisionSplashScreenFix, LoadFix,
+;   HdtpHoloFix, MonitorFix), whatever their own keys say. The 64-bit
+;   companion app is not started: DLSS, FSR 4 and XeSS run as FSR 3.1,
+;   ray-traced shadows and reflections as High, ray-traced occlusion as SSAO,
+;   and there is no frame generation. The display is not asked about HDR:
+;   the picture is eight-bit SDR. Read at the start only; the menu shows it,
+;   but cannot change it.
+SafeMode=Off
+
+; LogLevel (default Info)   -   Info | Debug
+;   Debug is for finding a fault, not for playing: the game runs slower, and
+;   the renderer's log takes everything it can tell - Windows, the processor
+;   and the memory, the graphics cards and their drivers, the screens, every
+;   program loaded into the game, the settings in effect, the Direct3D 12
+;   debug layer's messages (where Windows has Graphics Tools installed), a
+;   line for every frame in the first minute and after each change of level,
+;   and at a crash a dump of the game's memory. To report a fault: set Debug,
+;   start, make the fault happen, and send from the game's System folder
+;   SecondRevision.log (SecondRevision.1.log is the run before), Revision.log,
+;   SecondRevision-frames.csv and any SecondRevision-crash-*.dmp. Read at the
+;   start only; the log stops itself at 1024 MB.
+LogLevel=Info

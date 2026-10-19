@@ -1,0 +1,18 @@
+# Not our code: cloned reference repositories, the game SDK, downloads. Build inputs, never part of a release.
+/external/
+
+# Build output.
+/build/
+
+# Working data: screenshots, measurements, extracted and generated textures and height maps, ini backups. Either
+# regenerable or personal, and all of it far too large for a repository (the textures alone are gigabytes).
+/_*/
+
+# Local by-products of the compiler and the IDE, and Python's compiled scripts.
+*.pdb
+*.ilk
+*.user
+__pycache__/
+
+# This machine's own answer to where the game is (scripts/game.ps1).
+/game-path.txt

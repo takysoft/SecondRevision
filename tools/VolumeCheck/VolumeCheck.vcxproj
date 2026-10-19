@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- A console tool that runs the renderer's volume walk by itself (VolumeCheck.cpp). The pass's own source is not
+       compiled where it lies: beside it stands the renderer's Pch.h, which pulls in the engine. It is copied into the
+       build folder first, where the Pch.h it finds is the one beside this project. 32-bit, as the renderer is. -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{7B1D9E42-5C3A-4F68-9D27-A1E4C8B6F053}</ProjectGuid>
+    <RootNamespace>VolumeCheck</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)'==''">v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>VolumeCheck</TargetName>
+    <RendererCopy>$(IntDir)renderer\</RendererCopy>
+    <RendererSource>$(MSBuildThisFileDirectory)..\..\src\RevisionDX12\</RendererSource>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);$(RendererCopy);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <WarningLevel>Level3</WarningLevel>
+      <ConformanceMode>false</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <RendererFile Include="$(RendererSource)Volumetrics.cpp;$(RendererSource)Volumetrics.h;$(RendererSource)RenderMath.h;$(RendererSource)RenderLimits.h;$(RendererSource)ViewGeneration.h" />
+  </ItemGroup>
+  <Target Name="CopyRendererSource" BeforeTargets="ClCompile" Inputs="@(RendererFile)" Outputs="@(RendererFile->'$(RendererCopy)%(Filename)%(Extension)')">
+    <Copy SourceFiles="@(RendererFile)" DestinationFolder="$(RendererCopy)" />
+  </Target>
+  <ItemGroup>
+    <ClCompile Include="VolumeCheck.cpp" />
+    <ClCompile Include="$(RendererCopy)Volumetrics.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -1,0 +1,9 @@
+[Public]
+Object=(Name=DXProbe.ProbeRenderDevice,Class=Class,MetaClass=Engine.RenderDevice,Autodetect=)
+Preferences=(Caption="Rendering",Parent="Advanced Options")
+Preferences=(Caption="DXProbe (instrumentation, draws nothing)",Parent="Rendering",Class=DXProbe.ProbeRenderDevice,Immediate=True)
+
+[ProbeRenderDevice]
+ClassCaption="DXProbe (instrumentation, draws nothing)"
+AskInstalled=DXProbe is a measurement device and renders no image. Use it?
+AskUse=
