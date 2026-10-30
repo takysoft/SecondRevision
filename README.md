@@ -19,7 +19,7 @@ Click a picture to see it at full size.
 | ![Vanilla](screenshots/11-Vanilla.jpg) | ![I Never Asked For This](screenshots/11-INeverAskedForThis.jpg) |
 
 <details>
-<summary>9 more pairs</summary>
+<summary>11 more pairs</summary>
 
 | Vanilla | I Never Asked For This |
 |:---:|:---:|
@@ -33,6 +33,7 @@ Click a picture to see it at full size.
 | ![Vanilla](screenshots/10-Vanilla.jpg) | ![I Never Asked For This](screenshots/10-INeverAskedForThis.jpg) |
 | ![Vanilla](screenshots/12-Vanilla.jpg) | ![I Never Asked For This](screenshots/12-INeverAskedForThis.jpg) |
 | ![Vanilla](screenshots/13-Vanilla.jpg) | ![I Never Asked For This](screenshots/13-INeverAskedForThis.jpg) |
+| ![Vanilla](screenshots/14-Vanilla.jpg) | ![I Never Asked For This](screenshots/14-INeverAskedForThis.jpg) |
 
 </details>
 
