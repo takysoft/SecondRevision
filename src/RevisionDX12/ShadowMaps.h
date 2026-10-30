@@ -8,6 +8,7 @@
 #pragma once
 
 #include "RenderMath.h"
+#include "CardWriter.h"
 
 // One light casting shadows this frame, as the engine side hands it over.
 struct FShadowLightFrame
@@ -46,6 +47,9 @@ public:
     // The two cube arrays for the preset (six faces a light), the depth-only pipeline, both frame slots' actor vertex and
     // world index buffers, and the lookup's constant buffers. False, logged, on failure: the renderer goes on without shadows.
     UBOOL Init(ID3D12Device* Device, const RdxMath::FShadowPreset& Preset);
+    // The maps' shaders compiled, nothing made of them: for a start with the shadows off (FBackend::WarmShaders) -
+    // the same as CreatePipeline asks for, so the shader cache knows them when the shadows are switched on.
+    static void WarmShaders();
     void  Shutdown();
     // A diagnostic (FBackend::NameResources): the cube arrays and the masks named, for DRED's report.
     void  NameResources();
@@ -55,8 +59,12 @@ public:
 
     // The level's occluding polygons as a triangle list, x y z a vertex, world units. Replaces the level before it (kept
     // alive a few frames, the GPU may still be reading it), makes every world map due again, and sorts the triangles into a
-    // grid, so that a light's world map is drawn with the triangles within its reach only. No vertices: no walls.
-    UBOOL SetWorld(ID3D12Device* Device, const FLOAT* Xyz, INT VertexCount);
+    // grid, so that a light's world map is drawn with the triangles within its reach only. No vertices: no walls. The
+    // vertices go on the card's own memory where Card can put them there (CardWriter.h), otherwise in an upload heap.
+    UBOOL SetWorld(ID3D12Device* Device, const FLOAT* Xyz, INT VertexCount, FCardWriter* Card);
+    // What the LEVEL owns let go - the world maps' vertices and their grid (the other half of Shutdown, beside
+    // ReleasePreset): at a teardown, and at a level's change once the GPU is done with them (FBackend::ForgetShadowWorld).
+    void  ForgetWorld();
 
     // A frame: BeginFrame with the frame slot (every frame, in Lock - so nothing of the frame before is drawn again), the
     // casters, the lights, then Render within the frame's command list. The slot's vertex buffers are made larger
@@ -120,6 +128,8 @@ public:
     // The texture places' buffers, for the RT shadows: the frame's (a caster's First counts from its start) or the arena's.
     D3D12_GPU_VIRTUAL_ADDRESS GetCasterUvw(UBOOL bArena) const;
     INT    GetArenaVertices() const { return ArenaUsed; }
+    // Counts the arena's emptyings: what was written in it before another number is gone (ArenaAlloc).
+    INT    GetArenaGen() const { return ArenaGen; }
     // The casters' buffers themselves, for a pass that hands their bytes on to another process (the rays' host,
     // docs/terv-rt-host.md): the positions (bUvw 0) or the texture places (1) - the frame's, this frame slot's, or the
     // arena's - twelve bytes a vertex; and the vertices in use in the frame's (the arena's: GetArenaVertices).
@@ -213,6 +223,9 @@ public:
     // The vertices in the buffers.
     INT GetWorldRedraws()        const { return StatWorldRedraws; }
     INT GetActorDraws()          const { return StatActorDraws; }
+    INT GetFacesKept()           const { return StatFacesKept; }
+    INT GetFacesMoving()         const { return StatFacesMoving; }
+    INT GetFacesChanged()        const { return StatFacesChanged; }
     INT GetTotalWorldRedraws()   const { return TotalWorldRedraws; }
     INT GetTotalDeferred()       const { return TotalDeferred; }
     INT GetTotalStaleUsed()      const { return TotalStaleUsed; }
@@ -239,14 +252,21 @@ private:
     void  ForgetMasks();
     void  SetFace(ID3D12GraphicsCommandList* Cmd, INT Face, const RdxMath::FVec3& Light) const;
     UBOOL BuildWorldGrid(const FLOAT* Xyz, INT Triangles);
+    // BuildWorldGrid's clusters and their lists in the grid's cells, once the grid is laid out; false where refused.
+    UBOOL BuildClusters();
     void  FreeWorldGrid();
+    // A new query's stamp: where the count would run out, every stamp of the triangles and the clusters is cleared.
+    INT   NextStamp();
     // The two halves of Shutdown. ReleasePreset drops what the PRESET owns - the cube arrays, the pipelines, the
     // per-frame buffers, the slots; ForgetWorld drops what the LEVEL owns. Init calls only the first, so a change of
     // preset in the running game keeps the geometry the world maps are drawn from.
     void  ReleasePreset();
-    void  ForgetWorld();
     // The level's triangles whose sphere reaches into the light's sphere, into Candidates; returns how many.
     INT   CollectWorldTriangles(const RdxMath::FVec3& Light, FLOAT Radius);
+    // The level's triangles a spot may light (RenderSpots), as indices into the level's vertices from Out on, at most
+    // Room: how many indices, or -1 where they do not fit.
+    INT   CollectSpotTriangles(const RdxMath::FVec3& Pos, const RdxMath::FVec3& Aim, FLOAT Cos, FLOAT Sin, FLOAT Reach,
+                               UINT* Out, INT Room);
 
     // The actors' buffers of a frame slot begin with room for FIRST_ACTOR_VERTICES vertices (4 bytes x 3 each) and are
     // made larger as the frames ask (ActorRoom); the world's index buffer of a frame slot holds WORLD_INDICES indices
@@ -287,8 +307,12 @@ private:
 
     TComRef<ID3D12Resource> WorldVb;
     INT                     WorldVertexCount;
-    TComRef<ID3D12Resource> RetiredWorldVb;     // the level before, until the GPU is surely done with it
-    INT                     RetiredAge;
+    // The levels before, each until the GPU is surely done with it: its age in frames begun since (BeginFrame). A
+    // second level before the first is free keeps both.
+    enum { RETIRED_WORLD_MOST = 4 };
+    ID3D12Resource*         RetiredWorldVb[RETIRED_WORLD_MOST];
+    INT                     RetiredAge[RETIRED_WORLD_MOST];
+    void                    FreeRetiredWorlds();
 
     // The level's triangles for the culling (BuildWorldGrid): a sphere each (x y z r), and a grid over the level whose cells
     // list the triangles their sphere's box touches; a triangle touching too many cells is in BigTris, which every query
@@ -306,6 +330,19 @@ private:
     INT    StampClock;
     INT*   Candidates;
     BYTE*  FaceMasks;      // a candidate's faces (RdxMath::CubeFacesTouched), as long as Candidates
+    // The same triangles in clusters (BuildClusters), what the spots' collection walks: runs of consecutive triangles
+    // - a node's pieces lie together - each with a sphere holding its triangles' spheres, listed in the cells of the
+    // same grid by that sphere's box; a cluster touching too many cells is in BigClusters. ClusterStamp: the query that
+    // last took a cluster (StampClock's count).
+    INT*   ClusterFirst;          // ClusterCount + 1: a cluster's first triangle
+    FLOAT* ClusterSpheres;        // x y z r
+    INT*   ClusterStamp;
+    INT    ClusterCount;
+    INT*   CellClusterStart;      // GridCells + 1 offsets into CellClusters
+    INT*   CellClusters;
+    FLOAT* CellClusterMaxR;       // GridCells: the largest sphere of the clusters a cell lists
+    INT*   BigClusters;
+    INT    BigClusterCount;
 
     TComRef<ID3D12Resource> ActorVb[BACKEND_FRAME_COUNT];
     FLOAT*                  ActorMapped[BACKEND_FRAME_COUNT];
@@ -369,6 +406,7 @@ private:
 
     // A slot is one cube in each array. A light keeps its slot while it stays chosen; how its world map stands (LightState,
     // RdxMath::ClassifyWorldMap) goes by where the map was drawn from (X Y Z, with reach R), and a new level drops it.
+    enum { FACE_KEEP = 128 };     // the casters a kept face may have (FSlot::KeptFaces)
     struct FSlot
     {
         void* Key;
@@ -384,6 +422,17 @@ private:
         // ever cleared, and a face marked as not drawn into would keep it - the new light would see the old one's
         // casters.
         BYTE  ActorFaceUsed;
+        // The faces of the actor cube that hold what drawing them again would give, to the bit (Render): bit f for face
+        // f, drawn from KeptAt with nothing but stretches of the arena - whose vertices and texture places never change
+        // while ArenaGen stays - each face's in KeptFirst and KeptCount by their place in it, KeptLength of them, with
+        // the masks as MaskGen had them. A face whose casters are those again, from the same place, is left as it is:
+        // only depth is drawn, so the order they come in makes no difference to it. None wherever ActorFaceUsed goes
+        // to ALL_FACES.
+        BYTE           KeptFaces;
+        BYTE           KeptLength[6];
+        RdxMath::FVec3 KeptAt;
+        INT            KeptArenaGen, KeptMaskGen;
+        INT            KeptFirst[6][FACE_KEEP], KeptCount[6][FACE_KEEP];
     };
     enum { ALL_FACES = 0x3F };
     FSlot Slots[RdxMath::ShadowMaxLights];
@@ -391,6 +440,12 @@ private:
 
     INT StatWorldRedraws;
     INT StatActorDraws;
+    INT StatFacesKept;
+    INT StatFacesMoving;         // drawn again for a caster not the arena's: one that moved or is animated
+    INT StatFacesChanged;        // drawn again for other casters than before, or with none kept for it
+    // Counted up whenever the arena is emptied and the masks are forgotten: a kept face (FSlot::KeptFaces) drawn
+    // before is no longer what its casters would draw.
+    INT ArenaGen = 0, MaskGen = 0;
     INT StatStaleUsed;
     INT TotalWorldRedraws;
     INT TotalDeferred;

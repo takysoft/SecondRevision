@@ -3,6 +3,9 @@
 #include "Log.h"
 #include "RenderMath.h"
 #include "TreeGen.h"
+#include "Spherify.h"
+#include "MeshRound.h"
+#include "LevelRound.h"
 #include "PomArchive.h"
 #include "PresentWatch.h"
 #include "CrashLog.h"
@@ -11,7 +14,8 @@
 #include "ShaderCache.h"
 #include "WaterProbe.h"
 #include "CpuSampler.h"
-#include <tlhelp32.h>                // the overlay-hook census - see LogOverlayModules
+#include "ShotWriter.h"
+#include <tlhelp32.h>               // the overlay-hook census - see LogOverlayModules
 #include <algorithm>                 // std::sort: the grass's pairs, a frame's thousands (GrowGrass)
 #include <xmmintrin.h>               // RootOf
 #include <string.h>
@@ -104,6 +108,7 @@ struct FNodeStats
     INT WaterCut;       // the water's polygons cut up before the lifting (AddWaterFans),
     INT WaterCutPieces; // and the pieces they came to
     INT GlassPanes;     // surfaces of the levels' glass with a mirror layer over them (Reflections=RT)
+    INT WetSurfaces;    // the world view's surfaces of a texture the wet floors' list names (WetKindOfTexture)
     INT DetailMaps;
     INT MacroMaps;
     // Draw calls we dropped because the texture could not be uploaded - see NoteDropped.
@@ -185,6 +190,7 @@ struct FFrameTimes
     // with no texture object among them (light maps, fog maps), and the time that took - a part of the draw calls'.
     DOUBLE SumRefreshes, SumMapRefreshes;
     DOUBLE SumRefreshSec, SumMapRefreshSec;
+    DOUBLE SumRefreshesKept;
 };
 static FFrameTimes GTime;
 
@@ -197,6 +203,24 @@ static FFrameTimes GTime;
 // call that also uploads a texture is counted DRAW_SAMPLE times over; the upload columns of the
 // census are exact, apart.
 enum { DRAW_SAMPLE = 8 };
+// The spherifier's share of the frame (the detail line's): the time the surfaces drawn in its pieces took, how many there
+// were and how many pieces, and the time the turned-away polygons' bulges took (SphereBackBulges).
+static DOUBLE GSphereSurfSec = 0.0, GSphereBackSec = 0.0, GSpherePieceSec = 0.0, GSphereMade = 0.0;
+static DOUBLE GSphereSurfs = 0.0, GSpherePieces = 0.0;
+struct FSphereSurfTimer
+{
+    DOUBLE T0;
+    UBOOL  bRounded = 0;
+    FSphereSurfTimer() : T0(appSeconds()) {}
+    ~FSphereSurfTimer()
+    {
+        if (!bRounded)
+            return;
+        GSphereSurfSec += appSeconds() - T0;
+        GSphereSurfs += 1.0;
+    }
+};
+
 struct FDrawTimer
 {
     DOUBLE T0;
@@ -594,6 +618,174 @@ static inline FVector PointBy(const FVector& P, const FCoords& C)
                    X * C.ZAxis.X + Y * C.ZAxis.Y + Z * C.ZAxis.Z);
 }
 
+// FVector::TransformPointBy (bPoint) or TransformVectorBy of Count points of three FLOATs each, In to Out: Core.dll's
+// own x87 steps - the same operations on the same operands in the same order, (t.X * A.X + t.Y * A.Y) + t.Z * A.Z for
+// each axis A, t the point less the origin - so that each result is the engine's to the last bit, whatever the x87 is
+// set to. In one call, where the engine's is a call for each point and an FVector made through its library for each.
+// Checked against the engine's own once a frame (CheckTransformAll); GTransformAllOk 0: its own calls.
+static UBOOL GTransformAllOk = 0;
+static void TransformAllAsEngine(const FLOAT* In, FLOAT* Out, INT Count, const FCoords& C, UBOOL bPoint)
+{
+    if (Count <= 0)
+        return;
+    const FCoords* const Cp = &C;
+    if (bPoint)
+    {
+        __asm
+        {
+            mov   esi, In
+            mov   edi, Out
+            mov   ecx, Count
+            mov   edx, Cp
+        NextPoint:
+            fld   dword ptr [esi]
+            fsub  dword ptr [edx]
+            fld   dword ptr [esi + 4]
+            fsub  dword ptr [edx + 4]
+            fld   dword ptr [esi + 8]
+            fsub  dword ptr [edx + 8]
+            fld   st(2)
+            fmul  dword ptr [edx + 0Ch]
+            fld   st(2)
+            fmul  dword ptr [edx + 10h]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 14h]
+            faddp st(1), st
+            fstp  dword ptr [edi]
+            fld   st(2)
+            fmul  dword ptr [edx + 18h]
+            fld   st(2)
+            fmul  dword ptr [edx + 1Ch]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 20h]
+            faddp st(1), st
+            fstp  dword ptr [edi + 4]
+            fld   st(2)
+            fmul  dword ptr [edx + 24h]
+            fld   st(2)
+            fmul  dword ptr [edx + 28h]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 2Ch]
+            faddp st(1), st
+            fstp  dword ptr [edi + 8]
+            fstp  st(0)
+            fstp  st(0)
+            fstp  st(0)
+            add   esi, 12
+            add   edi, 12
+            dec   ecx
+            jnz   NextPoint
+        }
+    }
+    else
+    {
+        __asm
+        {
+            mov   esi, In
+            mov   edi, Out
+            mov   ecx, Count
+            mov   edx, Cp
+        NextVector:
+            fld   dword ptr [esi]
+            fld   dword ptr [esi + 4]
+            fld   dword ptr [esi + 8]
+            fld   st(2)
+            fmul  dword ptr [edx + 0Ch]
+            fld   st(2)
+            fmul  dword ptr [edx + 10h]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 14h]
+            faddp st(1), st
+            fstp  dword ptr [edi]
+            fld   st(2)
+            fmul  dword ptr [edx + 18h]
+            fld   st(2)
+            fmul  dword ptr [edx + 1Ch]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 20h]
+            faddp st(1), st
+            fstp  dword ptr [edi + 4]
+            fld   st(2)
+            fmul  dword ptr [edx + 24h]
+            fld   st(2)
+            fmul  dword ptr [edx + 28h]
+            faddp st(1), st
+            fld   st(1)
+            fmul  dword ptr [edx + 2Ch]
+            faddp st(1), st
+            fstp  dword ptr [edi + 8]
+            fstp  st(0)
+            fstp  st(0)
+            fstp  st(0)
+            add   esi, 12
+            add   edi, 12
+            dec   ecx
+            jnz   NextVector
+        }
+    }
+}
+
+// TransformAllAsEngine against the engine's own, once a frame, with the view's own frame (C): points and vectors made
+// up round the eye, to the bit. One that differs - said in the log - keeps the engine's calls till the next frame's.
+static void CheckTransformAll(const FCoords& C, INT EngineFrame)
+{
+    static INT CheckedFrame = -1, Differ = 0;
+    if (EngineFrame == CheckedFrame)
+        return;
+    CheckedFrame    = EngineFrame;
+    GTransformAllOk = 1;
+    DWORD Seed      = 0x9E3779B9u ^ (DWORD)EngineFrame;
+    auto  Next      = [&Seed]() -> FLOAT
+    {
+        Seed = Seed * 1664525u + 1013904223u;
+        return (FLOAT)((INT)(Seed >> 8) - 0x800000) * ((Seed & 1) ? (1.0f / 256.0f) : (1.0f / 8.0f));
+    };
+    FLOAT In[24], Got[24];
+    for (INT k = 0; k < 8; k++)
+    {
+        In[k * 3]     = C.Origin.X + Next();
+        In[k * 3 + 1] = C.Origin.Y + Next();
+        In[k * 3 + 2] = C.Origin.Z + Next();
+    }
+    for (INT bPoint = 0; bPoint < 2 && GTransformAllOk; bPoint++)
+    {
+        TransformAllAsEngine(In, Got, 8, C, bPoint);
+        for (INT k = 0; k < 8 && GTransformAllOk; k++)
+        {
+            const FVector V(In[k * 3], In[k * 3 + 1], In[k * 3 + 2]);
+            const FVector Its = bPoint ? V.TransformPointBy(C) : V.TransformVectorBy(C);
+            const FLOAT   Want[3] = { Its.X, Its.Y, Its.Z };
+            if (memcmp(&Got[k * 3], Want, sizeof(Want)) != 0)
+            {
+                GTransformAllOk = 0;
+                if (++Differ <= 8)
+                    RDX_LOGF("transforms: the engine's %s of (%.9g, %.9g, %.9g) is (%.9g, %.9g, %.9g), ours (%.9g, "
+                             "%.9g, %.9g) - its own calls this frame",
+                             bPoint ? TEXT("TransformPointBy") : TEXT("TransformVectorBy"), In[k * 3], In[k * 3 + 1],
+                             In[k * 3 + 2], Want[0], Want[1], Want[2], Got[k * 3], Got[k * 3 + 1], Got[k * 3 + 2]);
+            }
+        }
+    }
+}
+
+// FTransform::Project laid in, to the same numbers: its appFloor is the engine's x87 assembly, which keeps the compiler
+// from laying it in - a call for each corner of every piece. The x87 takes the half off exactly and rounds to the
+// nearest, to the even one at a tie; here the FLOAT less the half rounds, and is then rounded the same way. Below 2^23
+// the half comes off exactly; from there on a FLOAT is whole, and both ways come to the same even neighbour; past an
+// INT, and for what is no number, both give 0x80000000.
+static inline void ProjectAsEngine(FTransform& P, const FSceneNode* Frame)
+{
+    P.RZ      = Frame->Proj.Z / P.Point.Z;
+    P.ScreenX = P.Point.X * P.RZ + Frame->FX15;
+    P.ScreenY = P.Point.Y * P.RZ + Frame->FY15;
+    P.IntY    = _mm_cvtss_si32(_mm_set_ss(P.ScreenY - 0.5f));
+}
+
 // appSqrt laid in: the engine's is a call into Core.dll, in double - a float's root rounded from the double's is the
 // float's own root, which this is.
 static inline FLOAT RootOf(FLOAT X)
@@ -786,9 +978,13 @@ static const TCHAR* const RdxDefaultLensFlare       = TEXT("Off");
 static const UBOOL        RdxDefaultDepthOfField    = 1;
 static const UBOOL        RdxDefaultEndlessWater    = 1;
 static const UBOOL        RdxDefaultFire3D          = 1;
-static const TCHAR* const RdxDefaultGrass3D         = TEXT("High");
-static const UBOOL        RdxDefaultTrees3D         = 1;
+static const TCHAR* const RdxDefaultGrass3D         = TEXT("Medium");
+static const TCHAR* const RdxDefaultTrees3D         = TEXT("Medium");
+static const UBOOL        RdxDefaultSpherifier      = 1;
+static const INT          RdxDefaultSpherifierDistance = 8;
+static const INT          RdxDefaultSpherifierAngle = 105;
 static const UBOOL        RdxDefaultWind            = 1;
+static const UBOOL        RdxDefaultPuddles         = 1;
 static const UBOOL        RdxDefaultAntiLag         = 0;
 static const UBOOL        RdxDefaultFogRooms        = 1;
 static const TCHAR* const RdxDefaultForceField      = TEXT("3D");
@@ -913,6 +1109,10 @@ static UBOOL GLogDebug   = 0;
 static TCHAR GGpuKey[64];                  // GPU, from our own file: Auto, a card's number or a piece of its name
 static UBOOL GWindowsScales = 0;    // Windows stretches the game window on its monitor now - the readout says so
 static INT   GFpsLimit = RdxMath::FpsLimit_Auto;   // FPSLimit, from our own file: Off, Auto, or a number
+// A measurement only (the marker SecondRevision-fps-limit.txt): the start's frame limit, kept over the menu's presets as
+// well, where the marker was there (GFpsMarkedOn).
+static UBOOL GFpsMarkedOn = 0;
+static INT   GFpsMarked   = 0;
 static UBOOL GVsync    = 0;                        // VSync, from our own file
 static RdxMath::EWater GCustomWater = RdxMath::Water_Off;   // Water, from our own file (RdxMath::EWater)
 static RdxMath::EWater GRunWater    = RdxMath::Water_Off;   // what runs: the preset's, or the menu's
@@ -1310,14 +1510,31 @@ void URevisionRenderDevice::StaticConstructor()
     new(GetClass(), TEXT("Grass3D"), RF_Public)
         UStrProperty(CPP_PROPERTY(Grass3D), TEXT("Options"), 0);
     Grass3D = RdxDefaultGrass3D;
-    // Trees3D: the game's trees and bushes grown again by code (TreeGen.h).
+    // Trees3D: the game's trees and bushes grown again by code (TreeGen.h). Off, Low, Medium or High: how a far plant
+    // is drawn (RdxMath::TreeFullReachOf and the rest).
     new(GetClass(), TEXT("Trees3D"), RF_Public)
-        UBoolProperty(CPP_PROPERTY(Trees3D), TEXT("Options"), 0);
+        UStrProperty(CPP_PROPERTY(Trees3D), TEXT("Options"), 0);
     Trees3D = RdxDefaultTrees3D;
+    // Spherifier: the level's and the models' round shapes rounded (Spherify.h).
+    new(GetClass(), TEXT("Spherifier"), RF_Public)
+        UBoolProperty(CPP_PROPERTY(Spherifier), TEXT("Options"), 0);
+    Spherifier = RdxDefaultSpherifier;
+    // SpherifierDistance: the most it moves a wall, in the level's units.
+    new(GetClass(), TEXT("SpherifierDistance"), RF_Public)
+        UIntProperty(CPP_PROPERTY(SpherifierDistance), TEXT("Options"), 0);
+    SpherifierDistance = RdxDefaultSpherifierDistance;
+    // SpherifierAngle: two faces that meet at this angle or wider are rounded as one surface; a sharper meeting stays.
+    new(GetClass(), TEXT("SpherifierAngle"), RF_Public)
+        UIntProperty(CPP_PROPERTY(SpherifierAngle), TEXT("Options"), 0);
+    SpherifierAngle = RdxDefaultSpherifierAngle;
     // Wind: the game's rain leaning with the level's wind, and a fine dust in the air.
     new(GetClass(), TEXT("Wind"), RF_Public)
         UBoolProperty(CPP_PROPERTY(Wind), TEXT("Options"), 0);
     Wind = RdxDefaultWind;
+    // Puddles: the floors outdoors wet in the rain - what they give back is the Reflections setting's.
+    new(GetClass(), TEXT("Puddles"), RF_Public)
+        UBoolProperty(CPP_PROPERTY(Puddles), TEXT("Options"), 0);
+    Puddles = RdxDefaultPuddles;
     // FogRooms: the level's fog kept in the room it belongs to, laid by the renderer (FFogRooms) - or the engine's own.
     new(GetClass(), TEXT("FogRooms"), RF_Public)
         UBoolProperty(CPP_PROPERTY(FogRooms), TEXT("Options"), 0);
@@ -2426,8 +2643,9 @@ static WNDPROC     GEngineWndProc       = nullptr;
 enum EMenuItem
 {
     // IN THE ORDER THEY ARE DRAWN, in blocks: what this picture is, then the frame rate pair, then the picture's own
-    // settings, then the two views. scripts/aa-measure.ps1, ao-shots.ps1, pom-shots.ps1 and display-cycle.ps1 walk this
-    // menu by index, so a line moved here has to be moved in them as well - they carry the same list.
+    // settings, then the two views. The scripts that walk this menu read these names from here (scripts/menu-lines.ps1):
+    // a line may be added or moved; one renamed or taken out stops the scripts that step it. Keep one name a line, and
+    // MenuItem_Preset = 0 and MenuItem_Count as they are - the reading goes from the one to the other.
     MenuItem_Preset = 0,         // Recommended / I NEVER ASKED FOR THIS / Vanilla / Custom
     MenuItem_Display,            // which monitor: right and left step through them - borderless only
     MenuItem_Readout,            // the numbers on screen: Off / FPS / On
@@ -2439,7 +2657,8 @@ enum EMenuItem
     MenuItem_FrameGen,           // frame generation: two pictures a frame, on or off
     MenuItem_AntiLag,            // AMD's Anti-Lag 2 or NVIDIA's Reflex: the input read as late as the GPU allows
     MenuItem_Water,              // Off / Low / High
-    MenuItem_Reflections,        // what the water and the levels' glass give back: Default / High / RT
+    MenuItem_Reflections,        // what the water, the glass and the wet floors give back: Default / Low ... RT High
+    MenuItem_Puddles,            // the floors outdoors wet in the rain
     MenuItem_Shadows,            // Off / Low / Medium / High / RTLow / RTMedium / RTHigh
     MenuItem_Ao,                 // ambient occlusion: Off / SSAO / RT
     MenuItem_ShadowView,         // the shadows' factor in place of the picture, white where nothing is shadowed
@@ -2468,7 +2687,8 @@ enum EMenuItem
     MenuItem_ForceField,         // the game's force fields drawn as arcs of light
     MenuItem_Grass3D,            // blades of grass on the level's grass
     MenuItem_Trees3D,            // the game's trees and bushes grown again
-    MenuItem_Wind,               // the rain leaning with the wind, the dust in it
+    MenuItem_Spherifier,         // the level's and the models' round shapes rounded
+    MenuItem_Wind,              // the rain leaning with the wind, the dust in it
     MenuItem_HdtpHoloFix,        // the holograms: as the game has them, mended, or mended in the original models
     MenuItem_SplashFix,          // the game's loading pictures on a tall screen too, laid by their middle
     MenuItem_LoadFix,            // a saved game loads beside the running level, not over it
@@ -2544,14 +2764,27 @@ static UBOOL                   GRunSoft       = 0;
 static UBOOL                   GRunVolumetric = 0;        // smoke and gas as volumes, not as flat cards
 static UBOOL                   GRunFire       = 0;        // fires as flame bodies (a measurement for now - the marker)
 static RdxMath::EGrass         GRunGrass      = RdxMath::Grass_Off;   // blades of grass on the level's grass (Grass3D)
-static UBOOL                   GRunTrees      = 0;        // the game's trees and bushes grown again (Trees3D)
-// GRunTrees' ways: 0 off, 1 EZ-Tree's, 2 the own, TreesMixed half of each kind's variants either way, the hedges EZ-Tree's.
-enum { TreesMixed = RdxMath::Trees_Mixed };
+static INT                     GRunTrees      = 0;        // the game's trees and bushes grown again (Trees3D)
+// GRunTrees' levels: RdxMath::Trees_Off, Low, Medium and High - the same plants at each, half of each kind's variants
+// grown EZ-Tree's way and half the own, the hedges EZ-Tree's; only a far plant is drawn otherwise (DrawTreeInstance).
 static UBOOL IsGrownSheetSurf(const UModel* M, INT Surf);
 static void  RestartRaySurfaces();
 static void  ForgetShadowLevel();
+static void  SphereLightForget();
+static void  SphereLevelsForget();
 static UBOOL                   GTreesRegrow   = 0;        // the way they grow changed: the level's grow again
 static UBOOL                   GRunWind       = 0;        // the rain leaning with the wind, the dust in it (Wind)
+static UBOOL                   GRunPuddles    = 0;        // the floors outdoors wet in the rain (Puddles)
+// The spherifier (Spherifier, Spherify.h): the level's and the models' round shapes rounded.
+static UBOOL                   GRunSpherifier    = 0;
+static UBOOL                   GCustomSpherifier = 1;
+// Its numbers, the settings file's alone - no preset and no menu line moves them: the most it moves a wall, in the
+// level's units (SpherifierDistance), and the sharpest meeting of two faces it still rounds, in degrees
+// (SpherifierAngle).
+static INT                     GSpherifierDistance = RdxMath::SpherifierDistanceDefault;
+static INT                     GSpherifierAngle    = RdxMath::SpherifierAngleDefault;
+// What it runs with: the most it moves a wall while it is on, nought while it is off.
+static inline INT SpherifierCap() { return GRunSpherifier ? GSpherifierDistance : 0; }
 static UBOOL                   GRunBlur       = 0;        // the picture smeared along what moved in it
 static UBOOL                   GRunAberr      = 0;        // the lens pulling the colours apart
 static UBOOL                   GRunVign       = 0;        // the lens darkening the corners
@@ -2579,8 +2812,9 @@ static UBOOL                   GCustomDof       = 0;
 static UBOOL                   GCustomEndless   = 0;
 static UBOOL                   GCustomFire      = 0;
 static RdxMath::EGrass         GCustomGrass     = RdxMath::Grass_High;
-static UBOOL                   GCustomTrees     = TreesMixed;
+static INT                     GCustomTrees     = RdxMath::Trees_High;
 static UBOOL                   GCustomWind      = 1;
+static UBOOL                   GCustomPuddles   = 1;
 static UBOOL                   GCustomFogRooms  = 1;
 static UBOOL                   GRunFogRooms     = 0;      // the level's fog in its rooms (FFogRooms)
 static RdxMath::EForceField    GCustomForceField = RdxMath::ForceField_Volume;
@@ -2627,6 +2861,83 @@ static INT                     GPomPickEntry  = -1;     // which height map, so 
 static INT                     GPomPickShownEntry = -1;
 static INT                     GPomPickNode   = -1;     // the level node of the polygon picked (the relief's why log)
 static INT                     GPomPickShownNode = -1;
+static FVector                 GPomPickAt;              // where it was hit, in the world
+// What model the crosshair is on (the readout's LOOKING AT line, LookPick): the nearest mesh polygon under the middle of
+// the main view this frame, said as the actor drawn there; where it was hit, and how far; and the level either pick was
+// drawn in (read within the frame only). Handed over at the frame's end, with the level's light nearest the place hit -
+// a lamp's body and the light the level gives it often stand apart.
+enum { LOOK_CHARS = 96 };
+static char                    GLookName[LOOK_CHARS] = { 0 };
+static char                    GLookShown[LOOK_CHARS] = { 0 };
+static char                    GLightShown[LOOK_CHARS] = { 0 };
+static FLOAT                   GLookDepth = 0.0f;
+static FVector                 GLookAt;
+static ULevel*                 GLookLevel = nullptr;
+
+// Text onto a readout string of Max chars: an engine string, or a whole number.
+static void LookAppend(char* Out, INT Max, const TCHAR* Text)
+{
+    INT n = 0;
+    while (Out[n] && n < Max - 1)
+        n++;
+    for (INT i = 0; Text && Text[i] && n < Max - 1; i++)
+        Out[n++] = (Text[i] < 128) ? (char)Text[i] : '?';
+    Out[n] = 0;
+}
+static void LookAppendNumber(char* Out, INT Max, INT Value)
+{
+    TCHAR Digits[16];
+    INT   d = 0;
+    UBOOL bMinus = Value < 0;
+    UINT  V = bMinus ? (UINT)(-Value) : (UINT)Value;
+    do
+    {
+        Digits[d++] = (TCHAR)(TEXT('0') + V % 10);
+        V /= 10;
+    } while (V && d < 15);
+    TCHAR Text[18];
+    INT   t = 0;
+    if (bMinus)
+        Text[t++] = TEXT('-');
+    while (d > 0)
+        Text[t++] = Digits[--d];
+    Text[t] = 0;
+    LookAppend(Out, Max, Text);
+}
+
+// The level's light nearest At, as the readout says it: its name, how far from At, its reach, and a corona if it has one.
+// Not the player's own (the flashlight's beam stands wherever it is pointed, so it would be the nearest everywhere).
+static void NearestLightText(ULevel* Level, const FVector& At, char* Out, INT Max)
+{
+    Out[0]        = 0;
+    AActor* Best  = nullptr;
+    FLOAT   BestD = 0.0f;
+    for (INT i = 0; i < Level->Actors.Num(); i++)
+    {
+        AActor* const A = Level->Actors(i);
+        if (!A || A->bDeleteMe || A->LightType == LT_None || A->LightBrightness == 0 ||
+            (A->Owner && A->Owner->IsA(APlayerPawn::StaticClass())))
+            continue;
+        const FLOAT D = (A->Location - At).Size();
+        if (!Best || D < BestD)
+        {
+            Best  = A;
+            BestD = D;
+        }
+    }
+    if (!Best)
+    {
+        LookAppend(Out, Max, TEXT("NONE"));
+        return;
+    }
+    LookAppend(Out, Max, Best->GetName());
+    LookAppend(Out, Max, TEXT(", "));
+    LookAppendNumber(Out, Max, (INT)BestD);
+    LookAppend(Out, Max, TEXT(" FROM IT, RADIUS "));
+    LookAppendNumber(Out, Max, (INT)Best->WorldLightRadius());
+    if (Best->bCorona)
+        LookAppend(Out, Max, TEXT(", CORONA"));
+}
 // Why a texture that HAS a height map shows no relief on the surface picked: the relief runs on opaque surfaces alone,
 // and a mirror is drawn see-through over its own reflection.
 enum EPomPickWhyNot { PomPickWhyNot_None, PomPickWhyNot_Mirror, PomPickWhyNot_SeeThrough };
@@ -2877,6 +3188,12 @@ static const TCHAR* RawFlagsText(DWORD F)
 // alone. Each is counted only when the other cannot come, and the first turn says in the log which way they arrive.
 static UBOOL GPomWheelOn = 0;
 
+// Screenshot: Shift with the menu key takes a pair of pictures to show the renderer with - the frame as it runs, then
+// the same moment in the Vanilla preset - and goes back to what ran (ShotPairFrame). A switch nobody is shown, as
+// HeightMapWheel: only the line "Screenshot=On", written into the settings file by hand, turns it on.
+static UBOOL GShotPairOn    = 0;
+static UBOOL GShotPairAsked = 0;   // the press, from the window's messages (BorderlessWndProc)
+
 static UBOOL RawMouseNoLegacy()
 {
     RAWINPUTDEVICE Dev;
@@ -2924,6 +3241,66 @@ static void FillBlack(HWND W, HDC Given)
         ::ReleaseDC(W, Dc);
 }
 
+// While the backend's start compiles its shaders on a thread of their own, the window answers Windows by itself
+// (AnswerWhileCompiling): the engine is in the middle of its own start then, and nothing is handed on to it. What it
+// would have had later from a window that did not answer - the window coming to the front or going from it, a close -
+// is kept in order and posted to it when the wait is over, for its own loop to hand on once its start is done.
+enum { WINDOW_LATER_MAX = 64 };
+struct FWindowLater
+{
+    UINT   Msg;
+    WPARAM WParam;
+    LPARAM LParam;
+};
+static UBOOL        GWindowAlone      = 0;
+static UBOOL        GWindowCloseLater = 0;
+static FWindowLater GWindowLater[WINDOW_LATER_MAX];
+static INT          GWindowLaterNum   = 0;
+
+static LRESULT AnswerAlone(HWND W, UINT Msg, WPARAM WParam, LPARAM LParam)
+{
+    switch (Msg)
+    {
+    case WM_PAINT:
+    {
+        // The picture is the chain's - the caption: nothing to draw, only to say it is drawn.
+        PAINTSTRUCT Paint;
+        ::BeginPaint(W, &Paint);
+        ::EndPaint(W, &Paint);
+        return 0;
+    }
+    case WM_SETCURSOR:
+        // The engine's window class names no cursor: without this the busy one stays.
+        if (LOWORD(LParam) == HTCLIENT)
+        {
+            ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        GWindowCloseLater = 1;
+        return 0;
+    case WM_ACTIVATE:
+    case WM_ACTIVATEAPP:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        // More than the list holds: the latest are what the window's state is.
+        if (GWindowLaterNum == WINDOW_LATER_MAX)
+        {
+            memmove(GWindowLater, GWindowLater + 1, sizeof(GWindowLater[0]) * (WINDOW_LATER_MAX - 1));
+            GWindowLaterNum--;
+        }
+        GWindowLater[GWindowLaterNum].Msg    = Msg;
+        GWindowLater[GWindowLaterNum].WParam = WParam;
+        GWindowLater[GWindowLaterNum].LParam = LParam;
+        GWindowLaterNum++;
+        break;
+    default:
+        break;
+    }
+    return ::DefWindowProcW(W, Msg, WParam, LParam);
+}
+
 static LRESULT CALLBACK BorderlessWndProc(HWND W, UINT Msg, WPARAM WParam, LPARAM LParam)
 {
     if (Msg == WM_ERASEBKGND && !GPictureShown)
@@ -2931,6 +3308,8 @@ static LRESULT CALLBACK BorderlessWndProc(HWND W, UINT Msg, WPARAM WParam, LPARA
         FillBlack(W, (HDC)WParam);
         return 1;
     }
+    if (GWindowAlone)
+        return AnswerAlone(W, Msg, WParam, LParam);
     // The menu key (DebugKey, Scroll Lock unless changed) opens and closes the menu. It is taken HERE and not by asking
     // the keyboard once a frame: a press sent by a script lasts microseconds and falls between two frames, so polling
     // missed it entirely. A message cannot be missed. The game never sees the key: Scroll Lock is bound to nothing in
@@ -2941,6 +3320,14 @@ static LRESULT CALLBACK BorderlessWndProc(HWND W, UINT Msg, WPARAM WParam, LPARA
         GNoticeDismiss = 1;
     if ((Msg == WM_KEYDOWN || Msg == WM_SYSKEYDOWN) && (INT)WParam == GMenuKey)
     {
+        // With Shift, where Screenshot=On, the pair of pictures instead of the menu (ShotPairFrame). A held key's
+        // repeats are not presses of their own.
+        if (GShotPairOn && (::GetKeyState(VK_SHIFT) & 0x8000))
+        {
+            if (!(LParam & (1 << 30)))
+                GShotPairAsked = 1;
+            return 0;
+        }
         GMenuToggle = 1;
         return 0;
     }
@@ -3046,6 +3433,38 @@ static void InstallMouseHelper(HWND W, UViewport* V, UBOOL bWindowed)
     GMouseWnd = W;
     RDX_LOGF("window hook: messages are seen before the engine (for the menu keys); the menu mouse fixes are %s",
              GMouseFix ? TEXT("on") : (bWindowed ? TEXT("OFF (marker)") : TEXT("OFF - not windowed")));
+}
+
+// FBackend::AnswerWhile: until Done, the window's messages answered here (AnswerAlone) - all of them but the timers'
+// (a timer's message may call a function of the engine's) and the ones kept for the engine, which come by being sent,
+// never from the queue, and stay there once posted. The engine's other windows and the thread's own messages wait for
+// its loop. Only where this procedure stands before the engine's on that window; anywhere else the caller waits plainly.
+static void AnswerWhileCompiling(HWND Window, HANDLE Done)
+{
+    if (!Window || Window != GMouseWnd || !GEngineWndProc || GWindowAlone ||
+        ::GetWindowThreadProcessId(Window, nullptr) != ::GetCurrentThreadId())
+        return;
+    static const UINT Taken[][2] = { { 0, WM_ACTIVATE - 1 }, { WM_KILLFOCUS + 1, WM_CLOSE - 1 },
+                                     { WM_CLOSE + 1, WM_ACTIVATEAPP - 1 }, { WM_ACTIVATEAPP + 1, WM_TIMER - 1 },
+                                     { WM_TIMER + 1, 0xFFFFFFFFu } };
+    GWindowAlone = 1;
+    for (;;)
+    {
+        MSG Msg;
+        for (INT r = 0; r < (INT)ARRAY_COUNT(Taken); r++)
+            while (::PeekMessageW(&Msg, Window, Taken[r][0], Taken[r][1], PM_REMOVE))
+                ::DispatchMessageW(&Msg);
+        const DWORD Woke = ::MsgWaitForMultipleObjects(1, &Done, FALSE, 250, QS_ALLINPUT);
+        if (Woke == WAIT_OBJECT_0 || Woke == WAIT_FAILED)
+            break;
+    }
+    GWindowAlone = 0;
+    for (INT i = 0; i < GWindowLaterNum; i++)
+        ::PostMessageW(Window, GWindowLater[i].Msg, GWindowLater[i].WParam, GWindowLater[i].LParam);
+    GWindowLaterNum = 0;
+    if (GWindowCloseLater)
+        ::PostMessageW(Window, WM_CLOSE, 0, 0);
+    GWindowCloseLater = 0;
 }
 
 static void TendMouse(UViewport* V, INT Frame)
@@ -3222,6 +3641,18 @@ static const TCHAR* ShadowQualityText(RdxMath::EShadowQuality Q)
     case RdxMath::ShadowQuality_RtMedium: return TEXT("RTMedium");
     case RdxMath::ShadowQuality_Rt:       return TEXT("RTHigh");
     default:                              return TEXT("High");
+    }
+}
+
+// The same as the menu says it: the RT levels with a space, as the reflections' (RT LOW).
+static const TCHAR* ShadowQualityMenuText(RdxMath::EShadowQuality Q)
+{
+    switch (Q)
+    {
+    case RdxMath::ShadowQuality_RtLow:    return TEXT("RT Low");
+    case RdxMath::ShadowQuality_RtMedium: return TEXT("RT Medium");
+    case RdxMath::ShadowQuality_Rt:       return TEXT("RT High");
+    default:                              return ShadowQualityText(Q);
     }
 }
 
@@ -3669,6 +4100,27 @@ static void SettingsPath(WCHAR* Out, INT Max)
     ::lstrcatW(Path, L"SecondRevision.settings.ini");
     if ((INT)::lstrlenW(Path) < Max)
     ::lstrcpyW(Out, Path);
+}
+
+// Our data files - the trees' pictures, the surfaces' lists - in SecondRevision\Assets beside the DLL. The folder
+// SecondRevision holds our own files (Assets, Host64, Legal); the DLL, its .int, the settings, the shader cache and the
+// logs stay beside the DLL itself. Empty where the path does not fit.
+static void AssetPath(WCHAR* Out, INT Max, const WCHAR* Name)
+{
+    static const WCHAR Folder[] = L"SecondRevision\\Assets\\";
+    SettingsPath(Out, Max);
+    INT Cut = -1;
+    for (INT i = 0; Out[i]; i++)
+        if (Out[i] == L'\\' || Out[i] == L'/')
+            Cut = i;
+    if (Cut < 0 || Cut + 1 + ::lstrlenW(Folder) + ::lstrlenW(Name) >= Max)
+    {
+        Out[0] = 0;
+        return;
+    }
+    Out[Cut + 1] = 0;
+    ::lstrcatW(Out, Folder);
+    ::lstrcatW(Out, Name);
 }
 
 // A measurement only (the marker SecondRevision-settings-extra.txt, fresh): its lines are read as if they stood at the
@@ -4188,11 +4640,11 @@ static const char* const GIniTemplate =
 ";   not count that much.)\n"
 "ShadowVerticalWeight=@VERT@\n"
 "\n"
-"; AmbientOcclusion (default SSAO)   -   Off | SSAO | RT\n"
+"; AmbientOcclusion (default SSAO)   -   Off | SSAO | RTAO\n"
 ";   Light doesn't get into corners that much - like that bouncing DVD logo on\n"
 ";   your TV :D This creates those shadows, and makes the look more realistic.\n"
 ";     SSAO  A good solution, it works on all computers.\n"
-";     RT    The ray-traced solution. Nicer. It needs RT capable hardware and\n"
+";     RTAO  The ray-traced solution. Nicer. It needs RT capable hardware and\n"
 ";           the 64-bit companion app; where it cannot run, SSAO runs instead.\n"
 "AmbientOcclusion=@AO@\n"
 "\n"
@@ -4211,14 +4663,14 @@ static const char* const GIniTemplate =
 ";   removes that too. Visually only: you still can't swim any farther.\n"
 "EndlessWater=@ENDLESSWATER@\n"
 "\n"
-"; Reflections (default High)   -   Default | High | RTHalf | RT\n"
+"; Reflections (default High)   \n"
+";   - Default | Low | Medium | High | RTLow | RTMedium | RTHigh\n"
 ";   Adds some extra reflections to the game. The game has reflections on\n"
-";   mirrors and floors by default; this adds reflections to the water and to\n"
-";   glass surfaces too. Glass surfaces only get reflections in the ray tracing\n"
-";   modes. In RTHalf mode, only 1 of every 4 pixels gets its own reflection,\n"
-";   and the other 3 share it, but it looks pretty close to the RT mode, with\n"
-";   much better performance. The RT modes need RT capable hardware and the\n"
-";   64-bit companion app; without them, High runs.\n"
+";   mirrors and floors by default; this adds reflections to the water, puddles\n"
+";   and to glass surfaces too. Glass surfaces only get reflections in the \n"
+";   ray tracing modes. Medium and Low modes look a bit worse, but are faster.\n"
+";   The RT modes need RT capable hardware and the 64-bit companion app\n"
+";   without that, itt falls back too the default reflections.\n"
 "Reflections=@REFLECTIONS@\n"
 "\n"
 "; Geometry (default POM)   -   Off | POM | DisplacementMapping\n"
@@ -4238,6 +4690,20 @@ static const char* const GIniTemplate =
 ";   but one could argue, as it has to 'go down' at the edges of the textures.\n"
 ";   It requires more calculations, and it lowers your FPS more.\n"
 "Geometry=@GEOMETRY@\n"
+"\n"
+"; Puddles (default On)\n"
+";   Rain creates puddles. With Geometry(POM/Displacement) other areas are\n"
+";   else wet. With Reflections these will also give you an awesome look.\n"
+";   Please note: This may make the ground a bit darker...\n"
+"Puddles=@PUDDLES@\n"
+"\n"
+"; Spherifier (default On)\n"
+";   The game is full of models that are supposed to be round, but arent.\n"
+";   Pro: This little tweak maked them round. Looks way-way better :)\n"
+";   Con: A bit pricey on the system. Also there are objects that are not\n"
+";        supposed to be round, yet this makes them rounder.\n"
+";   Generally I'd say it improves the look of the game.\n"
+"Spherifier=@SPHERIFIER@\n"
 "\n"
 "; SoftParticles (default On)\n"
 ";   Smoke, steam and fire are flat pictures (sprites) standing in the air.\n"
@@ -4260,11 +4726,11 @@ static const char* const GIniTemplate =
 ";   new volumetric 3D ones. They look better.\n"
 "Fire3D=@FIRE3D@\n"
 "\n"
-"; Grass3D (default High)   -   Off | Low | Medium | High\n"
+"; Grass3D (default Medium)   -   Off | Low | Medium | High\n"
 ";   Procedurally generated grass. High has more grass :)\n"
 "Grass3D=@GRASS3D@\n"
 "\n"
-"; Trees3D (default On)\n"
+"; Trees3D   -   Off | Low | Medium | High (default Medium)\n"
 ";   Procedurally generated trees. They look nice :)\n"
 "Trees3D=@TREES3D@\n"
 "\n"
@@ -4578,14 +5044,13 @@ static RdxMath::EReflections ReflectionsForPreset(RdxMath::EPreset P)
 static void ForgetShadowLevel();
 static void RestartRaySurfaces();
 
-// A preset's whole picture (RdxMath::PresetPicture) into what runs AND what the settings file is written from: Custom
-// being only the name for none of the presets, the two are one. With the level up (bLevel) the level's plants grow
-// again and the mirror rays' grass is made again where the picture moves them.
-static void TakePresetPicture(RdxMath::EPreset P, UBOOL bLevel)
+// A picture (RdxMath::FPresetPicture) into what runs AND what the settings file is written from: Custom being only
+// the name for none of the presets, the two are one. With the level up (bLevel) the level's plants grow again and the
+// mirror rays' grass is made again where the picture moves them.
+static void TakePicture(const RdxMath::FPresetPicture& S, UBOOL bLevel)
 {
-    const RdxMath::FPresetPicture S        = RdxMath::PresetPicture(P);
-    const RdxMath::EGrass         WasGrass = GRunGrass;
-    const UBOOL                   WasTrees = GRunTrees;
+    const RdxMath::EGrass         WasGrass  = GRunGrass;
+    const INT                     WasTrees  = GRunTrees;
     GRunAaChoice    = GCustomAaChoice    = S.Aa;
     GRunUpscale     = GCustomUpscale     = S.Upscale;
     GRunShadows     = GCustomShadows     = S.bShadows ? 1 : 0;
@@ -4617,26 +5082,84 @@ static void TakePresetPicture(RdxMath::EPreset P, UBOOL bLevel)
     GRunGrass       = GCustomGrass       = S.Grass;
     GRunTrees       = GCustomTrees       = S.Trees;
     GRunWind        = GCustomWind        = S.bWind ? 1 : 0;
+    GRunPuddles     = GCustomPuddles     = S.bPuddles ? 1 : 0;
     GRunAntiLag     = S.bAntiLag ? 1 : 0;
+    // The spherifier's walls are made again beside the game where it comes or goes (EnsureSphere), the shadows' and the
+    // rays' level with them once they are drawn; the grass for the mirror rays here.
+    GRunSpherifier  = GCustomSpherifier  = S.bSpherifier ? 1 : 0;
     if (bLevel && GRunGrass != WasGrass)
         ForgetShadowLevel();
-    if (bLevel && GRunTrees != WasTrees)
+    // The plants grow again only where they come or go: each level draws the same plants.
+    if (bLevel && (GRunTrees != 0) != (WasTrees != 0))
     {
         GTreesRegrow = 1;
         RestartRaySurfaces();
     }
 }
 
+// A preset's whole picture (RdxMath::PresetPicture), put on as above.
+static void TakePresetPicture(RdxMath::EPreset P, UBOOL bLevel)
+{
+    TakePicture(RdxMath::PresetPicture(P), bLevel);
+}
+
+// What runs, as a picture: the values TakePicture puts on, read back - to be put on again (ShotPairFrame).
+static RdxMath::FPresetPicture RunningPicture()
+{
+    RdxMath::FPresetPicture S;
+    S.Aa          = GRunAaChoice;
+    S.Upscale     = GRunUpscale;
+    S.bShadows    = GRunShadows != 0;
+    S.ShadowQ     = GRunShadowQ;
+    S.Hdr         = GRunHdr;
+    S.Ao          = GRunAo;
+    S.Water       = GRunWater;
+    S.Reflections = GRunReflections;
+    S.FpsLimit    = GFpsLimit;
+    S.bVsync      = GVsync != 0;
+    S.bFrameGen   = GRunFrameGen != 0;
+    S.Geometry    = GRunGeometry;
+    S.bSoft       = GRunSoft != 0;
+    S.bVolumetric = GRunVolumetric != 0;
+    S.bBlur       = GRunBlur != 0;
+    S.bRays       = GRunRays != 0;
+    S.bAberr      = GRunAberr != 0;
+    S.bVign       = GRunVign != 0;
+    S.bGrain      = GRunGrain != 0;
+    S.Bloom       = GRunBloom;
+    S.Flare       = GRunFlare;
+    S.bDof        = GRunDof != 0;
+    S.bEndless    = GRunEndless != 0;
+    S.bFire       = GRunFire != 0;
+    S.bFogRooms   = GRunFogRooms != 0;
+    S.Flashlight  = GCustomFlashlight;
+    S.ForceField  = GRunForceField;
+    S.Grass       = GRunGrass;
+    S.Trees       = (int)GRunTrees;
+    S.bWind       = GRunWind != 0;
+    S.bPuddles    = GRunPuddles != 0;
+    S.bAntiLag    = GRunAntiLag != 0;
+    S.bSpherifier = GRunSpherifier != 0;
+    return S;
+}
+
 UBOOL URevisionRenderDevice::ApplyPreset(RdxMath::EPreset P)
 {
-    URevisionRenderDevice& Dev = *this;
     GRunPreset = P;
     // Custom is only the name for a picture that is none of the presets: picking it changes nothing that runs.
     if (P == RdxMath::Preset_Custom)
         return 1;
+    return ApplyPicture(RdxMath::PresetPicture(P));
+}
+
+// A picture put on while the game runs (TakePicture), and what it needs besides its values: the frame limit and the
+// latency's help told, the antialiasing resolved, and the frame generation and the targets made again between frames.
+UBOOL URevisionRenderDevice::ApplyPicture(const RdxMath::FPresetPicture& S)
+{
+    URevisionRenderDevice& Dev = *this;
     const UBOOL bFrameGenWas = GRunFrameGen;
-    TakePresetPicture(P, 1);
-    Dev.Backend.SetFrameLimit(GFpsLimit, GVsync);
+    TakePicture(S, 1);
+    Dev.Backend.SetFrameLimit(GFpsMarkedOn ? GFpsMarked : GFpsLimit, GVsync);
     Dev.Backend.SetAntiLag(GRunAntiLag);
     ResolveAa();
     GRunAoAlone = 0;          // a preset is a picture to play with, and the view is not one
@@ -5154,6 +5677,20 @@ static void BuildReadout(const FBackend& Backend, char* C, INT& L, UBOOL bFpsOnl
                 ReadoutNumber(C, L, Tenths % 10);
             }
         }
+        // The model the crosshair is on, where one is nearer than the surface named above, and the level's light
+        // nearest the place hit.
+        if (GLookShown[0])
+        {
+            ReadoutLine(C, L);
+            ReadoutText(C, L, "LOOKING AT: ");
+            ReadoutText(C, L, GLookShown);
+        }
+        if (GLightShown[0])
+        {
+            ReadoutLine(C, L);
+            ReadoutText(C, L, "NEAREST LIGHT: ");
+            ReadoutText(C, L, GLightShown);
+        }
     }
     // A lost device says nothing HERE, and that is not an oversight. Once the device is gone every Present fails,
     // so no frame drawn afterwards can reach the screen: the last one that did stays up, this readout included,
@@ -5233,6 +5770,7 @@ static UBOOL MenuLineUnderPreset(INT Item)
     case MenuItem_FilmGrain: case MenuItem_Bloom: case MenuItem_LensFlare: case MenuItem_DepthOfField:
     case MenuItem_EndlessWater: case MenuItem_Fire3D: case MenuItem_FogRooms: case MenuItem_FlashlightBeam:
     case MenuItem_ForceField: case MenuItem_Grass3D: case MenuItem_Trees3D: case MenuItem_Wind: case MenuItem_AntiLag:
+    case MenuItem_Spherifier: case MenuItem_Puddles:
         return 1;
     default:
         return 0;
@@ -5363,7 +5901,9 @@ static void SetCaptureLabel(FBackend& Backend)
         // A word for each of the grass's levels - as many as there are, or the build stops.
         static const char* const Grass[] = { "", "|GRASSLOW", "|GRASSMEDIUM", "|GRASSHIGH" };
         static_assert(sizeof(Grass) / sizeof(Grass[0]) == RdxMath::Grass_Count, "a word for each grass level");
-        const char* const Parts[3] = { Grass[GRunGrass], GRunTrees ? "|TREES" : "", GRunWind ? "|WIND" : "" };
+        static const char* const Trees[] = { "", "|TREESLOW", "|TREESMEDIUM", "|TREESHIGH" };
+        static_assert(sizeof(Trees) / sizeof(Trees[0]) == RdxMath::Trees_Count, "a word for each trees level");
+        const char* const Parts[3] = { Grass[GRunGrass], Trees[GRunTrees], GRunWind ? "|WIND" : "" };
         for (INT p = 0; p < 3; p++)
             for (INT k = 0; Parts[p][k] && n < 126; k++)
                 L[n++] = Parts[p][k];
@@ -5481,21 +6021,38 @@ void URevisionRenderDevice::DrawRendererMenu()
             break;
         }
         case MenuItem_Trees3D:
-            // Off, EZ-Tree's way, the own way, the two mixed (TreesMixed), round either way: the level's plants grow
-            // again when the way changes.
-            GRunTrees    = (GRunTrees + ((Step < 0) ? 3 : 1)) % 4;
+        {
+            // Off, Low, Medium, High, round either way: the level's plants grow again where they come or go - each
+            // level draws the same plants.
+            const INT Was = GRunTrees;
+            GRunTrees    = (GRunTrees + ((Step < 0) ? RdxMath::Trees_Count - 1 : 1)) % RdxMath::Trees_Count;
             GCustomTrees = GRunTrees;
-            GTreesRegrow = 1;
-            RestartRaySurfaces();
-            RDX_LOGF("menu: 3D trees %s", !GRunTrees           ? TEXT("off")
-                                          : (GRunTrees == 1)     ? TEXT("EZ-Tree")
-                                          : (GRunTrees == TreesMixed) ? TEXT("mixed")
-                                                                 : TEXT("own"));
+            if ((GRunTrees != 0) != (Was != 0))
+            {
+                GTreesRegrow = 1;
+                RestartRaySurfaces();
+            }
+            TCHAR Name[16];
+            RdxMath::TreesName(GRunTrees, Name, 16);
+            RDX_LOGF("menu: 3D trees %s", Name);
+            break;
+        }
+        case MenuItem_Spherifier:
+            // On or off: the level is rounded again or let go beside the game (EnsureSphere), the shadows' and the rays'
+            // level made again once that is drawn, and the models' shapes as they are next drawn (RoundFrameStart).
+            GRunSpherifier    = GRunSpherifier ? 0 : 1;
+            GCustomSpherifier = GRunSpherifier;
+            RDX_LOGF("menu: spherifier %s", GRunSpherifier ? TEXT("on") : TEXT("off"));
             break;
         case MenuItem_Wind:
             GRunWind    = GRunWind ? 0 : 1;
             GCustomWind = GRunWind;
             RDX_LOGF("menu: wind %s", GRunWind ? TEXT("on") : TEXT("off"));
+            break;
+        case MenuItem_Puddles:
+            GRunPuddles    = GRunPuddles ? 0 : 1;
+            GCustomPuddles = GRunPuddles;
+            RDX_LOGF("menu: puddles %s", GRunPuddles ? TEXT("on") : TEXT("off"));
             break;
         case MenuItem_FogRooms:
             GRunFogRooms    = GRunFogRooms ? 0 : 1;
@@ -5876,21 +6433,20 @@ void URevisionRenderDevice::DrawRendererMenu()
         // against - is High for the frame, and the line carries the mark. The backend takes the menu's value at the
         // frame's end: until the two agree there is nothing to mark.
         INT  n = 0;
-        char Name[16];
-        RdxMath::ReflectionsName(GRunReflections, Name, 16);
-        PutUpper(Val, n, RdxMath::CaptionLineChars, Name);
+        PutUpper(Val, n, RdxMath::CaptionLineChars, RdxMath::ReflectionsMenuNames()[(INT)GRunReflections]);
         if (RdxMath::ReflectionsTraced(GRunReflections) && Dev.Backend.IsRtMirrorRequested() &&
             !Dev.Backend.IsRtMirrorRunning())
             PutUpper(Val, n, RdxMath::CaptionLineChars, MarkFallback);
         MenuLine(C, L, GMenuPick == MenuItem_Reflections, "REFLECTIONS", Val);
     }
+    MenuLine(C, L, GMenuPick == MenuItem_Puddles, "PUDDLES", GRunPuddles ? "ON" : "OFF");
     {
         // What cannot run is marked, as the readout says it: the shadows off where their targets or their lists
         // could not be had, and the ray-traced ones the maps' where the ray tracing cannot run. The backend takes
         // the menu's value at the frame's end: until the two agree there is nothing to mark.
         INT  n = 0;
         char Quality[32];
-        MenuValue(GRunShadows ? ShadowQualityText(GRunShadowQ) : TEXT("Off"), Quality, 32);
+        MenuValue(GRunShadows ? ShadowQualityMenuText(GRunShadowQ) : TEXT("Off"), Quality, 32);
         PutUpper(Val, n, RdxMath::CaptionLineChars, Quality);
         if (GRunShadows && Dev.Backend.ShadowsRefused())
             PutUpper(Val, n, RdxMath::CaptionLineChars, MarkOff);
@@ -5907,7 +6463,7 @@ void URevisionRenderDevice::DrawRendererMenu()
         PutUpper(Val, n, RdxMath::CaptionLineChars,
                  bNoShadows ? "NEEDS SHADOWS"
                             : ((GRunAo == RdxMath::Ao_Off) ? "OFF"
-                               : ((GRunAo == RdxMath::Ao_Rt) ? (GRunAoAlone ? "RT ALONE" : "RT")
+                               : ((GRunAo == RdxMath::Ao_Rt) ? (GRunAoAlone ? "RT AO ALONE" : "RT AO")
                                                              : (GRunAoAlone ? "SSAO ALONE" : "SSAO"))));
         if (!bNoShadows && GRunAo == RdxMath::Ao_Rt && Dev.Backend.IsRtAoRequested() && !Dev.Backend.IsRtAoRunning())
             PutUpper(Val, n, RdxMath::CaptionLineChars, MarkFallback);
@@ -6028,11 +6584,14 @@ void URevisionRenderDevice::DrawRendererMenu()
         static_assert(sizeof(GrassText) / sizeof(GrassText[0]) == RdxMath::Grass_Count, "a text for each grass level");
         MenuLine(C, L, GMenuPick == MenuItem_Grass3D, "3D GRASS", GrassText[GRunGrass][Dev.Backend.CanGrass() ? 0 : 1]);
     }
-    MenuLine(C, L, GMenuPick == MenuItem_Trees3D, "3D TREES",
-             !GRunTrees ? "OFF"
-             : (GRunTrees == 1)          ? (Dev.Backend.CanTrees() ? "EZ-TREE" : "EZ-TREE (N/A)")
-             : (GRunTrees == TreesMixed) ? (Dev.Backend.CanTrees() ? "MIXED" : "MIXED (N/A)")
-                                         : (Dev.Backend.CanTrees() ? "OWN" : "OWN (N/A)"));
+    {
+        // A line's text for each of the trees' levels - as many as there are, or the build stops.
+        static const char* const TreesText[][2] = {
+            { "OFF", "OFF" }, { "LOW", "LOW (N/A)" }, { "MEDIUM", "MEDIUM (N/A)" }, { "HIGH", "HIGH (N/A)" } };
+        static_assert(sizeof(TreesText) / sizeof(TreesText[0]) == RdxMath::Trees_Count, "a text for each trees level");
+        MenuLine(C, L, GMenuPick == MenuItem_Trees3D, "3D TREES", TreesText[GRunTrees][Dev.Backend.CanTrees() ? 0 : 1]);
+    }
+    MenuLine(C, L, GMenuPick == MenuItem_Spherifier, "SPHERIFIER", GRunSpherifier ? "ON" : "OFF");
     MenuLine(C, L, GMenuPick == MenuItem_Wind, "WIND", GRunWind ? "ON" : "OFF");
     {
         char Holo[40];
@@ -6217,6 +6776,8 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
     RdxMath::GeometryName(GCustomGeometry, GeometryT, RdxMath::GeometryNameChars);
     char GrassT[16];
     RdxMath::GrassName(GCustomGrass, GrassT, 16);
+    char TreesT[16];
+    RdxMath::TreesName(GCustomTrees, TreesT, 16);
     char FieldT[16];
     RdxMath::ForceFieldName(GCustomForceField, FieldT, 16);
     char HoloT[16];
@@ -6256,11 +6817,12 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
     AsciiOf(GGpuKey, GpuT, 64);
     const char* const Names[] = { "PRESET", "AA", "HDR", "SHARP", "UPSCALE", "FRAMEGEN", "ANTILAG", "SQ",
                                   "VERT", "READOUT", "BORDERLESS", "EXCLUSIVE", "GPUCONV", "GPU", "AO", "DEBUGKEY",
-                                  "DPIFIX", "FPSLIMIT", "VSYNC", "WATER", "REFLECTIONS",
+                                  "DPIFIX", "FPSLIMIT", "VSYNC", "WATER", "REFLECTIONS", "PUDDLES",
                                   "GEOMETRY",
                                   "SOFTPARTICLES", "VOLUMETRICS", "MOTIONBLUR",
                                   "ABERRATION", "VIGNETTE", "FILMGRAIN", "BLOOM", "LENSFLARE",
-                                  "GODRAYS", "DEPTHOFFIELD", "ENDLESSWATER", "FIRE3D", "GRASS3D", "TREES3D", "WIND", "FOGROOMS",
+                                  "GODRAYS", "DEPTHOFFIELD", "ENDLESSWATER", "FIRE3D", "GRASS3D", "TREES3D", "SPHERIFIER",
+                                  "WIND", "FOGROOMS",
                                   "FLASHLIGHTBEAM",
                                   "FORCEFIELD",
                                   "HDTPHOLOFIX",
@@ -6281,6 +6843,7 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
                                    GVsync       ? "On" : "Off",
                                    WaterT,
                                    ReflectionsT,
+                                   GCustomPuddles   ? "On" : "Off",
                                    GeometryT,
                                    GCustomSoft      ? "On" : "Off",
                                    GCustomVolume    ? "On" : "Off",
@@ -6295,7 +6858,8 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
                                    GCustomEndless   ? "On" : "Off",
                                    GCustomFire      ? "On" : "Off",
                                    GrassT,
-                                   GCustomTrees     ? "On" : "Off",
+                                   TreesT,
+                                   GCustomSpherifier ? "On" : "Off",
                                    GCustomWind      ? "On" : "Off",
                                    GCustomFogRooms  ? "Fixed" : "Original",
                                    RdxMath::FlashlightNames()[(INT)GCustomFlashlight],
@@ -6371,6 +6935,26 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         AmbientOcclusion = RdxDefaultAo;
     if (Preset.Len() == 0)
         Preset        = RdxDefaultPreset;
+    // And every other string the menu and the file have - left empty, the first start without a file of ours wrote
+    // what an empty string parses to into it: Geometry=Off and Grass3D=Low where Recommended has POM and High.
+    if (DebugReadout.Len() == 0)
+        DebugReadout  = RdxDefaultReadout;
+    if (Geometry.Len() == 0)
+        Geometry      = RdxDefaultGeometry;
+    if (Bloom.Len() == 0)
+        Bloom         = RdxDefaultBloom;
+    if (LensFlare.Len() == 0)
+        LensFlare     = RdxDefaultLensFlare;
+    if (Grass3D.Len() == 0)
+        Grass3D       = RdxDefaultGrass3D;
+    if (Trees3D.Len() == 0)
+        Trees3D       = RdxDefaultTrees3D;
+    if (ForceField.Len() == 0)
+        ForceField    = RdxDefaultForceField;
+    if (Flashlight.Len() == 0)
+        Flashlight    = RdxDefaultFlashlight;
+    if (HdtpHoloFix.Len() == 0)
+        HdtpHoloFix   = RdxDefaultHdtpHoloFix;
 
     const UBOOL bOwnFile = LoadSettingsFile();
     if (bOwnFile)
@@ -6398,8 +6982,15 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         Fire3D               = SettingOnOff("Fire3D",                RdxDefaultFire3D);
         if (!SettingText("Grass3D", Grass3D))
             Grass3D = RdxDefaultGrass3D;
-        Trees3D              = SettingOnOff("Trees3D",               RdxDefaultTrees3D);
+        if (!SettingText("Trees3D", Trees3D))
+            Trees3D = RdxDefaultTrees3D;
+        Spherifier           = SettingOnOff("Spherifier",            RdxDefaultSpherifier);
+        SpherifierDistance   = RdxMath::SpherifierDistanceOf(
+            appRound(SettingFloat("SpherifierDistance", (FLOAT)RdxDefaultSpherifierDistance)));
+        SpherifierAngle      = RdxMath::SpherifierAngleOf(
+            appRound(SettingFloat("SpherifierAngle", (FLOAT)RdxDefaultSpherifierAngle)));
         Wind                 = SettingOnOff("Wind",                  RdxDefaultWind);
+        Puddles              = SettingOnOff("Puddles",               RdxDefaultPuddles);
         FogRooms             = SettingFixed("Fog",                  RdxDefaultFogRooms);
         if (!SettingText("ForceField", ForceField))
             ForceField = RdxDefaultForceField;
@@ -6409,8 +7000,12 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
             HdtpHoloFix = RdxDefaultHdtpHoloFix;
         RevisionSplashScreenFix = SettingOnOff("RevisionSplashScreenFix", RdxDefaultSplashFix);
         LoadFix                 = SettingOnOff("LoadFix", RdxDefaultLoadFix);
-        // Read where someone wrote it into the settings file, and written nowhere (GPomWheelOn).
+        // Read where someone wrote them into the settings file, and written nowhere (GPomWheelOn, GShotPairOn).
         GPomWheelOn             = SettingOnOff("HeightMapWheel", 0) ? 1 : 0;
+        GShotPairOn             = SettingOnOff("Screenshot", 0) ? 1 : 0;
+        if (GShotPairOn)
+            RDX_LOG("screenshot: on (Screenshot=On) - Shift with the menu key takes the frame, then the same moment "
+                    "in Vanilla, into SecondRevision-Screenshots beside the renderer");
         GodRays              = SettingOnOff("GodRays",               RdxDefaultGodRays);
         FsrSharpness         = SettingFloat("FsrSharpness",         RdxDefaultFsrSharpness);
         if (!SettingText("Upscale", Upscale))
@@ -6549,7 +7144,7 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         GCustomWater = V[0] ? RdxMath::ParseWater(V, bKnown) : RdxDefaultWater;
         if (V[0] && !bKnown)
             RDX_LOGF("WaterQuality: unknown value '%s' - Off (Off, Low, High)", appFromAnsi(V));
-        // The reflections (Default, High, RT). A file with no key for them says them by its water's level
+        // The reflections (Default, High, RTLow, RTMedium, RTHigh). A file with no key for them says them by its water's level
         // (RdxMath::ReflectionsOfOldWater), so the picture it gives stays what it is.
         char R[32];
         R[0] = 0;
@@ -6559,7 +7154,7 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         GCustomReflections = R[0] ? RdxMath::ParseReflections(R, bKnownR)
                                   : (V[0] ? RdxMath::ReflectionsOfOldWater(V) : RdxDefaultReflections);
         if (R[0] && !bKnownR)
-            RDX_LOGF("Reflections: unknown value '%s' - Default (Default, High, RT)", appFromAnsi(R));
+            RDX_LOGF("Reflections: unknown value '%s' - Default (Default, High, RTLow, RTMedium, RTHigh)", appFromAnsi(R));
         if (!R[0] && V[0])
         {
             TCHAR Name[16];
@@ -6594,6 +7189,15 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         if (RtKnobs > 0)
             RDX_LOGF("ray tracing (marker): the RT factor with %i lights a pixel and %i samples an edge", RtKnobs / 10,
                      RtKnobs % 10);
+        // A measurement: how many lamps cast their shadows in the mirror image at Reflections=RTLow, for this start
+        // (RdxMath::RtLowShadowedLamps; 9: all of them).
+        const INT RtLowLamps = MarkerNumber(L"SecondRevision-rtlow-lamps.txt", -1, -1);
+        if (RtLowLamps >= 0)
+        {
+            Backend.RequestRtLowLamps((RtLowLamps >= 9) ? 0 : Min(RtLowLamps, (INT)RdxMath::RtLowLampsMost));
+            RDX_LOGF("ray tracing (marker): at RTLow %i of the lamps cast shadows in the mirror image (0: all)",
+                     (RtLowLamps >= 9) ? 0 : Min(RtLowLamps, (INT)RdxMath::RtLowLampsMost));
+        }
         // A measurement: the RT water's measuring views (FBackend::RequestRtWaterView), for this start.
         const INT RtWaterView = MarkerNumber(L"SecondRevision-rt-water-view.txt", 0, 1);
         Backend.RequestRtWaterView(RtWaterView);
@@ -6603,7 +7207,13 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
                                                       TEXT("the sky from the far probe alone"),
                                                       TEXT("how high above the water its mirror rays met something"),
                                                       TEXT("the surfaces' own colours alone, without their textures") };
-        if (RtWaterView == 11)
+        if (RtWaterView == 13)
+            RDX_LOGF("ray tracing (marker): at RTLow a borrowed answer whose triangle the pixel's own ray passes is "
+                     "taken for one that met nothing, for this start - measurement only");
+        else if (RtWaterView == 12)
+            RDX_LOGF("ray tracing (marker): at RTLow the mirror image shows how the pixels' borrowed answers went (green "
+                     "the own ray meets the borrowed triangle, red it passes it, grey none borrowed) - measurement only");
+        else if (RtWaterView == 11)
             RDX_LOGF("ray tracing (marker): the RT water shows which light its mirror rays' level surfaces are given "
                      "(red a dark light map, green a lit one, magenta held at its edge, blue/cyan none) - measurement only");
         else if (RtWaterView == 10)
@@ -6612,6 +7222,16 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         else if (RtWaterView > 0)
             RDX_LOGF("ray tracing (marker): the RT water shows %s for this start - measurement only",
                      RtWaterViews[Clamp(RtWaterView, 1, 7)]);
+        // A measurement: the wet floors' measuring views (FBackend::RequestWetView), for this start - 1 the patches and
+        // the water, 2 the place in the level as a grid.
+        const INT WetView = MarkerNumber(L"SecondRevision-wet-view.txt", 0, 1);
+        Backend.RequestWetView(WetView);
+        if (WetView == 1)
+            RDX_LOGF("wet floors (marker): drawn as their patches - grey the wetter, blue the share under water, a red "
+                     "tint on metal - for this start, measurement only");
+        else if (WetView == 2)
+            RDX_LOGF("wet floors (marker): drawn as their place in the level - a line every 64 units along X (red) and "
+                     "Y (green), the height in bands of 16 (blue) - for this start, measurement only");
         const INT RtShadowMode = MarkerNumber(L"SecondRevision-rt-shadow.txt", 0, 1);
         Backend.RequestRtShadows(RtShadowMode);
         if (RtShadowMode > 0)
@@ -6781,8 +7401,23 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         RdxMath::GrassName(GCustomGrass, Name, 16);
         Grass3D = Name;
     }
-    GCustomTrees     = Trees3D ? TreesMixed : 0;
+    {
+        char A[32];
+        AsciiOf(*Trees3D, A, 32);
+        const INT Level = RdxMath::ParseTrees(A);
+        if (Level < 0)
+            RDX_LOGF("Trees3D: unknown value '%s' - High (Off, Low, Medium, High)", *Trees3D);
+        GCustomTrees = (Level < 0) ? RdxMath::Trees_High : Level;
+        TCHAR Name[16];
+        RdxMath::TreesName(GCustomTrees, Name, 16);
+        Trees3D = Name;
+    }
+    GCustomSpherifier = Spherifier ? 1 : 0;
+    // The spherifier's numbers hold under every preset (TakePicture leaves them be).
+    GSpherifierDistance = RdxMath::SpherifierDistanceOf(SpherifierDistance);
+    GSpherifierAngle    = RdxMath::SpherifierAngleOf(SpherifierAngle);
     GCustomWind      = Wind ? 1 : 0;
+    GCustomPuddles   = Puddles ? 1 : 0;
     GCustomFogRooms  = FogRooms ? 1 : 0;
     {
         bool bK = false;
@@ -6854,7 +7489,9 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         GRunFire       = GCustomFire;
         GRunGrass      = GCustomGrass;
         GRunTrees      = GCustomTrees;
+        GRunSpherifier = GCustomSpherifier;
         GRunWind       = GCustomWind;
+        GRunPuddles    = GCustomPuddles;
         GRunFogRooms   = GCustomFogRooms;
         GRunForceField = GCustomForceField;
         SetRunFlashlight(GCustomFlashlight);
@@ -6877,7 +7514,9 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         const INT FpsMark = MarkerNumber(L"SecondRevision-fps-limit.txt", -1, 0);
         if (FpsMark >= 0)
         {
-            Fps = (FpsMark == 0) ? (INT)RdxMath::FpsLimit_Off : FpsMark;
+            Fps          = (FpsMark == 0) ? (INT)RdxMath::FpsLimit_Off : FpsMark;
+            GFpsMarked   = Fps;
+            GFpsMarkedOn = 1;
             RDX_LOGF("frame rate (marker): limit %i for this start (0 is none) - measurement only", FpsMark);
         }
         Backend.SetFrameLimit(Fps, bSync);
@@ -7512,6 +8151,7 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
             RdxShaderCacheElsewhere(Folder);
     }
     RdxStartupMark(TEXT("Init: the settings read, the window made borderless"));
+    Backend.AnswerWhile = &AnswerWhileCompiling;
     if (!Backend.Init(Window, InViewport->SizeX, InViewport->SizeY))
         return 0;
     RdxStartupMark(TEXT("Init: the backend is up"));
@@ -7623,17 +8263,26 @@ UBOOL URevisionRenderDevice::SetRes(INT NewX, INT NewY, INT NewColorBytes, UBOOL
 
 static void ForgetShadowShapes();
 static void ForgetLevelPlantShapes();
+static void ForgetPlantJobs();
+static void ForgetPieceJobs();
+static void StopPieceJobs();
 
 static void ReliefLevelForget();
 
 static void ForgetLevelFires();
+static void ForgetRoundModels();
+static void SpherePieceBlocksForget();
 static void ForgetFogLists();
 static void ForgetShadowLists();
 static void FreeShapeCache();
 
+static void SphereJobWait();
+
 void URevisionRenderDevice::Exit()
 {
     RDX_LOGF("Exit after %i frames", FrameCounter);
+    RdxShotWriteWait();
+    SphereJobWait();
     RdxCpuSamplerStop();
     LoadFixListen(0);
     RdxShaderCacheSave(1);
@@ -7642,6 +8291,8 @@ void URevisionRenderDevice::Exit()
     RdxPresentWatchStop();
     RdxStallWatchStop();
     Backend.Shutdown();
+    ForgetPlantJobs();
+    ForgetPieceJobs();
     ForgetShadowShapes();
     FreeShapeCache();
     ForgetShadowLists();
@@ -7649,6 +8300,8 @@ void URevisionRenderDevice::Exit()
     ForgetFogLists();
     ReliefLevelForget();
     RdxWaterForget();
+    ForgetRoundModels();
+    SpherePieceBlocksForget();
     RdxCrashLogRemove();
     RdxLogClose();
 }
@@ -7785,6 +8438,18 @@ void URevisionRenderDevice::Flush(UBOOL /*AllowPrecache*/)
     // And the relief's record of the level's edges (ReliefLevelRead).
     ReliefLevelForget();
     RdxWaterForget();
+    // And the models the spherifier knew: the level's meshes go with it, and another may come at a freed one's address.
+    ForgetRoundModels();
+    SpherePieceBlocksForget();
+    // The mirror probe holds the level being left.
+    Backend.ForgetMirrorProbe();
+    // The level's own large blocks let go now, not when the next level makes its own: the shadow maps' copy of its
+    // triangles (the GPU is idle - FlushTextures waited for it) and the light maps' blending. A large level following a
+    // large one otherwise holds both at once, in an address space of 32 bits.
+    Backend.ForgetShadowWorld();
+    SphereLightForget();
+    // And the spherifier's roundings themselves (SphereLevelsForget).
+    SphereLevelsForget();
 #if RDX_DIAG_DRAW_ORDER
     GSorLoadFrame = FrameCounter;
 #endif
@@ -7857,6 +8522,11 @@ static void NoteFlash(const FPlane& Scale, const FPlane& Fog)
 enum { MeshFogRoom = 3 * 4096 };
 static FSolidVertex GMeshFog[2][MeshFogRoom];        // [0] the whole ones', [1] the masked ones'
 static INT          GMeshFogCount[2] = { 0, 0 };
+
+// The mesh pieces held back for their model's rounding (RoundHold), drawn before anything else of the engine's is - or
+// let go undrawn where nothing can be drawn.
+static void RoundRelease(FBackend& Backend);
+static void RoundHeldForget();
 
 static void FlushMeshFog(FBackend& Backend)
 {
@@ -8321,8 +8991,134 @@ static void DumpReadPixels(FBackend& Backend, UViewport* Viewport)
 }
 #endif
 
+// Screenshot=On: the pair of pictures Shift with the menu key asks for - the frame as it runs, then the same moment in
+// the Vanilla preset - and back to what ran. Each picture is read back once its frame is done (FBackend::ReadScene, the
+// way the engine's own screenshots go) and handed to a thread of its own to be written as a PNG (ShotWriter.h), into
+// SecondRevision-Screenshots beside the renderer, named by the time of the press and its preset. Vanilla is held for
+// ShotPairSettle frames before its picture is taken: its targets are made again between frames, and the trees go back
+// to the level's own. The menu is not involved, so nothing is written into the settings file, and what ran is put back
+// as it was - a preset by its name, the custom set by its values.
+enum { ShotPairSettle = 10 };
+static INT                     GShotPairLeft = 0;   // the frames of Vanilla still to wait; 0: no pair under way
+static RdxMath::EPreset        GShotPairWas  = RdxMath::Preset_Custom;
+static RdxMath::FPresetPicture GShotPairPicture;
+static WCHAR                   GShotPairStamp[32];
+
+// A picture's file: SecondRevision-Screenshots\<stamp>-<preset>.png beside the renderer, the folder made where it is
+// missing. 0 where no such path can be had.
+static UBOOL ShotPath(WCHAR* Out, INT Max, const WCHAR* Stamp, const TCHAR* Preset)
+{
+    Out[0] = 0;
+    HMODULE Self = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              (LPCWSTR)&GShotPairOn, &Self) || !Self)
+        return 0;
+    WCHAR Path[MAX_PATH];
+    const DWORD N = ::GetModuleFileNameW(Self, Path, MAX_PATH);
+    if (N == 0 || N >= MAX_PATH)
+        return 0;
+    INT Cut = -1;
+    for (INT i = 0; Path[i]; i++)
+        if (Path[i] == L'\\' || Path[i] == L'/')
+            Cut = i;
+    if (Cut < 0)
+        return 0;
+    Path[Cut + 1] = 0;
+    // The folder, a backslash, the stamp, a dash, the preset and ".png", within both buffers.
+    if (::lstrlenW(Path) + 26 + ::lstrlenW(Stamp) + ::lstrlenW(Preset) + 6 >= Min(Max, (INT)MAX_PATH))
+        return 0;
+    ::lstrcatW(Path, L"SecondRevision-Screenshots");
+    ::CreateDirectoryW(Path, nullptr);
+    ::lstrcpyW(Out, Path);
+    ::lstrcatW(Out, L"\\");
+    ::lstrcatW(Out, Stamp);
+    ::lstrcatW(Out, L"-");
+    ::lstrcatW(Out, Preset);
+    ::lstrcatW(Out, L".png");
+    return 1;
+}
+
+// One picture of the frame just finished: read back and handed to a writer, and said in the log either way.
+static void TakeShot(FBackend& Backend, UViewport* Viewport, RdxMath::EPreset P)
+{
+    TCHAR Name[32];
+    RdxMath::PresetName(P, Name, 32);
+    const INT W = Viewport ? Viewport->SizeX : 0;
+    const INT H = Viewport ? Viewport->SizeY : 0;
+    WCHAR Path[MAX_PATH];
+    if (W <= 0 || H <= 0 || !ShotPath(Path, MAX_PATH, GShotPairStamp, Name))
+    {
+        RDX_LOGF("screenshot: %s skipped - no window size, or no folder for it", Name);
+        return;
+    }
+    void* const Pixels = RdxShotAlloc(W, H);
+    if (!Pixels)
+    {
+        RDX_LOGF("screenshot: %s skipped - no memory for a %ix%i picture", Name, W, H);
+        return;
+    }
+    if (!Backend.ReadScene((FColor*)Pixels, W, H))
+    {
+        RdxShotFree(Pixels);
+        RDX_LOGF("screenshot: %s skipped - the frame could not be read back", Name);
+        return;
+    }
+    if (RdxShotWriteStart(Pixels, W, H, Path))
+        RDX_LOGF("screenshot: %s taken (%ix%i)", Name, W, H);
+    else
+        RDX_LOGF("screenshot: %s skipped - every writer is busy", Name);
+}
+
+void URevisionRenderDevice::ShotPairFrame()
+{
+    // The writes finished since the last frame, said in the log - from here, the game's own thread.
+    WCHAR Done[MAX_PATH];
+    INT   bWritten = 0;
+    while (RdxShotWriteDone(Done, MAX_PATH, &bWritten))
+        RDX_LOGF("screenshot: %s %s", bWritten ? TEXT("written") : TEXT("FAILED to write"), Done);
+
+    if (GShotPairLeft > 0)
+    {
+        GShotPairAsked = 0;        // a press while a pair is under way is not another pair
+        if (--GShotPairLeft > 0)
+            return;
+        TakeShot(Backend, URenderDevice::Viewport, RdxMath::Preset_Vanilla);
+        // Back to what ran: a preset by its name, the custom set by its values.
+        if (GShotPairWas == RdxMath::Preset_Custom)
+        {
+            GRunPreset = RdxMath::Preset_Custom;
+            ApplyPicture(GShotPairPicture);
+        }
+        else
+            ApplyPreset(GShotPairWas);
+        TCHAR Name[32];
+        RdxMath::PresetName(GShotPairWas, Name, 32);
+        RDX_LOGF("screenshot: back to %s", Name);
+        return;
+    }
+    if (!GShotPairAsked)
+        return;
+    GShotPairAsked = 0;
+    if (!GShotPairOn || Backend.GetDeviceLost())
+        return;
+    SYSTEMTIME T;
+    ::GetLocalTime(&T);
+    ::wsprintfW(GShotPairStamp, L"%04u%02u%02u-%02u%02u%02u", T.wYear, T.wMonth, T.wDay, T.wHour, T.wMinute,
+                T.wSecond);
+    TakeShot(Backend, URenderDevice::Viewport, GRunPreset);
+    // In Vanilla already, that one picture is all there is to take.
+    if (GRunPreset == RdxMath::Preset_Vanilla)
+        return;
+    GShotPairWas     = GRunPreset;
+    GShotPairPicture = RunningPicture();
+    ApplyPreset(RdxMath::Preset_Vanilla);
+    GShotPairLeft    = ShotPairSettle;
+}
+
 void URevisionRenderDevice::Unlock(UBOOL Blit)
 {
+    // The pieces made ahead and not yet taken are no longer needed this frame (StartPieceJobs).
+    StopPieceJobs();
     // The plants hidden for the frame shown again, before anything of the frame's end reads the level's actors.
     ShowLevelTrees(Backend, FrameCounter);
     if (GLogDebug)
@@ -8338,8 +9134,10 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         UndressHolograms();
         GMeshFogCount[0] = 0;
         GMeshFogCount[1] = 0;
+        RoundHeldForget();
         return;
     }
+    RoundRelease(Backend);
     FlushMeshFog(Backend);
 
     // Flicker detector. A one-frame flash is far too fast to catch by screenshot at
@@ -8421,6 +9219,15 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         RDX_LOGF("glass (frame %i): %i surfaces of the levels' glass with a mirror layer over them", FrameCounter,
                  GNode.GlassPanes);
     }
+    // The wet floors' textures in view: said at the first frame that has any, and then one in 600 - their wet look is
+    // yet to come (docs/terv-nedves-feluletek.md 8.4).
+    static UBOOL bWetSaid = 0;
+    if (GNode.WetSurfaces > 0 && (!bWetSaid || (FrameCounter % 600) == 0))
+    {
+        bWetSaid = 1;
+        RDX_LOGF("wet floors (frame %i): %i surfaces drawn of a texture the list names", FrameCounter,
+                 GNode.WetSurfaces);
+    }
     // The water's polygons cut up for the lifting (AddWaterFans): said at the first frame that cuts any, and then at
     // every six-hundredth that does.
     static UBOOL bWaterCutSaid = 0;
@@ -8472,6 +9279,7 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
     GTime.SumMapRefreshes  += TC.GetFrameMapRefreshes();
     GTime.SumRefreshSec    += TC.GetFrameRefreshSec();
     GTime.SumMapRefreshSec += TC.GetFrameMapRefreshSec();
+    GTime.SumRefreshesKept += TC.GetFrameRefreshesKept();
 
 #if RDX_DIAG_DRAW_ORDER
     if (GSorActive)
@@ -8711,6 +9519,10 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         DumpReadPixels(Backend, URenderDevice::Viewport);
 #endif
 
+    // Screenshot=On: the pair of pictures (ShotPairFrame). Here, after EndFrame, where the frame can be read back, and
+    // before the menu's work below, which puts a preset change on between this frame and the next.
+    ShotPairFrame();
+
     // What the renderer's menu asked for. HERE, and not where the menu is drawn: the targets and the shadow maps can
     // only be rebuilt between two frames, and inside one both calls refuse.
     // Nothing can be rebuilt on a device that is gone, and trying is not free: each attempt walks the whole chain
@@ -8805,6 +9617,18 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         T.Steps   = (SwSteps   > 0) ? SwSteps                   : (INT)RdxMath::CloudSteps;
         Backend.SetCloudTuning(T);
     }
+    // The model picked (LookPick), where it is nearer than the surface picked, and the level's light nearest whichever
+    // was hit - only while the readout shows them. Kept as the surface's line is, where nothing was hit.
+    if (GRunReadout == RdxMath::Readout_On && GLookLevel && (GLookName[0] || GPomPickDepth > 0.0f))
+    {
+        const UBOOL bModel = GLookName[0] && (GPomPickDepth <= 0.0f || GLookDepth < GPomPickDepth);
+        appMemcpy(GLookShown, bModel ? GLookName : "", bModel ? LOOK_CHARS : 1);
+        GLookShown[LOOK_CHARS - 1] = 0;
+        NearestLightText(GLookLevel, bModel ? GLookAt : GPomPickAt, GLightShown, LOOK_CHARS);
+    }
+    GLookName[0] = 0;
+    GLookDepth   = 0.0f;
+    GLookLevel   = nullptr;
     // This frame's pick becomes the one the readout shows, and the search starts again. Kept rather than cleared, so
     // that a frame where the crosshair falls on nothing at all - the sky, a mesh - leaves the last surface named
     // instead of blanking the line.
@@ -8948,10 +9772,18 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
                  GTime.SumEndPart[0] * K, GTime.SumEndPart[1] * K, GTime.SumEndPart[2] * K,
                  GTime.SumEndPart[3] * K, GTime.SumEndPart[4] * K);
         RDX_LOGF("time per frame, textures recorded again (%i frames): %.1f a frame in %.3f ms; of them light and fog "
-                 "maps %.1f in %.3f ms", GTime.Frames, GTime.SumRefreshes / N, GTime.SumRefreshSec * K,
-                 GTime.SumMapRefreshes / N, GTime.SumMapRefreshSec * K);
+                 "maps %.1f in %.3f ms; %.1f more built again just as the texture held them, left as they were",
+                 GTime.Frames, GTime.SumRefreshes / N, GTime.SumRefreshSec * K, GTime.SumMapRefreshes / N,
+                 GTime.SumMapRefreshSec * K, GTime.SumRefreshesKept / N);
+        if (GSphereSurfs > 0.0)
+            RDX_LOGF("time per frame, the spherifier (%i frames): %.1f surfaces drawn in its pieces, %.0f pieces, in %.3f ms "
+                     "(the whole of those surfaces' drawing; making the pieces, %.0f of them over all the passes, %.3f of it); "
+                     "the turned-away polygons' bulges %.3f ms", GTime.Frames, GSphereSurfs / N, GSpherePieces / N,
+                     GSphereSurfSec * K, GSphereMade / N, GSpherePieceSec * K, GSphereBackSec * K);
+        GSphereSurfSec = GSphereBackSec = GSpherePieceSec = GSphereMade = GSphereSurfs = GSpherePieces = 0.0;
         GTime.SumRefreshes = GTime.SumMapRefreshes = 0.0;
         GTime.SumRefreshSec = GTime.SumMapRefreshSec = 0.0;
+        GTime.SumRefreshesKept = 0.0;
         appMemzero(GTime.SumKind, sizeof(GTime.SumKind));
         appMemzero(GTime.SumCalls, sizeof(GTime.SumCalls));
         appMemzero(GTime.SumEndPart, sizeof(GTime.SumEndPart));
@@ -9485,6 +10317,8 @@ static UBOOL ReliefDrawsInView(const FSceneNode* Frame, INT EngineFrame)
 
 // The surfaces Geometry=Tessellation raised in mirrors' views since the log last said how many.
 static INT GReliefMirrorRaised = 0;
+// And the surfaces raised on the spherifier's rounding (DSRelief's SphereMoveAt), the same way.
+static INT GReliefRoundRaised = 0;
 
 // A mirror of the level's own, looked into from the frame's world view: the engine draws the world once more through
 // it, and Geometry=Tessellation raises the relief there as well - a raised wall stands raised in its mirror image
@@ -11161,8 +11995,1997 @@ static UBOOL ShadowNodeUsable(const UModel* M, const FBspNode& Node, INT& Why)
     return 1;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The spherifier (Spherifier=On, SpherifierDistance=<units>, SpherifierAngle=<degrees>; LevelRound.h)
+// ---------------------------------------------------------------------------------------------------------------
+// The level's round shapes that its makers could only build of flat walls - a pool, a tank, a tower, a dome, a round
+// hole - rounded, once a level, from the level's own polygons, by the rule the models are rounded by (MeshRound.h). What
+// moved is drawn in place of the engine's polygons (SpherePiece), and it is what the shadows and the rays have of the
+// level (BuildShadowWorld). The collision stays the level's own: that is why the setting is the most a wall moves, and
+// small.
+struct FSphereLevel
+{
+    RdxSphere::FResult R;
+    const UModel*      Model   = nullptr;   // the model it was made of
+    INT                Flushes = -1;        // GLevelFlushes when it was made
+    INT                Cap     = -1;        // SpherifierCap() when it was made
+    INT                Angle   = -1;        // and GSpherifierAngle
+    INT                Nodes   = 0;         // the model's nodes then
+    // Each node's first corner then: a node the engine has given to something else since - a mover's polygons come and
+    // go among the model's nodes - is not the one that was rounded.
+    TArray<FVector>    First;
+    UBOOL              bOn     = 0;         // something moved
+};
+// Two of them: the one drawn, and the one a new number is rounded into meanwhile (FSphereJob).
+static FSphereLevel  GSphereSlots[2];
+static FSphereLevel* GSphere = &GSphereSlots[0];
+// Counted up each time what is drawn changes: the relief's copy of the rounding on the card is made again by it
+// (FBackend::SetSphereField).
+static INT GSphereGen = 0;
+// How much further back a piece of the spherifier's is drawn where the relief's patches stand over it (DSRelief rounds
+// them by the field itself): the pieces' flat faces may stand off the arc by up to Spherify.h's Sag, towards the eye.
+static const FLOAT SphereUnderPatches = 0.1f;
+// How near the eye a piece of the spherifier's is cut: at the GPU's own cut, a view depth of one. A corner nearer than
+// that would be given the depth of one (RdxMath::DepthFromViewZ) - and its triangle the perspective of it: the texture
+// bent over the whole triangle, the part before the cut drawn in front of everything, and its shadow cast.
+static const FLOAT SphereNear = 1.0f;
+// The spherifier's clock, for the parts of its time in the log line.
+static double SphereSeconds() { return (double)appSeconds(); }
+
+// A rounding made beside the game, on a thread of its own, when the number moves in the menu: a large level takes the
+// good part of a second, and the game would stand still for it - and lose the menu's key presses meanwhile. The level's
+// polygons are copied for it on the game's thread; it rounds them into the slot not drawn, which is drawn from the
+// frame it is done in. Nothing else of the renderer's is touched by it.
+struct FSphereJob
+{
+    HANDLE                               Thread = nullptr;
+    volatile LONG                        bDone  = 0;
+    FSphereLevel*                        Into   = nullptr;
+    RdxSphere::TList<RdxSphere::FV3>     Pts;
+    RdxSphere::TList<RdxSphere::FPolyIn> Polys;
+    bool                                 bMade = false;     // false: there was no memory for it
+    double                               Ms    = 0.0;
+};
+static FSphereJob GSphereJob;
+
+static DWORD WINAPI SphereJobMain(LPVOID)
+{
+    FSphereJob&  J  = GSphereJob;
+    const double T0 = SphereSeconds();
+    J.bMade = RdxLevelRound::Round(J.Pts.Data, J.Pts.Num, J.Polys.Data, J.Polys.Num, (double)J.Into->Cap,
+                                   (double)J.Into->Angle, J.Into->R);
+    J.Ms    = (SphereSeconds() - T0) * 1000.0;
+    ::InterlockedExchange(&J.bDone, 1);
+    return 0;
+}
+
+// The job's end waited for, if one is running.
+static void SphereJobJoin()
+{
+    FSphereJob& J = GSphereJob;
+    if (!J.Thread)
+        return;
+    ::WaitForSingleObject(J.Thread, INFINITE);
+    ::CloseHandle(J.Thread);
+    J.Thread = nullptr;
+}
+
+// At the renderer's end: a job still running is waited for - it runs this module's code.
+static void SphereJobWait()
+{
+    SphereJobJoin();
+    GSphereJob.Pts.Free();
+    GSphereJob.Polys.Free();
+}
+
+// The log's line of a rounding made: Ms how long it took, Where where it was made.
+static void SphereLog(const FSphereLevel& L, double Ms, const TCHAR* Where)
+{
+    const RdxSphere::FResult& R = L.R;
+    RDX_LOGF("spherifier: %i polygons of the level, %i of them drawn and staying (%i T-junctions put in, %i of too many "
+             "corners or none to cut), cut into %i triangles with %i soft edges and %i creases at %i degrees; %i polygons "
+             "moved (the most a point moves: %.2f of %i units), into %i triangles; %.1f ms%s on %i thread(s) (welding "
+             "%.0f, T-junctions %.0f, triangles %.0f, shape %.0f, pieces %.0f, made again %.0f, moves %.0f, polygons "
+             "%.0f, outlines %.0f); it holds %.1f MB",
+             L.Nodes, R.Walls, R.TPoints, R.Folded, R.Segments, R.SoftEdges, R.Creases, L.Angle, R.Touched,
+             R.LargestMove, L.Cap, R.Tri.Num / 3, Ms, Where, R.Workers, R.PartMs[0], R.PartMs[1], R.PartMs[2],
+             R.PartMs[3], R.PartMs[4], R.PartMs[5], R.PartMs[6], R.PartMs[7], R.PartMs[8],
+             (DOUBLE)R.Bytes() / (1024.0 * 1024.0));
+    RDX_LOGF("spherifier: the relief's outlines on the pieces' sides - %i walls with %i edges of %i points, %i walls "
+             "whose triangles make no ring (their outline keeps to the curve)", R.ChordPolys, R.ChordFirst.Num,
+             R.ChordT.Num, R.ChordMissed);
+    RDX_LOGF("spherifier: held behind what stands in front of the walls - %i places stopped short of it, %i eased "
+             "round those", R.HeldStopped, R.HeldEased);
+}
+
+// A slot let go: nothing in it, and made of no model.
+static void SphereSlotForget(FSphereLevel& L)
+{
+    L.R.Free();
+    L.Model   = nullptr;
+    L.Flushes = -1;
+    L.Cap     = -1;
+    L.Angle   = -1;
+    L.Nodes   = 0;
+    L.First.Empty();
+    L.bOn     = 0;
+}
+
+// The roundings let go at a level's change (Flush) - both slots, and the polygons the last was made of: the level left
+// is not drawn again, and the next one is rounded anew whatever it is. A large level's rounding is tens of megabytes,
+// and the slot not drawn held the one before it through the whole of the next level.
+static void SphereLevelsForget()
+{
+    SphereJobJoin();
+    SphereSlotForget(GSphereSlots[0]);
+    SphereSlotForget(GSphereSlots[1]);
+    GSphereJob.Pts.Free();
+    GSphereJob.Polys.Free();
+}
+
+// The level's polygons as the spherifier takes them, into Pts and Polys, and what the slot L keeps of the model: its
+// nodes' first corners. False when there was no memory for them.
+static UBOOL SphereInput(FBackend& Backend, UModel* M, FSphereLevel& L, RdxSphere::TList<RdxSphere::FV3>& Pts,
+                         RdxSphere::TList<RdxSphere::FPolyIn>& Polys)
+{
+    const INT N = M->Nodes.Num();
+    Pts.Clear();
+    L.First.Empty();
+    if (!Polys.Resize(N))
+        return 0;
+    L.First.Add(N);
+    // Whether the relief may be drawn on a surface (Spherify.h's Use_Relief): its texture has a height map switched on,
+    // and it is drawn solid - whatever the relief's own switch says now, so that turning it on later finds the edges
+    // already cut for it. Asked once a texture; a surface's answer kept (0 not asked, 1 no, 2 yes).
+    RdxSphere::TList<unsigned char> SurfRelief, AskedRelief;
+    RdxSphere::TList<UTexture*>     AskedTex;
+    if (!SurfRelief.Resize(M->Surfs.Num() > 0 ? M->Surfs.Num() : 1))
+        return 0;
+    for (INT s = 0; s < M->Surfs.Num(); s++)
+        SurfRelief[s] = 0;
+    for (INT n = 0; n < N; n++)
+    {
+        const FBspNode&     Node = M->Nodes(n);
+        RdxSphere::FPolyIn& P    = Polys[n];
+        P.First = Pts.Num;
+        P.Count = 0;
+        P.Nx    = Node.Plane.X;
+        P.Ny    = Node.Plane.Y;
+        P.Nz    = Node.Plane.Z;
+        P.W     = Node.Plane.W;
+        P.Use   = 0;
+        L.First(n) = FVector(0.0f, 0.0f, 0.0f);
+        if (Node.NumVertices < 3 || Node.iSurf < 0 || Node.iSurf >= M->Surfs.Num() || Node.iVertPool < 0 ||
+            Node.iVertPool + (INT)Node.NumVertices > M->Verts.Num())
+            continue;
+        UBOOL bIn = 1;
+        for (INT k = 0; k < Node.NumVertices && bIn; k++)
+        {
+            const INT V = M->Verts(Node.iVertPool + k).pVertex;
+            bIn = V >= 0 && V < M->Points.Num();
+        }
+        if (!bIn)
+            continue;
+        // The flags it is drawn with - its own and its texture's - and the editor's sky marker, which the engine does
+        // not draw (as BuildShadowWorld has them).
+        const FBspSurf& Sf      = M->Surfs(Node.iSurf);
+        const UBOOL     bMarker = Sf.Texture && appStricmp(Sf.Texture->GetName(), TEXT("Marker_sky")) == 0;
+        const DWORD     Flags   = Sf.PolyFlags | (Sf.Texture ? Sf.Texture->PolyFlags : 0) | (bMarker ? PF_FakeBackdrop : 0);
+        const bool      bMover  = Sf.Actor && Sf.Actor->IsA(AMover::StaticClass());
+        P.Use = RdxSphere::UseFor((unsigned int)Flags, bMover);
+        if ((P.Use & RdxSphere::Use_Wall) && Sf.Texture && !(Flags & (PF_Translucent | PF_Modulated)))
+        {
+            unsigned char& Known = SurfRelief[Node.iSurf];
+            if (!Known)
+            {
+                INT i = 0;
+                while (i < AskedTex.Num && AskedTex[i] != Sf.Texture)
+                    i++;
+                if (i == AskedTex.Num)
+                {
+                    const INT Entry = Backend.FindPom(Sf.Texture->GetPathName(), Sf.Texture->USize, Sf.Texture->VSize);
+                    const unsigned char Has = (unsigned char)((Entry >= 0 && Backend.PomIsOn(Entry)) ? 2 : 1);
+                    if (!AskedTex.Add(Sf.Texture) || !AskedRelief.Add(Has))
+                        return 0;
+                }
+                Known = AskedRelief[i];
+            }
+            P.Use |= (Known == 2) ? RdxSphere::Use_Relief : 0;
+        }
+        for (INT k = 0; k < Node.NumVertices; k++)
+        {
+            const FVector& Q = M->Points(M->Verts(Node.iVertPool + k).pVertex);
+            if (!Pts.Add(RdxSphere::V3(Q.X, Q.Y, Q.Z)))
+                return 0;
+        }
+        P.Count = Node.NumVertices;
+        L.First(n) = M->Points(M->Verts(Node.iVertPool).pVertex);
+    }
+    INT ReliefPolys = 0, ReliefTextures = 0;
+    for (INT n = 0; n < N; n++)
+        ReliefPolys += (Polys[n].Use & RdxSphere::Use_Relief) ? 1 : 0;
+    for (INT i = 0; i < AskedRelief.Num; i++)
+        ReliefTextures += (AskedRelief[i] == 2) ? 1 : 0;
+    RDX_LOGF("spherifier: %i of the level's %i polygons may carry the relief - %i of the %i textures asked have a height "
+             "map switched on", ReliefPolys, N, ReliefTextures, AskedTex.Num);
+    return 1;
+}
+
+// A measurement (the marker SecondRevision-level-round-dump.txt): the level's polygons as the spherifier takes them,
+// written into the temporary folder as tools\LevelRoundCheck's input (SPI1: the cap, the places, the polygons with
+// their use), SecondRevision-level-round-<level>.in - with the walls the relief may be drawn on, which the level's
+// package alone does not tell.
+static void SphereInputDump(ULevel* Level, double Cap, const RdxSphere::TList<RdxSphere::FV3>& Pts,
+                            const RdxSphere::TList<RdxSphere::FPolyIn>& Polys)
+{
+    WCHAR       Path[MAX_PATH + 160];
+    const DWORD N = ::GetTempPathW(MAX_PATH, Path);
+    if (N == 0 || N >= MAX_PATH)
+        return;
+    ::lstrcatW(Path, L"SecondRevision-level-round-");
+    INT At = ::lstrlenW(Path);
+    const TCHAR* const Name = (Level && Level->GetOuter()) ? Level->GetOuter()->GetName() : TEXT("level");
+    for (INT i = 0; Name[i] && i < 96; i++)
+        Path[At++] = (WCHAR)Name[i];
+    Path[At] = 0;
+    ::lstrcatW(Path, L".in");
+    FILE* F = nullptr;
+    if (_wfopen_s(&F, Path, L"wb") != 0 || !F)
+        return;
+    const INT NumPts = Pts.Num, NumPolys = Polys.Num;
+    fwrite("SPI1", 1, 4, F);
+    fwrite(&Cap, sizeof(double), 1, F);
+    fwrite(&NumPts, sizeof(INT), 1, F);
+    fwrite(Pts.Data, sizeof(RdxSphere::FV3), (size_t)NumPts, F);
+    fwrite(&NumPolys, sizeof(INT), 1, F);
+    for (INT p = 0; p < NumPolys; p++)
+    {
+        const RdxSphere::FPolyIn& P = Polys[p];
+        const double Plane[4] = { P.Nx, P.Ny, P.Nz, P.W };
+        fwrite(&P.First, sizeof(INT), 1, F);
+        fwrite(&P.Count, sizeof(INT), 1, F);
+        fwrite(Plane, sizeof(double), 4, F);
+        fwrite(&P.Use, sizeof(INT), 1, F);
+    }
+    fclose(F);
+    RDX_LOGF("spherifier: the level's polygons written for the rounding's check tool (%i places, %i polygons)", NumPts,
+             NumPolys);
+}
+
+// The level's rounding, made again when the level, the setting or the engine's flush is new. True when what is drawn
+// changed now (EnsureSphere counts it).
+static UBOOL EnsureSphereNow(FBackend& Backend, ULevel* Level)
+{
+    UModel* const M = Level ? Level->Model : nullptr;
+    FSphereJob&   J = GSphereJob;
+    // A job done: drawn from now on, if it is still the level's and the number's.
+    if (J.Thread && J.bDone)
+    {
+        SphereJobJoin();
+        FSphereLevel& Made = *J.Into;
+        if (J.bMade && Made.Model == M && Made.Flushes == GLevelFlushes && Made.Cap == SpherifierCap() &&
+            Made.Angle == GSpherifierAngle)
+        {
+            Made.Nodes = J.Polys.Num;
+            Made.bOn   = Made.R.Touched > 0;
+            GSphere    = &Made;
+            SphereLog(Made, J.Ms, TEXT(" beside the game"));
+            // The rounding before it, of the number before, is drawn no more.
+            SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
+            return 1;
+        }
+    }
+    if (M == GSphere->Model && GSphere->Flushes == GLevelFlushes && GSphere->Cap == SpherifierCap() &&
+        GSphere->Angle == GSpherifierAngle)
+        return 0;
+    // The same level with a new number from the menu: made beside the game once the number has stood still a moment,
+    // not at every step, the rounding before drawn meanwhile.
+    static INT    SeenCap = -1, SeenAngle = -1;
+    static DOUBLE SeenAt  = 0.0;
+    if (SpherifierCap() != SeenCap || GSpherifierAngle != SeenAngle)
+    {
+        SeenCap   = SpherifierCap();
+        SeenAngle = GSpherifierAngle;
+        SeenAt    = appSeconds();
+    }
+    const UBOOL bSameLevel = M && M == GSphere->Model && GSphere->Flushes == GLevelFlushes;
+    if (bSameLevel && (J.Thread || appSeconds() - SeenAt < 0.4))
+        return 0;
+    // A new level: a job still running for the one before is let go.
+    SphereJobJoin();
+    FSphereLevel& L = (GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0];
+    L.Model   = M;
+    L.Flushes = GLevelFlushes;
+    L.Cap     = SpherifierCap();
+    L.Angle   = GSpherifierAngle;
+    L.bOn     = 0;
+    L.Nodes   = 0;
+    if (!M || L.Cap <= 0)
+    {
+        L.First.Empty();
+        L.R.Free();
+        GSphere = &L;
+        SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
+        return 1;
+    }
+    const double T0 = SphereSeconds();
+    if (!SphereInput(Backend, M, L, J.Pts, J.Polys))
+    {
+        RDX_LOG("spherifier: no memory for the level - it is drawn as it is");
+        GSphere = &L;
+        return 1;
+    }
+    static const UBOOL bInputDump = FreshMarker(L"SecondRevision-level-round-dump.txt");
+    if (bInputDump)
+        SphereInputDump(Level, (double)L.Cap, J.Pts, J.Polys);
+    L.R.Seconds = SphereSeconds;
+    // A new level's is waited for: on every thread it may take. One made beside the game, on its thread alone - the
+    // frames go on meanwhile.
+    L.R.Workers = bSameLevel ? 1 : RdxSphere::WorkersAvailable();
+    J.Into      = &L;
+    J.bDone     = 0;
+    J.bMade     = false;
+    if (bSameLevel)
+    {
+        J.Thread = ::CreateThread(nullptr, 0, &SphereJobMain, nullptr, 0, nullptr);
+        if (J.Thread)
+            return 0;
+    }
+    // A new level - only just showing, and its shadows and rays are made of it - or no thread to be had: made here.
+    if (!RdxLevelRound::Round(J.Pts.Data, J.Pts.Num, J.Polys.Data, J.Polys.Num, (double)L.Cap, (double)L.Angle, L.R))
+        RDX_LOG("spherifier: no memory for the level - it is drawn as it is");
+    else
+    {
+        L.Nodes = J.Polys.Num;
+        L.bOn   = L.R.Touched > 0;
+        SphereLog(L, (SphereSeconds() - T0) * 1000.0, TEXT(""));
+    }
+    // What it was made of is made again for the next rounding (SphereInput); and the rounding drawn before is drawn no
+    // more.
+    J.Pts.Free();
+    J.Polys.Free();
+    GSphere = &L;
+    SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
+    return 1;
+}
+static UBOOL EnsureSphere(FBackend& Backend, ULevel* Level)
+{
+    const UBOOL bNew = EnsureSphereNow(Backend, Level);
+    GSphereGen += bNew ? 1 : 0;
+    return bNew;
+}
+
+// How long the direction to lift along is at the corners of a relief patch whose polygon the spherifier did not move:
+// the shader makes the direction unit again, and DSRelief tells such a patch by the length (RELIEF_STILL_TEST, the square
+// of half of it) and leaves it where the level has it. Moved polygons' corners carry it unit long; a split's halves keep
+// the length.
+static const FLOAT ReliefStillScale = 4.0f;
+
+// The spherifier's rows for a relief run whose patches DSRelief rounds (FSolidPass::SetReliefHeld): on; the light map's
+// coordinates against the texture's, along U and V (LightPerU, LightPerV: what slides the light map as far as the
+// texture there); how many of the level's polygons the patches lie on - Nodes, NodeCount of them, at most SPHERE_NODES,
+// or none where there are more (the shader then finds them by the plan's grid); the view's space to the level's, and the
+// level's to the view's, three rows of an axis and an offset each; and the polygons' numbers.
+static void SphereRowsOf(const FSceneNode* Frame, FLOAT LightPerU, FLOAT LightPerV, const INT* Nodes, INT NodeCount,
+                         FLOAT* Out)
+{
+    const INT Own = (NodeCount > 0 && NodeCount <= FSolidPass::SPHERE_NODES) ? NodeCount : 0;
+    Out[0] = 1.0f;
+    Out[1] = LightPerU;
+    Out[2] = LightPerV;
+    Out[3] = (FLOAT)Own;
+    for (INT k = 0; k < FSolidPass::SPHERE_NODES; k++)
+    {
+        const DWORD Word = (k < Own) ? (DWORD)Nodes[k] : 0u;
+        appMemcpy(&Out[28 + k], &Word, sizeof(Word));
+    }
+    auto Rows = [](const FCoords& C, FLOAT* R)
+    {
+        const FVector Axes[3] = { C.XAxis, C.YAxis, C.ZAxis };
+        for (INT k = 0; k < 3; k++)
+        {
+            R[k * 4]     = Axes[k].X;
+            R[k * 4 + 1] = Axes[k].Y;
+            R[k * 4 + 2] = Axes[k].Z;
+            R[k * 4 + 3] = -(Axes[k] | C.Origin);
+        }
+    };
+    Rows(Frame->Uncoords, Out + 4);
+    Rows(Frame->Coords, Out + 16);
+}
+
+// How many of the spherifier's triangles stand in the place of the model's node n: none where it is drawn as the engine
+// has it.
+static INT SphereNodeTris(const UModel* M, INT n)
+{
+    if (!GSphere->bOn || !M || M != GSphere->Model || n < 0 || n >= GSphere->Nodes || GSphere->R.PolyTris[n] <= 0)
+        return 0;
+    if (n >= M->Nodes.Num())
+        return 0;
+    const FBspNode& Node = M->Nodes(n);
+    if (Node.NumVertices < 3 || Node.iVertPool < 0 || Node.iVertPool >= M->Verts.Num())
+        return 0;
+    const INT V = M->Verts(Node.iVertPool).pVertex;
+    if (V < 0 || V >= M->Points.Num() || M->Points(V) != GSphere->First(n))
+        return 0;
+    return GSphere->R.PolyTris[n];
+}
+
+// The same for a polygon the engine hands over.
+static INT SphereTris(const FSceneNode* Frame, const FSavedPoly* Poly)
+{
+    if (!GSphere->bOn || !Poly || !Frame || !Frame->Level)
+        return 0;
+    return SphereNodeTris(Frame->Level->Model, Poly->iNode);
+}
+
+// A triangle of the spherifier's in the level's space: the node n's t-th, its corners where they are now.
+static void SphereTriangle(INT n, INT t, FVector& A, FVector& B, FVector& C)
+{
+    const RdxSphere::FResult& R  = GSphere->R;
+    const INT                 At = (R.PolyFirst[n] + t) * 3;
+    const RdxSphere::FV3&     a  = R.Moved[R.Tri[At]];
+    const RdxSphere::FV3&     b  = R.Moved[R.Tri[At + 1]];
+    const RdxSphere::FV3&     c  = R.Moved[R.Tri[At + 2]];
+    A = FVector((FLOAT)a.X, (FLOAT)a.Y, (FLOAT)a.Z);
+    B = FVector((FLOAT)b.X, (FLOAT)b.Y, (FLOAT)b.Z);
+    C = FVector((FLOAT)c.X, (FLOAT)c.Y, (FLOAT)c.Z);
+}
+
+// A piece of the spherifier's, as the engine hands a polygon over: the polygon's head with its points' pointers right
+// after it, in one block as the engine lays them (a FSavedPoly ends in an array of no size, so it cannot be a member
+// with more after it); the points; and each point's turn round the upright (Spherify.h), for the relief's axes there.
+struct FSpherePiece
+{
+    alignas(8) BYTE Block[sizeof(FSavedPoly) + 8 * sizeof(FTransform*)];
+    FTransform      Pts[8];
+    FLOAT           Turn[8];
+    // The cosine and sine of the turn its points share (Trig), where it has them - SpherePiece's pieces, whose points
+    // all have their triangle's turn (SpherePieceBlock): bTrig, and TrigFor that turn.
+    UBOOL           bTrig;
+    FLOAT           TrigFor, Trig[2];
+    // Each point where its texture, light map and fog map are read, in the view's space (SphereReadAt): where it was,
+    // moved as far as it moved along its polygon's plane.
+    FVector         Was[8];
+    FSavedPoly&     Poly() { return *(FSavedPoly*)Block; }
+};
+
+// The spherifier's triangle Piece of the node of the engine's polygon Engine, as the engine would have handed it over:
+// each corner from the level's space into the view's, cut at the near plane - and in a mirror's view along the
+// mirror, on the side the engine kept of its own polygon (ReliefCutAlongMirror's rule) - and projected as the engine
+// projects. False: nothing of it is left to draw.
+static UBOOL SpherePieceOf(const FSceneNode* Frame, const FSavedPoly* Engine, const FVector* World, const FVector* Was,
+                           const FLOAT* Turn, FLOAT Lift, FSpherePiece& Out);
+static UBOOL SpherePieceInView(const FSceneNode* Frame, const FSavedPoly* Engine, const RdxMath::FVec3* P3,
+                               const RdxMath::FVec3* O3, const FLOAT* Turn, FSpherePiece& Out);
+// Where a piece's pictures are read at a corner of it that was at Was and is at Now, on a polygon of normal N (of length
+// one): where it was, moved as far as it moved along the plane. A polygon that only moved along its plane - a floor whose
+// edge followed a rounded wall's foot - keeps its pictures where they lay in the level, and a piece of it folded over by
+// an edge drawn in close is drawn as what it lies over; one that rounded off its plane takes its pictures with it.
+static inline FVector SphereReadAt(const FVector& Was, const FVector& Now, const FVector& N)
+{
+    const FVector Move = Now - Was;
+    return Was + Move - N * (Move | N);
+}
+
+// The pieces of each node drawn, made once: the node's corners - each once, however many of its triangles share it -
+// where they are now and where their pictures are read (SphereReadAt), and its triangles, each its three corners and
+// the surface's turn there - the triangle's own, the same at its three - with the turn's cosine and sine, for the
+// relief's axes (TurnedPomFrameOf). The node's own block, read in order as the node is drawn: read from the rounding's
+// own lists, whose places lie scattered over the whole level, a piece cost more in waiting for the memory than in all
+// of its own work. Made again whenever the rounding drawn changes.
+// The blocks are held within SpherePieceBudget: a large rounded level's blocks, all of them once the player has seen
+// the whole of it, are more of the 32-bit address space than a level's loads can spare beside it, and a frame draws few
+// of them. Past it, the blocks of nodes drawn neither this frame nor the one before go, and are made again when drawn.
+struct FPieceBlock
+{
+    INT    Corners;     // after the head, six floats each: where it is now, where its pictures are read
+    INT    Tris;        // after the corners, a FPieceTri each
+    INT    Serial;      // the block's own number, never given twice (SpherePiece's corners in the view)
+    SIZE_T Bytes;       // the whole block's
+};
+struct FPieceTri
+{
+    INT   Corner[3];    // the node's corners
+    FLOAT Turn, Cos, Sin;
+};
+static inline const FLOAT* PieceCorners(const FPieceBlock* B) { return (const FLOAT*)(B + 1); }
+static inline const FPieceTri* PieceTris(const FPieceBlock* B)
+{
+    return (const FPieceTri*)(PieceCorners(B) + 6 * B->Corners);
+}
+static const SIZE_T                  SpherePieceBudget = (SIZE_T)48 << 20;
+static RdxSphere::TList<FPieceBlock*> GSpherePieceBlocks;
+static RdxSphere::TList<INT>          GSpherePieceUsed;      // a node's block: the frame it was last drawn in
+static SIZE_T                        GSpherePieceBytes  = 0;
+static INT                           GSpherePieceGen    = -1;
+static INT                           GSpherePieceFrame  = 0;   // the frame being drawn (DrawComplexSurface)
+static INT                           GSpherePieceSerial = 0;
+// A block being made: its corners as the rounding numbers them, through a table to the node's own (open addressing,
+// pairs of the rounding's number and the node's), and each triangle corner's.
+static RdxSphere::TList<INT>          GPieceSlots, GPieceCornerOf, GPieceCornerAt;
+
+// The pieces made ahead (StartPieceJobs) read the blocks: their helpers are called off and waited for before a block
+// goes, and where the blocks all go, the jobs and what they made go with them.
+static void ClosePieceJobs();
+static void ForgetPieceJobsData();
+
+static void SpherePieceBlocksForget()
+{
+    ForgetPieceJobsData();
+    for (INT n = 0; n < GSpherePieceBlocks.Num; n++)
+        if (GSpherePieceBlocks[n])
+            appFree(GSpherePieceBlocks[n]);
+    GSpherePieceBlocks.Free();
+    GSpherePieceUsed.Free();
+    GSpherePieceBytes = 0;
+    GSpherePieceGen   = -1;
+}
+
+// Room for Need more bytes of blocks within the budget: the blocks not drawn this frame or the one before let go.
+static void SpherePieceBlocksTrim(SIZE_T Need)
+{
+    ClosePieceJobs();
+    for (INT n = 0; n < GSpherePieceBlocks.Num && GSpherePieceBytes + Need > SpherePieceBudget * 3 / 4; n++)
+        if (GSpherePieceBlocks[n] && GSpherePieceUsed[n] < GSpherePieceFrame - 1)
+        {
+            GSpherePieceBytes -= GSpherePieceBlocks[n]->Bytes;
+            appFree(GSpherePieceBlocks[n]);
+            GSpherePieceBlocks[n] = nullptr;
+        }
+}
+
+// Node n's block (SphereNodeTris of it says it is rounded), made the first time it is asked for; null where there was no
+// memory for it.
+static const FPieceBlock* SpherePieceBlock(const FSceneNode* Frame, INT n)
+{
+    if (GSpherePieceGen != GSphereGen || GSpherePieceBlocks.Num != GSphere->Nodes)
+    {
+        SpherePieceBlocksForget();
+        if (!GSpherePieceBlocks.Resize(GSphere->Nodes) || !GSpherePieceUsed.Resize(GSphere->Nodes))
+            return nullptr;
+        for (INT k = 0; k < GSpherePieceBlocks.Num; k++)
+        {
+            GSpherePieceBlocks[k] = nullptr;
+            GSpherePieceUsed[k]   = 0;
+        }
+        GSpherePieceGen = GSphereGen;
+    }
+    GSpherePieceUsed[n] = GSpherePieceFrame;
+    FPieceBlock*& Block = GSpherePieceBlocks[n];
+    if (Block)
+        return Block;
+    const RdxSphere::FResult& R     = GSphere->R;
+    const INT                 Tris  = R.PolyTris[n];
+    const INT                 First = R.PolyFirst[n] * 3;
+    // Each corner once: the rounding's numbers of the triangles' corners, through the table.
+    INT Size = 64;
+    while (Size < Tris * 6)
+        Size *= 2;
+    if (!GPieceSlots.Resize(Size * 2) || !GPieceCornerOf.Resize(Tris * 3) || !GPieceCornerAt.Resize(Tris * 3))
+        return nullptr;
+    for (INT s = 0; s < Size; s++)
+        GPieceSlots[s * 2] = -1;
+    INT Corners = 0;
+    for (INT i = 0; i < Tris * 3; i++)
+    {
+        const INT G = R.Tri[First + i];
+        INT       s = (INT)(((DWORD)G * 2654435761u) & (DWORD)(Size - 1));
+        while (GPieceSlots[s * 2] >= 0 && GPieceSlots[s * 2] != G)
+            s = (s + 1) & (Size - 1);
+        if (GPieceSlots[s * 2] < 0)
+        {
+            GPieceSlots[s * 2]        = G;
+            GPieceSlots[s * 2 + 1]    = Corners;
+            GPieceCornerAt[Corners++] = G;
+        }
+        GPieceCornerOf[i] = GPieceSlots[s * 2 + 1];
+    }
+    const SIZE_T Bytes = sizeof(FPieceBlock) + sizeof(FLOAT) * 6 * (SIZE_T)Corners + sizeof(FPieceTri) * (SIZE_T)Tris;
+    if (GSpherePieceBytes + Bytes > SpherePieceBudget)
+        SpherePieceBlocksTrim(Bytes);
+    Block = (FPieceBlock*)appMalloc(Bytes, TEXT("RdxSpherePieces"));
+    if (!Block)
+        return nullptr;
+    GSpherePieceBytes += Bytes;
+    Block->Corners = Corners;
+    Block->Tris    = Tris;
+    Block->Serial  = ++GSpherePieceSerial;
+    Block->Bytes   = Bytes;
+    const FVector N  = Frame->Level->Model->Nodes(n).Plane;
+    FLOAT* const  Cs = (FLOAT*)PieceCorners(Block);
+    for (INT c = 0; c < Corners; c++)
+    {
+        const RdxSphere::FV3& W    = R.Moved[GPieceCornerAt[c]];
+        const RdxSphere::FV3& O    = R.Orig[GPieceCornerAt[c]];
+        const FVector         Now((FLOAT)W.X, (FLOAT)W.Y, (FLOAT)W.Z);
+        const FVector         Read = SphereReadAt(FVector((FLOAT)O.X, (FLOAT)O.Y, (FLOAT)O.Z), Now, N);
+        FLOAT* const          C    = Cs + 6 * c;
+        C[0] = Now.X;
+        C[1] = Now.Y;
+        C[2] = Now.Z;
+        C[3] = Read.X;
+        C[4] = Read.Y;
+        C[5] = Read.Z;
+    }
+    FPieceTri* const Ts = (FPieceTri*)PieceTris(Block);
+    for (INT t = 0; t < Tris; t++)
+    {
+        FPieceTri& T = Ts[t];
+        for (INT k = 0; k < 3; k++)
+            T.Corner[k] = GPieceCornerOf[t * 3 + k];
+        // A turn TurnedPomFrameOf leaves as it is needs no cosine and sine, and has 1 and 0.
+        T.Turn            = R.TriTurn[R.PolyFirst[n] + t];
+        const UBOOL bNone = (T.Turn > -1e-5f && T.Turn < 1e-5f);
+        T.Cos             = bNone ? 1.0f : (FLOAT)appCos(T.Turn);
+        T.Sin             = bNone ? 0.0f : (FLOAT)appSin(T.Turn);
+    }
+    return Block;
+}
+
+// The node's corners in the view's space (PieceCornersInView): each one's place, then where its pictures are read -
+// turned once for all its triangles; with the view they were turned in (its frame, to the bit) and the block they are
+// of.
+static RdxSphere::TList<RdxMath::FVec3> GPieceView;
+static INT                              GPieceViewSerial = 0;
+static BYTE                             GPieceViewCoords[sizeof(FCoords)];
+
+// Block's corners in Frame's view, into GPieceView: turned there unless they were the last turned. False: no memory.
+static UBOOL PieceCornersInView(const FSceneNode* Frame, const FPieceBlock* Block)
+{
+    if (Block->Serial == GPieceViewSerial && memcmp(&Frame->Coords, GPieceViewCoords, sizeof(FCoords)) == 0)
+        return 1;
+    GPieceViewSerial = 0;
+    if (!GPieceView.Resize(Block->Corners * 2))
+        return 0;
+    const FLOAT* C = PieceCorners(Block);
+    if (GTransformAllOk)
+        TransformAllAsEngine(C, &GPieceView[0].X, Block->Corners * 2, Frame->Coords, 1);
+    else
+        for (INT c = 0; c < Block->Corners; c++, C += 6)
+        {
+            GPieceView[c * 2]     = ToVec(FVector(C[0], C[1], C[2]).TransformPointBy(Frame->Coords));
+            GPieceView[c * 2 + 1] = ToVec(FVector(C[3], C[4], C[5]).TransformPointBy(Frame->Coords));
+        }
+    GPieceViewSerial = Block->Serial;
+    appMemcpy(GPieceViewCoords, &Frame->Coords, sizeof(FCoords));
+    return 1;
+}
+
+static UBOOL SpherePiece(const FSceneNode* Frame, const FSavedPoly* Engine, INT Piece, FSpherePiece& Out)
+{
+    // Timed one piece in sixteen (the detail line's spherifier part).
+    static INT   Tick   = 0;
+    const UBOOL  bTimed = (++Tick & 15) == 0;
+    const DOUBLE T0     = bTimed ? appSeconds() : 0.0;
+    struct FCount
+    {
+        UBOOL  bOn;
+        DOUBLE T0;
+        ~FCount()
+        {
+            if (bOn)
+                GSpherePieceSec += (appSeconds() - T0) * 16.0;
+        }
+    } Count = { bTimed, T0 };
+    GSphereMade += 1.0;
+    const FPieceBlock* const Block = SpherePieceBlock(Frame, Engine->iNode);
+    if (!Block || Piece < 0 || Piece >= Block->Tris || !PieceCornersInView(Frame, Block))
+        return 0;
+    const FPieceTri& T = PieceTris(Block)[Piece];
+    RdxMath::FVec3   P[3], O[3];
+    FLOAT            Turn[3];
+    for (INT k = 0; k < 3; k++)
+    {
+        P[k]    = GPieceView[T.Corner[k] * 2];
+        O[k]    = GPieceView[T.Corner[k] * 2 + 1];
+        Turn[k] = T.Turn;
+    }
+    if (!SpherePieceInView(Frame, Engine, P, O, Turn, Out))
+        return 0;
+    Out.bTrig   = 1;
+    Out.TrigFor = T.Turn;
+    Out.Trig[0] = T.Cos;
+    Out.Trig[1] = T.Sin;
+    return 1;
+}
+
+// The spherifier's pieces made ahead, on helper threads (FPolyWalk). At the world view's start (SetSceneNode), each
+// rounded node the world view drew in the frame before is a job - its pieces in this frame's view - in the order they
+// were drawn; the walk takes a node's where it comes to it, waiting while a helper makes them or making them itself
+// where none has started, and makes those of a node not drawn the frame before in turn, as ever. The same functions on
+// the same numbers, with the game thread's float control words: the bytes are those made in turn. Taken only in the
+// very view they were made in, to the bit, and never made for a mirror's (its cut goes by the engine's polygon).
+enum { PieceHelpersMost = 6 };
+static const INT PieceAheadMost = 1 << 16;      // pieces made ahead in a frame at most
+// A piece made ahead: SpherePiece's, of the four corners a cut at the near plane leaves at most. Its polygon's count of
+// points 0: nothing of it is left to draw; -1: more than four, made in turn.
+struct FAheadPiece
+{
+    alignas(8) BYTE Block[sizeof(FSavedPoly) + 4 * sizeof(FTransform*)];
+    FTransform      Pts[4];
+    FLOAT           Turn[4];
+    FVector         Was[4];
+    FLOAT           TrigFor, Trig[2];
+    FSavedPoly&     Poly() { return *(FSavedPoly*)Block; }
+};
+struct FPieceJob
+{
+    const FPieceBlock* Block;
+    INT                Node;
+    INT                First;       // its pieces' place in GPieceAhead
+    volatile LONG      State;       // 0 waiting, 1 being made, 2 made
+};
+static RdxSphere::TList<FPieceJob>      GPieceJobs;
+static RdxSphere::TList<FAheadPiece>    GPieceAhead;
+static RdxSphere::TList<INT>            GPieceJobAt;            // a node's job, or -1
+// The corners in view and the piece each helper makes them with, and the game thread's after them.
+static RdxSphere::TList<RdxMath::FVec3> GPieceViewOf[PieceHelpersMost + 1];
+static FSpherePiece                     GPieceMadeOf[PieceHelpersMost + 1];
+static FSceneNode                       GPieceJobView;          // the view they are made in
+static const UModel*                    GPieceJobModel    = nullptr;
+static INT                              GPieceJobGen      = -1; // the rounding they are made of (GSphereGen)
+static INT                              GPieceJobFrame    = -1; // the frame they are made for
+static INT                              GPieceJobLaid     = -1; // the frame a world view's start was last seen in
+static volatile LONG                    GPieceJobNext     = 0;  // the next a helper takes
+static volatile LONG                    GPieceJobsOpen    = 0;  // the helpers may take more
+static volatile LONG                    GPieceJobsRunning = 0;  // helpers may be at work, not waited for yet
+static volatile LONG                    GPieceHelperNext  = 0;
+static INT                              GPieceHelpers     = -1; // -1: not asked yet
+static PTP_WORK                         GPiecePool        = nullptr;
+static UINT                             GPieceCsr         = 0;  // the game thread's SSE control word, and its x87 one
+static WORD                             GPieceX87         = 0;
+// The rounded nodes the world view drew, each once, in the order drawn: the frame's being drawn and the one before's
+// (the jobs'); the frame each node was last listed in; and the rounding the per-node lists are of.
+static RdxSphere::TList<INT>            GPieceDrawn, GPieceDrawnBefore, GPieceDrawnAt;
+static INT                              GPieceDrawnFrame  = -1;
+static INT                              GPieceNodesGen    = -1;
+
+// Job J's pieces, made with the corners' room View and the piece Made.
+static void MakePieceJob(FPieceJob& J, RdxSphere::TList<RdxMath::FVec3>& View, FSpherePiece& Made)
+{
+    const FPieceBlock* const B = J.Block;
+    TransformAllAsEngine(PieceCorners(B), &View[0].X, B->Corners * 2, GPieceJobView.Coords, 1);
+    // The engine's polygon, as far as SpherePieceInView reads it outside a mirror's view: its node and its user.
+    alignas(8) BYTE   EngineBlock[sizeof(FSavedPoly)];
+    FSavedPoly&       Engine = *(FSavedPoly*)EngineBlock;
+    Engine.Next   = nullptr;
+    Engine.User   = nullptr;
+    Engine.iNode  = J.Node;
+    Engine.NumPts = 0;
+    const FPieceTri* const Ts = PieceTris(B);
+    for (INT t = 0; t < B->Tris; t++)
+    {
+        const FPieceTri& T = Ts[t];
+        RdxMath::FVec3   P[3], O[3];
+        FLOAT            Turn[3];
+        for (INT k = 0; k < 3; k++)
+        {
+            P[k]    = View[T.Corner[k] * 2];
+            O[k]    = View[T.Corner[k] * 2 + 1];
+            Turn[k] = T.Turn;
+        }
+        FAheadPiece& S    = GPieceAhead[J.First + t];
+        FSavedPoly&  Poly = S.Poly();
+        Poly.Next  = nullptr;
+        Poly.User  = nullptr;
+        Poly.iNode = J.Node;
+        if (!SpherePieceInView(&GPieceJobView, &Engine, P, O, Turn, Made))
+        {
+            Poly.NumPts = 0;
+            continue;
+        }
+        const INT Num = Made.Poly().NumPts;
+        if (Num > 4)
+        {
+            Poly.NumPts = -1;
+            continue;
+        }
+        Poly.NumPts = Num;
+        for (INT i = 0; i < Num; i++)
+        {
+            memcpy(&S.Pts[i], &Made.Pts[i], sizeof(FTransform));
+            memcpy(&S.Was[i], &Made.Was[i], sizeof(FVector));
+            S.Turn[i]   = Made.Turn[i];
+            Poly.Pts[i] = &S.Pts[i];
+        }
+        S.TrigFor = T.Turn;
+        S.Trig[0] = T.Cos;
+        S.Trig[1] = T.Sin;
+    }
+}
+
+static VOID CALLBACK PieceWorker(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK)
+{
+    const LONG Mine = ::InterlockedIncrement(&GPieceHelperNext) - 1;
+    if (Mine < 0 || Mine >= GPieceHelpers)
+        return;
+    const UINT Csr = _mm_getcsr();
+    WORD       X87 = 0, Want = GPieceX87;
+    __asm fnstcw X87
+    __asm fldcw Want
+    _mm_setcsr(GPieceCsr);
+    while (GPieceJobsOpen)
+    {
+        const LONG j = ::InterlockedIncrement(&GPieceJobNext) - 1;
+        if (j >= GPieceJobs.Num)
+            break;
+        FPieceJob& J = GPieceJobs[j];
+        if (::InterlockedCompareExchange(&J.State, 1, 0) != 0)
+            continue;
+        MakePieceJob(J, GPieceViewOf[Mine], GPieceMadeOf[Mine]);
+        ::InterlockedExchange(&J.State, 2);
+    }
+    _mm_setcsr(Csr);
+    __asm fldcw X87
+}
+
+static void ClosePieceJobs()
+{
+    GPieceJobsOpen = 0;
+    if (GPieceJobsRunning && GPiecePool)
+        ::WaitForThreadpoolWorkCallbacks(GPiecePool, TRUE);
+    GPieceJobsRunning = 0;
+}
+
+// The helpers take no more jobs (the frame's end): those at one finish it, unwaited for.
+static void StopPieceJobs()
+{
+    GPieceJobsOpen = 0;
+}
+
+// The jobs no longer to be taken: their nodes forget them. Only with no helper at work (ClosePieceJobs).
+static void DropPieceJobs()
+{
+    for (INT j = 0; j < GPieceJobs.Num; j++)
+        if (GPieceJobs[j].Node >= 0 && GPieceJobs[j].Node < GPieceJobAt.Num)
+            GPieceJobAt[GPieceJobs[j].Node] = -1;
+    GPieceJobs.Clear();
+    GPieceJobFrame = -1;
+}
+
+static void ForgetPieceJobsData()
+{
+    ClosePieceJobs();
+    DropPieceJobs();
+    GPieceAhead.Free();
+    GPieceJobAt.Free();
+    GPieceDrawnAt.Free();
+    GPieceDrawn.Clear();
+    GPieceDrawnBefore.Clear();
+    GPieceDrawnFrame = -1;
+    GPieceNodesGen   = -1;
+}
+
+// The pieces made ahead, for good (the renderer's Exit).
+static void ForgetPieceJobs()
+{
+    ForgetPieceJobsData();
+    if (GPiecePool)
+    {
+        ::CloseThreadpoolWork(GPiecePool);
+        GPiecePool = nullptr;
+    }
+    GPieceHelpers = -1;
+    GPieceJobs.Free();
+    GPieceDrawn.Free();
+    GPieceDrawnBefore.Free();
+    for (INT h = 0; h <= PieceHelpersMost; h++)
+        GPieceViewOf[h].Free();
+}
+
+// The per-node lists, of the rounding drawn now: made again, empty, when it has changed. False: no memory for them.
+static UBOOL PieceNodesReady()
+{
+    if (GPieceNodesGen == GSphereGen && GPieceJobAt.Num == GSphere->Nodes)
+        return 1;
+    ForgetPieceJobsData();
+    if (!GSphere->bOn || GSphere->Nodes <= 0 || !GPieceJobAt.Resize(GSphere->Nodes) ||
+        !GPieceDrawnAt.Resize(GSphere->Nodes))
+    {
+        GPieceJobAt.Free();
+        GPieceDrawnAt.Free();
+        return 0;
+    }
+    for (INT n = 0; n < GSphere->Nodes; n++)
+    {
+        GPieceJobAt[n]   = -1;
+        GPieceDrawnAt[n] = -1;
+    }
+    GPieceNodesGen = GSphereGen;
+    return 1;
+}
+
+// A rounded node the world view draws (FPolyWalk), listed once a frame for the next frame's jobs.
+static void NotePieceDrawn(INT n, INT EngineFrame)
+{
+    if (n < 0 || n >= GPieceDrawnAt.Num || GPieceDrawnAt[n] == EngineFrame)
+        return;
+    if (GPieceDrawnFrame != EngineFrame)
+    {
+        GPieceDrawn.Clear();
+        GPieceDrawnFrame = EngineFrame;
+    }
+    GPieceDrawnAt[n] = EngineFrame;
+    GPieceDrawn.Add(n);
+}
+
+// At a root view's start: where it is the world view's - the screen the world view had - the nodes the world view drew
+// last are made ahead, in this view.
+static void StartPieceJobs(const FSceneNode* Frame, INT EngineFrame)
+{
+    if (!Frame || Frame->Parent || GWorldCoordsFrame == EngineFrame || GPieceJobLaid == EngineFrame ||
+        Frame->XB != GWorldView.XB || Frame->YB != GWorldView.YB || Frame->X != GWorldView.X ||
+        Frame->Y != GWorldView.Y)
+        return;
+    GPieceJobLaid = EngineFrame;
+    ClosePieceJobs();
+    DropPieceJobs();
+    // The list drawn last is the jobs'; this frame's is listed anew.
+    Exchange(GPieceDrawn.Data, GPieceDrawnBefore.Data);
+    Exchange(GPieceDrawn.Num, GPieceDrawnBefore.Num);
+    Exchange(GPieceDrawn.Room, GPieceDrawnBefore.Room);
+    GPieceDrawn.Clear();
+    GPieceDrawnFrame = EngineFrame;
+    const FPlane& Clip = Frame->NearClip;
+    if (!GSphere->bOn || !Frame->Level || Frame->Level->Model != GSphere->Model || GSpherePieceGen != GSphereGen ||
+        GPieceDrawnBefore.Num <= 0 || Clip.X * Clip.X + Clip.Y * Clip.Y + Clip.Z * Clip.Z >= 0.25f ||
+        !PieceNodesReady())
+        return;
+    if (GPieceHelpers < 0)
+    {
+        SYSTEM_INFO Si;
+        ::GetSystemInfo(&Si);
+        // One processor is left alone, as for the plants' shapes.
+        GPieceHelpers = Clamp((INT)Si.dwNumberOfProcessors - 2, 0, (INT)PieceHelpersMost);
+        if (GPieceHelpers > 0)
+            GPiecePool = ::CreateThreadpoolWork(PieceWorker, nullptr, nullptr);
+        if (!GPiecePool)
+            GPieceHelpers = 0;
+        RdxLog(TEXT("spherifier: the pieces of the nodes drawn made ahead on %i threads"), GPieceHelpers);
+    }
+    if (GPieceHelpers <= 0)
+        return;
+    CheckTransformAll(Frame->Coords, EngineFrame);
+    if (!GTransformAllOk)
+        return;
+    GSpherePieceFrame = EngineFrame;
+    const UModel* const M = Frame->Level->Model;
+    INT Pieces = 0, Corners = 0;
+    for (INT k = 0; k < GPieceDrawnBefore.Num; k++)
+    {
+        const INT n = GPieceDrawnBefore[k];
+        if (SphereNodeTris(M, n) <= 0 || GPieceJobAt[n] >= 0)
+            continue;
+        const FPieceBlock* const B = SpherePieceBlock(Frame, n);
+        if (!B || GSpherePieceGen != GSphereGen)
+            break;
+        if (Pieces + B->Tris > PieceAheadMost)
+            break;
+        const FPieceJob J = { B, n, Pieces, 0 };
+        if (!GPieceJobs.Add(J))
+            break;
+        GPieceJobAt[n] = GPieceJobs.Num - 1;
+        Pieces += B->Tris;
+        Corners = Max(Corners, B->Corners);
+    }
+    const INT Helpers = Min(GPieceHelpers, GPieceJobs.Num);
+    UBOOL     bRoom   = Helpers > 0 && GPieceAhead.Resize(Pieces) &&
+                        GPieceViewOf[PieceHelpersMost].Reserve(Corners * 2);
+    for (INT h = 0; h < Helpers && bRoom; h++)
+        bRoom = GPieceViewOf[h].Reserve(Corners * 2);
+    if (!bRoom)
+    {
+        DropPieceJobs();
+        return;
+    }
+    GPieceJobView  = *Frame;
+    GPieceJobModel = M;
+    GPieceJobGen   = GSphereGen;
+    GPieceJobFrame = EngineFrame;
+    GPieceCsr      = _mm_getcsr();
+    WORD X87       = 0;
+    __asm fnstcw X87
+    GPieceX87         = X87;
+    GPieceJobNext     = 0;
+    GPieceHelperNext  = 0;
+    GPieceJobsOpen    = 1;
+    GPieceJobsRunning = 1;
+    for (INT h = 0; h < Helpers; h++)
+        ::SubmitThreadpoolWork(GPiecePool);
+}
+
+// Whether the jobs' pieces are Frame's to the bit: made for this frame, of the rounding and the level drawn, in the
+// very view - its axes, its cut and its projection - and with the float control words the walk makes them with.
+static UBOOL PieceJobsFor(const FSceneNode* Frame, INT EngineFrame)
+{
+    if (GPieceJobFrame != EngineFrame || GPieceJobs.Num <= 0 || !Frame || !Frame->Level ||
+        Frame->Level->Model != GPieceJobModel || GPieceJobGen != GSphereGen || GSpherePieceGen != GSphereGen ||
+        GPieceNodesGen != GSphereGen)
+        return 0;
+    const FSceneNode& V = GPieceJobView;
+    if (memcmp(&Frame->Coords, &V.Coords, sizeof(FCoords)) != 0 || memcmp(&Frame->NearClip, &V.NearClip, sizeof(FPlane)) != 0 ||
+        memcmp(&Frame->Proj, &V.Proj, sizeof(FVector)) != 0 || memcmp(&Frame->FX, &V.FX, sizeof(FLOAT)) != 0 ||
+        memcmp(&Frame->FY, &V.FY, sizeof(FLOAT)) != 0 || memcmp(&Frame->FX15, &V.FX15, sizeof(FLOAT)) != 0 ||
+        memcmp(&Frame->FY15, &V.FY15, sizeof(FLOAT)) != 0)
+        return 0;
+    WORD X87 = 0;
+    __asm fnstcw X87
+    // The SSE word's flags (its lowest six bits) are what earlier sums raised, not how this one is made.
+    return (X87 == GPieceX87 && ((_mm_getcsr() ^ GPieceCsr) & ~0x3Fu) == 0) ? 1 : 0;
+}
+
+// A job a helper thread has taken (its State 1), waited for until it is done (2): a moment spinning, then the core given
+// away at each look - a helper the scheduler has put aside is not kept from finishing by the very thread waiting on it.
+static void WaitJobDone(volatile LONG& State)
+{
+    for (INT Spin = 0; State != 2; Spin++)
+    {
+        if (Spin < 4096)
+            YieldProcessor();
+        else
+            ::SwitchToThread();
+    }
+}
+
+// Node n's job with its pieces made - waited for while a helper makes them, made here where none has started - or
+// null: it has none.
+static const FPieceJob* TakePieceJob(INT n)
+{
+    if (n < 0 || n >= GPieceJobAt.Num || GPieceJobAt[n] < 0)
+        return nullptr;
+    FPieceJob& J = GPieceJobs[GPieceJobAt[n]];
+    if (J.State != 2)
+    {
+        const DOUBLE T0 = appSeconds();
+        if (::InterlockedCompareExchange(&J.State, 1, 0) == 0)
+        {
+            MakePieceJob(J, GPieceViewOf[PieceHelpersMost], GPieceMadeOf[PieceHelpersMost]);
+            ::InterlockedExchange(&J.State, 2);
+        }
+        else
+            WaitJobDone(J.State);
+        GSpherePieceSec += appSeconds() - T0;
+    }
+    return &J;
+}
+
+// A triangle of the level's space as a piece in the view of the engine's polygon Engine (SpherePiece's way): Was where
+// its pictures are read at its corners (SphereReadAt), Turn the surface's turn at each; Lift how much nearer the eye it
+// is drawn, along the eye's own rays (a decal's, over the wall it lies on - on the screen it stays where it was).
+static UBOOL SpherePieceOf(const FSceneNode* Frame, const FSavedPoly* Engine, const FVector* World, const FVector* Was,
+                           const FLOAT* Turn, FLOAT Lift, FSpherePiece& Out)
+{
+    RdxMath::FVec3 P[3], O[3];
+    for (INT k = 0; k < 3; k++)
+    {
+        P[k] = ToVec(World[k].TransformPointBy(Frame->Coords));
+        O[k] = ToVec(Was[k].TransformPointBy(Frame->Coords));
+        if (Lift > 0.0f)
+        {
+            const FLOAT Far = appSqrt(P[k].X * P[k].X + P[k].Y * P[k].Y + P[k].Z * P[k].Z);
+            if (Far > Lift + SphereNear)
+            {
+                const FLOAT S = (Far - Lift) / Far;
+                P[k].X *= S;
+                P[k].Y *= S;
+                P[k].Z *= S;
+            }
+        }
+    }
+    return SpherePieceInView(Frame, Engine, P, O, Turn, Out);
+}
+
+// SpherePieceOf's part in the view's space: the triangle's corners there (P) and where its pictures are read (O), on
+// plain vectors of our own - the engine's own vector type is made, copied and added through calls into its library, and
+// a frame draws tens of thousands of pieces.
+static UBOOL SpherePieceInView(const FSceneNode* Frame, const FSavedPoly* Engine, const RdxMath::FVec3* P3,
+                               const RdxMath::FVec3* O3, const FLOAT* Turn, FSpherePiece& Out)
+{
+    RdxMath::FVec3 P[8], O[8];
+    FLOAT          Tu[8];
+    INT            Num = 3;
+    for (INT k = 0; k < 3; k++)
+    {
+        P[k]  = P3[k];
+        O[k]  = O3[k];
+        Tu[k] = Turn[k];
+    }
+    auto Along = [](const RdxMath::FVec3& A, const RdxMath::FVec3& B, FLOAT S)
+    {
+        RdxMath::FVec3 R;
+        R.X = A.X + (B.X - A.X) * S;
+        R.Y = A.Y + (B.Y - A.Y) * S;
+        R.Z = A.Z + (B.Z - A.Z) * S;
+        return R;
+    };
+    // What lies on the far side of the plane N . p = D is kept - with where it was and its turn, as far along.
+    auto Cut = [&](FLOAT Nx, FLOAT Ny, FLOAT Nz, FLOAT D) -> UBOOL
+    {
+        RdxMath::FVec3 Q[8], Qo[8];
+        FLOAT          Qt[8];
+        INT            Got = 0;
+        for (INT i = 0; i < Num; i++)
+        {
+            const INT   j  = (i + 1 < Num) ? i + 1 : 0;
+            const FLOAT Di = P[i].X * Nx + P[i].Y * Ny + P[i].Z * Nz - D;
+            const FLOAT Dj = P[j].X * Nx + P[j].Y * Ny + P[j].Z * Nz - D;
+            if (Di >= 0.0f && Got < 8)
+            {
+                Q[Got]    = P[i];
+                Qo[Got]   = O[i];
+                Qt[Got++] = Tu[i];
+            }
+            if ((Di >= 0.0f) != (Dj >= 0.0f) && Got < 8)
+            {
+                const FLOAT S = Di / (Di - Dj);
+                Q[Got]    = Along(P[i], P[j], S);
+                Qo[Got]   = Along(O[i], O[j], S);
+                Qt[Got++] = Tu[i] + (Tu[j] - Tu[i]) * S;
+            }
+        }
+        Num = Got;
+        for (INT i = 0; i < Num; i++)
+        {
+            P[i]  = Q[i];
+            O[i]  = Qo[i];
+            Tu[i] = Qt[i];
+        }
+        return Num >= 3;
+    };
+    if ((P[0].Z < SphereNear || P[1].Z < SphereNear || P[2].Z < SphereNear) && !Cut(0.0f, 0.0f, 1.0f, SphereNear))
+        return 0;
+    const FPlane& Clip = Frame->NearClip;
+    if (Clip.X * Clip.X + Clip.Y * Clip.Y + Clip.Z * Clip.Z >= 0.25f)
+    {
+        FLOAT Side = 0.0f;
+        for (INT i = 0; i < Engine->NumPts; i++)
+            if (Engine->Pts[i])
+                Side += Clip.X * Engine->Pts[i]->Point.X + Clip.Y * Engine->Pts[i]->Point.Y +
+                        Clip.Z * Engine->Pts[i]->Point.Z - Clip.W;
+        const FLOAT Sign = RdxMath::MirrorKeptSide(Side, Engine->NumPts, Clip.W);
+        if (Sign != 0.0f && !Cut(Clip.X * Sign, Clip.Y * Sign, Clip.Z * Sign, Clip.W * Sign - 0.01f))
+            return 0;
+    }
+    // Nothing of it on the view's picture: all of it past one of the picture's sides, a pixel's margin left - a large
+    // polygon the engine hands over for the part of it in view comes in many pieces, most of them off it.
+    if (Frame->Proj.Z > 0.0f)
+    {
+        // A point's place on the picture times its depth, against the picture's sides times the depth - no division.
+        const FLOAT F  = Frame->Proj.Z;
+        const FLOAT Lo = -(Frame->FX15 + 1.0f), Hi = Frame->FX - Frame->FX15 + 1.0f;
+        const FLOAT Up = -(Frame->FY15 + 1.0f), Dn = Frame->FY - Frame->FY15 + 1.0f;
+        UBOOL bLeft = 1, bRight = 1, bAbove = 1, bBelow = 1;
+        for (INT i = 0; i < Num; i++)
+        {
+            bLeft  = bLeft && P[i].X * F < Lo * P[i].Z;
+            bRight = bRight && P[i].X * F > Hi * P[i].Z;
+            bAbove = bAbove && P[i].Y * F < Up * P[i].Z;
+            bBelow = bBelow && P[i].Y * F > Dn * P[i].Z;
+        }
+        if (bLeft || bRight || bAbove || bBelow)
+            return 0;
+    }
+    FSavedPoly& Poly = Out.Poly();
+    Poly.Next   = nullptr;
+    Poly.iNode  = Engine->iNode;
+    Poly.User   = Engine->User;
+    Poly.NumPts = Num;
+    Out.bTrig   = 0;
+    for (INT i = 0; i < Num; i++)
+    {
+        Out.Pts[i].Point.X = P[i].X;
+        Out.Pts[i].Point.Y = P[i].Y;
+        Out.Pts[i].Point.Z = P[i].Z;
+        ProjectAsEngine(Out.Pts[i], Frame);
+        Poly.Pts[i] = &Out.Pts[i];
+        Out.Turn[i] = Tu[i];
+        Out.Was[i].X = O[i].X;
+        Out.Was[i].Y = O[i].Y;
+        Out.Was[i].Z = O[i].Z;
+    }
+    return 1;
+}
+
+// Whether the engine draws the node n's own surface - in its own picture, or a frame of that picture's animation - and
+// not something it lays on the node with the node's polygon: a decal, in a picture of its own.
+static UBOOL SphereOwnSurface(const FSurfaceInfo* Surface, const UModel* M, INT n)
+{
+    if (!Surface || !Surface->Texture || !M || n < 0 || n >= M->Nodes.Num())
+        return 0;
+    const INT s = M->Nodes(n).iSurf;
+    if (s < 0 || s >= M->Surfs.Num())
+        return 0;
+    const UTexture* const Drawn = Surface->Texture->Texture;
+    UTexture* const       First = M->Surfs(s).Texture;
+    UTexture*             T     = First;
+    for (INT k = 0; T && k < 64; k++)
+    {
+        if (T == Drawn)
+            return 1;
+        T = T->AnimNext;
+        if (T == First)
+            break;
+    }
+    return 0;
+}
+
+// A decal the engine lays on a node the spherifier moved - a bullet hole, a splash of blood, a scorch mark - goes with
+// the wall: cut into triangles no side of which is longer than SphereDecalStep, each corner moved as the node's polygon
+// is moved there (LevelRound.h's MoveOnPolygon). The decal lies a hair in front of its wall, and in pieces that small it
+// lies on the curve as the wall's own pieces do.
+static const FLOAT SphereDecalStep = 4.0f;
+// And drawn this much nearer the eye than where the wall took it: the wall's strips are flat between the rays, the
+// decal's small pieces lie on the arc, up to Spherify.h's Sag behind the strip's face.
+static const FLOAT SphereDecalLift = 0.25f;
+enum { SphereDecalMost = 256 };
+struct FSphereDecal
+{
+    FVector Tri[SphereDecalMost * 3];   // the level's space, moved
+    FVector Was[SphereDecalMost * 3];   // and where the decal's picture is read (SphereReadAt)
+    INT     Count = 0;
+};
+
+static void SphereDecalOf(const FSceneNode* Frame, const FSavedPoly* Engine, FSphereDecal& Out)
+{
+    Out.Count = 0;
+    const INT     Num    = Engine->NumPts;
+    const FVector Normal = Frame->Level->Model->Nodes(Engine->iNode).Plane;
+    if (Num < 3 || Num > MAX_POLY_POINTS)
+        return;
+    FVector W[MAX_POLY_POINTS];
+    for (INT i = 0; i < Num; i++)
+    {
+        if (!Engine->Pts[i])
+            return;
+        W[i] = Engine->Pts[i]->Point.TransformPointBy(Frame->Uncoords);
+    }
+    // A fan over its corners, each triangle halved across its longest side until every side is short enough - or the
+    // room is used up, and what is left goes as it is.
+    static FVector Stack[SphereDecalMost * 3];
+    INT            Top = 0;
+    for (INT k = 1; k + 1 < Num && Top < SphereDecalMost; k++)
+    {
+        Stack[Top * 3]     = W[0];
+        Stack[Top * 3 + 1] = W[k];
+        Stack[Top * 3 + 2] = W[k + 1];
+        Top++;
+    }
+    while (Top > 0 && Out.Count < SphereDecalMost)
+    {
+        Top--;
+        const FVector T[3] = { Stack[Top * 3], Stack[Top * 3 + 1], Stack[Top * 3 + 2] };
+        INT   Long = 0;
+        FLOAT Most = 0.0f;
+        for (INT e = 0; e < 3; e++)
+        {
+            const FLOAT L = (T[(e + 1) % 3] - T[e]).Size();
+            if (L > Most)
+            {
+                Most = L;
+                Long = e;
+            }
+        }
+        if (Most > SphereDecalStep && Out.Count + Top + 2 <= SphereDecalMost && Top + 2 <= SphereDecalMost)
+        {
+            const FVector Mid = (T[Long] + T[(Long + 1) % 3]) * 0.5f;
+            const FVector Far = T[(Long + 2) % 3];
+            Stack[Top * 3]     = T[Long];
+            Stack[Top * 3 + 1] = Mid;
+            Stack[Top * 3 + 2] = Far;
+            Top++;
+            Stack[Top * 3]     = Mid;
+            Stack[Top * 3 + 1] = T[(Long + 1) % 3];
+            Stack[Top * 3 + 2] = Far;
+            Top++;
+            continue;
+        }
+        for (INT k = 0; k < 3; k++)
+        {
+            RdxSphere::FV3       Move = RdxSphere::V3(0.0, 0.0, 0.0);
+            const RdxSphere::FV3 At   = RdxSphere::V3(T[k].X, T[k].Y, T[k].Z);
+            RdxLevelRound::MoveOnPolygon(GSphere->R, Engine->iNode, At, 2.0, Move);
+            RdxLevelRound::HoldOnPolygon(GSphere->R, Engine->iNode, At, Move);
+            Out.Tri[Out.Count * 3 + k] = FVector(T[k].X + (FLOAT)Move.X, T[k].Y + (FLOAT)Move.Y, T[k].Z + (FLOAT)Move.Z);
+            Out.Was[Out.Count * 3 + k] = SphereReadAt(T[k], Out.Tri[Out.Count * 3 + k], Normal);
+        }
+        Out.Count++;
+    }
+}
+
+// A measurement only (the marker SecondRevision-sphere-tint.txt): each piece of the spherifier's drawn in the world's
+// view tinted by its node - eight hues, by the node's number - and every 300th frame the nodes so drawn near the eye
+// listed with their hue, so that a piece in a picture can be told for the level's polygon it is of. Node numbers in
+// the marker tint those nodes' pieces alone, each with the hue of its place in the list: two neighbours of one hue
+// told apart.
+static INT     GSphereTintNodes[256];
+static INT     GSphereTintCount = 0;
+static INT     GSphereTintFrame = -1;
+static FVector GSphereTintEye(0.0f, 0.0f, 0.0f);     // the world's view's eye, the frame its nodes were drawn in
+static const FLOAT SphereTintHue[8][3] = { { 1.0f, 0.3f, 0.3f }, { 0.3f, 1.0f, 0.3f }, { 0.3f, 0.3f, 1.0f },
+                                           { 1.0f, 1.0f, 0.3f }, { 1.0f, 0.3f, 1.0f }, { 0.3f, 1.0f, 1.0f },
+                                           { 1.0f, 0.6f, 0.2f }, { 0.6f, 0.3f, 1.0f } };
+static void SphereTintSay(const FSceneNode* Frame)
+{
+    const UModel* const M = (Frame && Frame->Level) ? Frame->Level->Model : nullptr;
+    if (!M)
+        return;
+    const FVector Eye = GSphereTintEye;
+    RDX_LOGF("sphere tint: %i nodes drawn as pieces in the world's view this frame; eye %.1f %.1f %.1f; the crosshair's "
+             "node %i", GSphereTintCount, Eye.X, Eye.Y, Eye.Z, GPomPickNode);
+    for (INT k = 0; k < GSphereTintCount; k++)
+    {
+        const INT n = GSphereTintNodes[k];
+        if (n < 0 || n >= M->Nodes.Num())
+            continue;
+        const FBspNode& Node = M->Nodes(n);
+        FVector C(0.0f, 0.0f, 0.0f);
+        INT     Got = 0;
+        for (INT v = 0; v < Node.NumVertices; v++)
+        {
+            const INT iv = Node.iVertPool + v;
+            if (iv < 0 || iv >= M->Verts.Num())
+                continue;
+            const INT pv = M->Verts(iv).pVertex;
+            if (pv < 0 || pv >= M->Points.Num())
+                continue;
+            C += M->Points(pv);
+            Got++;
+        }
+        if (!Got)
+            continue;
+        C /= (FLOAT)Got;
+        if ((C - Eye).Size() > 400.0f)
+            continue;
+        const FBspSurf* const Sf = (Node.iSurf >= 0 && Node.iSurf < M->Surfs.Num()) ? &M->Surfs(Node.iSurf) : nullptr;
+        // Its triangles' corners where they are now: how far up and down they reach, and the most any moved.
+        const RdxSphere::FResult& R = GSphere->R;
+        double ZLo = 1e30, ZHi = -1e30, Most = 0.0;
+        for (INT t = 0; n < R.PolyFirst.Num && t < R.PolyTris[n]; t++)
+            for (INT c = 0; c < 3; c++)
+            {
+                const INT             Ix = R.Tri[(R.PolyFirst[n] + t) * 3 + c];
+                const RdxSphere::FV3& Mv = R.Moved[Ix];
+                const RdxSphere::FV3& Og = R.Orig[Ix];
+                ZLo  = (Mv.Z < ZLo) ? Mv.Z : ZLo;
+                ZHi  = (Mv.Z > ZHi) ? Mv.Z : ZHi;
+                const double D = sqrt((Mv.X - Og.X) * (Mv.X - Og.X) + (Mv.Y - Og.Y) * (Mv.Y - Og.Y) +
+                                      (Mv.Z - Og.Z) * (Mv.Z - Og.Z));
+                Most = (D > Most) ? D : Most;
+            }
+        RDX_LOGF("sphere tint:   node %i hue %i at %.1f %.1f %.1f, plane %.2f %.2f %.2f, %i corners, %i triangles "
+                 "(z %.1f .. %.1f, moved %.2f at the most), surface %i (%s)", n, n % 8, C.X, C.Y, C.Z,
+                 Node.Plane.X, Node.Plane.Y, Node.Plane.Z, (INT)Node.NumVertices, R.PolyTris[n], ZLo, ZHi, Most,
+                 Node.iSurf, (Sf && Sf->Texture) ? Sf->Texture->GetName() : TEXT("-"));
+    }
+}
+
+// Where a point of something laid on a wall the spherifier moved - a mesh's decal, the laser sight's spot - is now, in
+// the view's space: moved as the polygon it lies on was there. False where it lies on no moved polygon
+// (LevelRound.h's PolygonAt, within two units of one - the engine lays such things a hair in front of what they hit).
+static UBOOL SphereOnWall(const FSceneNode* Frame, const FVector& View, FVector& Moved)
+{
+    if (!GSphere->bOn || !Frame || !Frame->Level || Frame->Level->Model != GSphere->Model)
+        return 0;
+    const FVector        W = View.TransformPointBy(Frame->Uncoords);
+    const RdxSphere::FV3 P = RdxSphere::V3(W.X, W.Y, W.Z);
+    RdxSphere::FV3       Move;
+    const INT            Poly = RdxLevelRound::PolygonMoveAt(GSphere->R, P, 2.0, Move);
+    if (Poly < 0)
+        return 0;
+    RdxLevelRound::HoldOnPolygon(GSphere->R, Poly, P, Move);
+    Moved = FVector(W.X + (FLOAT)Move.X, W.Y + (FLOAT)Move.Y, W.Z + (FLOAT)Move.Z).TransformPointBy(Frame->Coords);
+    return 1;
+}
+
+// A see-through polygon of a mesh lying on a rounded wall, every corner of it (SphereOnWall): its vertices put where
+// the wall took them, on the screen and in depth - and Lift nearer the eye where the wall's relief is raised
+// (ReliefDecalLift, asked of the polygon where the engine laid it). Nothing where any corner lies elsewhere - a cloud of
+// smoke passing a rounded wall is not laid on it.
+static inline FLOAT LiftedDepth(const FVector& Point, FLOAT Lift);
+static UBOOL SphereMeshDecal(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, FSolidVertex* Verts,
+                             FLOAT OffX, FLOAT OffY, FLOAT Lift)
+{
+    if (!GSphere->bOn || NumPts < 3 || NumPts > MAX_POLY_POINTS)
+        return 0;
+    FVector Moved[MAX_POLY_POINTS];
+    for (INT i = 0; i < NumPts; i++)
+        if (!Pts[i] || !SphereOnWall(Frame, Pts[i]->Point, Moved[i]) || Moved[i].Z < SphereNear)
+            return 0;
+    for (INT i = 0; i < NumPts; i++)
+    {
+        Verts[i].X     = Frame->FX15 + OffX + Moved[i].X * Frame->Proj.Z / Moved[i].Z;
+        Verts[i].Y     = Frame->FY15 + OffY + Moved[i].Y * Frame->Proj.Z / Moved[i].Z;
+        Verts[i].Depth = (Lift > 0.0f) ? LiftedDepth(Moved[i], Lift) : RdxMath::DepthFromViewZ(Moved[i].Z);
+    }
+    return 1;
+}
+
+// The light maps' blending over the spherifier's soft edges (RdxMath::SoftLightShare). The level's surfaces with a
+// polygon along a soft edge (LevelRound.h's light sides): each one's light map as it was last drawn in the world's view
+// - kept for its neighbours' copies - and its own copy with the light of the polygons across its soft edges blended in,
+// which it is drawn with while the level is rounded. Found again whenever the rounding drawn changes (GSphereGen).
+// A light map's place on its surface: with the sides, what decides which of its texels they reach.
+struct FSphereLightPlace
+{
+    INT     W, H, LitU, LitV;
+    FLOAT   PanU, PanV, InvU, InvV;
+    FVector Base, AxisU, AxisV;
+};
+static_assert(sizeof(FSphereLightPlace) == 17 * 4, "a place is compared with memcmp: no padding");
+struct FSphereLight
+{
+    INT          Surf;
+    QWORD        CacheID;       // the engine's light map last read
+    INT          W, H, LitU, LitV;
+    FLOAT        PanU, PanV, InvU, InvV;
+    FVector      Base, AxisU, AxisV;    // the surface's texture frame in the level
+    INT          Version;       // counted up whenever its texels are read anew
+    BYTE*        Texels;        // W * H * 4, as the engine has them
+    INT          SideFirst, SideCount;  // its polygons' light sides: in GSphereLightSides, the result's LightSides
+    INT          MadeKey;       // what its copy was made of (SphereLightKey); -1: none yet
+    INT          MadeCount;     // how many copies were made
+    BYTE*        Blend;         // W * H * 4
+    FTextureInfo Info;
+    FMipmapBase  Mip;
+    // The textures its copies go into, in turn, each written over in place: the texture cache keeps whatever it is
+    // given until the level changes, and a flickering light's copy is made every frame. Each a number of
+    // GSphereLightTexNext's (0: none yet), with the frame it was last written in.
+    QWORD        Tex[2];
+    INT          TexFrame[2];
+    // The texels its sides reach, for the copies made again over the same place (SphereLightMake): runs along the
+    // rows, each its first texel (j * W + i) and its length - NearRuns of them, found with the map at NearPlace.
+    INT*              Near;
+    INT               NearRuns;
+    FSphereLightPlace NearPlace;
+};
+static FSphereLight*         GSphereLights      = nullptr;
+static INT                   GSphereLightCount  = 0;
+static INT*                  GSphereLightOfSurf = nullptr;   // by the level's surface: its slot, or -1
+static INT                   GSphereLightSurfs  = 0;
+static INT                   GSphereLightGen    = -1;
+static const UModel*         GSphereLightModel  = nullptr;
+static RdxSphere::TList<int> GSphereLightSides;
+static INT                   GSphereLightMade   = 0;        // copies made since the log's last line
+static DOUBLE                GSphereLightMs     = 0.0;      // and the time they took, milliseconds
+static INT                   GSphereLightSaid   = -1;       // the frame of the log's last line
+static RdxSphere::TList<int> GSphereLightRuns;               // SphereLightMake's runs as it finds them
+
+// Where L's light map lies on its surface (FSphereLightPlace).
+static FSphereLightPlace SphereLightPlaceOf(const FSphereLight& L)
+{
+    FSphereLightPlace P;
+    P.W     = L.W;
+    P.H     = L.H;
+    P.LitU  = L.LitU;
+    P.LitV  = L.LitV;
+    P.PanU  = L.PanU;
+    P.PanV  = L.PanV;
+    P.InvU  = L.InvU;
+    P.InvV  = L.InvV;
+    P.Base  = L.Base;
+    P.AxisU = L.AxisU;
+    P.AxisV = L.AxisV;
+    return P;
+}
+// The copies' textures' identities in the texture cache: SphereLightTexBase and a number, each number given once.
+static const QWORD           SphereLightTexBase = 0xF7EE5BA4D0000000ull;
+static QWORD                 GSphereLightTexNext = 0;
+
+static void SphereLightForget()
+{
+    for (INT i = 0; i < GSphereLightCount; i++)
+    {
+        if (GSphereLights[i].Texels)
+            appFree(GSphereLights[i].Texels);
+        if (GSphereLights[i].Blend)
+            appFree(GSphereLights[i].Blend);
+        if (GSphereLights[i].Near)
+            appFree(GSphereLights[i].Near);
+    }
+    if (GSphereLights)
+        appFree(GSphereLights);
+    if (GSphereLightOfSurf)
+        appFree(GSphereLightOfSurf);
+    GSphereLights      = nullptr;
+    GSphereLightOfSurf = nullptr;
+    GSphereLightCount  = 0;
+    GSphereLightSurfs  = 0;
+    GSphereLightModel  = nullptr;
+    GSphereLightGen    = -1;
+    GSphereLightSides.Clear();
+}
+
+// The slot of node n's surface, or -1.
+static INT SphereLightSlotOf(const UModel* M, INT n)
+{
+    if (!GSphereLightOfSurf || n < 0 || n >= M->Nodes.Num())
+        return -1;
+    const INT sf = M->Nodes(n).iSurf;
+    return (sf >= 0 && sf < GSphereLightSurfs) ? GSphereLightOfSurf[sf] : -1;
+}
+
+// The surfaces with a polygon along a soft edge, for the rounding now drawn, and those across them - each with its
+// polygons' light sides.
+static void SphereLightFind(const UModel* M)
+{
+    SphereLightForget();
+    GSphereLightModel = M;
+    GSphereLightGen   = GSphereGen;
+    GSphereLightSurfs = M->Surfs.Num();
+    if (!GSphere->bOn || GSphere->Model != M || GSphereLightSurfs <= 0)
+        return;
+    const RdxSphere::FResult& R     = GSphere->R;
+    const INT                 Nodes = Min(Min(GSphere->Nodes, M->Nodes.Num()), R.PolySideCount.Num);
+    if (R.LightSides.Num <= 0 || Nodes <= 0)
+        return;
+    GSphereLightOfSurf = (INT*)appMalloc(GSphereLightSurfs * sizeof(INT), TEXT("RdxSphereLight"));
+    if (!GSphereLightOfSurf)
+        return;
+    for (INT s = 0; s < GSphereLightSurfs; s++)
+        GSphereLightOfSurf[s] = -1;
+    // The slots: each surface with sides, and each across one.
+    INT  Surfs = 0, Sides = 0;
+    auto Take  = [&](INT n)
+    {
+        if (n < 0 || n >= M->Nodes.Num())
+            return;
+        const INT sf = M->Nodes(n).iSurf;
+        if (sf >= 0 && sf < GSphereLightSurfs && GSphereLightOfSurf[sf] < 0)
+            GSphereLightOfSurf[sf] = Surfs++;
+    };
+    for (INT n = 0; n < Nodes; n++)
+        for (INT i = R.PolySideFirst[n]; i < R.PolySideFirst[n] + R.PolySideCount[n]; i++)
+        {
+            Take(n);
+            Sides++;
+            const RdxSphere::FLightSide& Sd = R.LightSides[i];
+            for (INT k = Sd.PartFirst; k < Sd.PartFirst + Sd.PartCount; k++)
+                Take(R.LightParts[k].Other);
+        }
+    if (!Surfs)
+        return;
+    GSphereLights = (FSphereLight*)appMalloc(Surfs * sizeof(FSphereLight), TEXT("RdxSphereLight"));
+    if (!GSphereLights || !GSphereLightSides.Resize(Sides))
+    {
+        for (INT sf = 0; sf < GSphereLightSurfs; sf++)
+            GSphereLightOfSurf[sf] = -1;
+        if (GSphereLights)
+            appFree(GSphereLights);
+        GSphereLights = nullptr;
+        return;
+    }
+    appMemzero(GSphereLights, Surfs * sizeof(FSphereLight));
+    GSphereLightCount = Surfs;
+    for (INT sf = 0; sf < GSphereLightSurfs; sf++)
+        if (GSphereLightOfSurf[sf] >= 0)
+        {
+            GSphereLights[GSphereLightOfSurf[sf]].Surf    = sf;
+            GSphereLights[GSphereLightOfSurf[sf]].MadeKey = -1;
+        }
+    // Each slot's sides together: counted, then filed.
+    for (INT n = 0; n < Nodes; n++)
+        if (R.PolySideCount[n] > 0)
+            GSphereLights[SphereLightSlotOf(M, n)].SideCount += R.PolySideCount[n];
+    for (INT i = 0, Next = 0; i < Surfs; i++)
+    {
+        GSphereLights[i].SideFirst = Next;
+        Next += GSphereLights[i].SideCount;
+        GSphereLights[i].SideCount = 0;
+    }
+    for (INT n = 0; n < Nodes; n++)
+        for (INT i = R.PolySideFirst[n]; i < R.PolySideFirst[n] + R.PolySideCount[n]; i++)
+        {
+            FSphereLight& L = GSphereLights[SphereLightSlotOf(M, n)];
+            GSphereLightSides[L.SideFirst + L.SideCount++] = i;
+        }
+    RDX_LOGF("spherifier light: %i surfaces along soft edges or across them, %i sides - their light maps blended "
+             "across the edges", Surfs, Sides);
+    // A measurement only (SecondRevision-sphere-light-say.txt, its first line a part of a texture's name): each side of
+    // the polygons of those textures - its length, the turn across it, the light parts across: how far each reaches in,
+    // how deep the polygon across is, and that polygon's texture - then how the turns of all the level's sides fall.
+    static WCHAR       Say[64] = L"";
+    static const UBOOL bSay    = MarkerLine(L"SecondRevision-sphere-light-say.txt", Say, 64);
+    if (bSay)
+    {
+        INT Said = 0, ByTurn[7] = { 0, 0, 0, 0, 0, 0, 0 };
+        for (INT n = 0; n < Nodes; n++)
+            for (INT i = R.PolySideFirst[n]; i < R.PolySideFirst[n] + R.PolySideCount[n]; i++)
+            {
+                const RdxSphere::FLightSide& Sd = R.LightSides[i];
+                const UTexture* const Tex = M->Surfs(M->Nodes(n).iSurf).Texture;
+                const UBOOL bAsked = Tex && appStrfind(Tex->GetName(), Say) != nullptr;
+                const FVector A((FLOAT)Sd.A.X, (FLOAT)Sd.A.Y, (FLOAT)Sd.A.Z), B((FLOAT)Sd.B.X, (FLOAT)Sd.B.Y,
+                                                                                (FLOAT)Sd.B.Z);
+                const FVector In((FLOAT)Sd.Into.X, (FLOAT)Sd.Into.Y, (FLOAT)Sd.Into.Z);
+                for (INT k = Sd.PartFirst; k < Sd.PartFirst + Sd.PartCount; k++)
+                {
+                    const RdxSphere::FLightPart& Pt = R.LightParts[k];
+                    const FVector PIn((FLOAT)Pt.Into.X, (FLOAT)Pt.Into.Y, (FLOAT)Pt.Into.Z);
+                    // Into this polygon and into the one across: opposite on a flat continuation, so the turn between
+                    // the two polygons is the angle off that.
+                    const FLOAT Turn = (FLOAT)acos((DOUBLE)Clamp(-(In | PIn), -1.0f, 1.0f)) * 180.0f / PI;
+                    ByTurn[(Turn < 1.0f) ? 0 : (Turn < 5.0f) ? 1 : (Turn < 15.0f) ? 2 : (Turn < 30.0f) ? 3
+                           : (Turn < 60.0f) ? 4 : (Turn < 90.0f) ? 5 : 6]++;
+                    if (!bAsked || Said >= 60)
+                        continue;
+                    Said++;
+                    const INT       On  = (Pt.Other >= 0 && Pt.Other < M->Nodes.Num()) ? M->Nodes(Pt.Other).iSurf : -1;
+                    const UTexture* OT  = (On >= 0) ? M->Surfs(On).Texture : nullptr;
+                    RDX_LOGF("spherifier light (marker): node %i surface %i side %.0f long from (%.0f %.0f %.0f) - "
+                             "turn %.2f degrees, reaches %.0f in, the polygon across %.0f deep, node %i surface %i %s",
+                             n, M->Nodes(n).iSurf, (B - A).Size(), A.X, A.Y, A.Z, Turn, (FLOAT)Pt.Reach,
+                             (FLOAT)Pt.Depth, Pt.Other, On, OT ? OT->GetName() : TEXT("-"));
+                }
+            }
+        RDX_LOGF("spherifier light (marker): the level's light parts by the turn across them - under 1 degree %i, "
+                 "1-5 %i, 5-15 %i, 15-30 %i, 30-60 %i, 60-90 %i, 90 and more %i", ByTurn[0], ByTurn[1], ByTurn[2],
+                 ByTurn[3], ByTurn[4], ByTurn[5], ByTurn[6]);
+    }
+}
+
+// What a surface's copy is made of: its own light map's version and those of the surfaces across its sides.
+static INT SphereLightKey(const UModel* M, const FSphereLight& L)
+{
+    const RdxSphere::FResult& R   = GSphere->R;
+    INT                       Key = L.Version;
+    for (INT i = L.SideFirst; i < L.SideFirst + L.SideCount; i++)
+    {
+        const RdxSphere::FLightSide& Sd = R.LightSides[GSphereLightSides[i]];
+        for (INT k = Sd.PartFirst; k < Sd.PartFirst + Sd.PartCount; k++)
+        {
+            const INT Slot = SphereLightSlotOf(M, R.LightParts[k].Other);
+            Key = Key * 31 + ((Slot >= 0) ? GSphereLights[Slot].Version + 1 : 0);
+        }
+    }
+    return Key;
+}
+
+// The copy of L's light map with the light across its soft edges blended in (RdxMath::SoftLightShare, SoftLightMix):
+// each texel's place on the surface, and for each side within whose reach it lies - beside the run of it there, or the
+// nearest, its share fading with how far it lies past the run's end - the light of the polygon across, at the place as
+// far into it from the side, read from that polygon's own light map. A texel no side reaches keeps its own light, and
+// which ones they reach the map's place decides: from the second copy on, the reached ones are kept (L.Near), and a copy
+// made again over the same place - a flickering light's, each frame - goes over them alone.
+static void SphereLightMake(const UModel* M, FSphereLight& L)
+{
+    const RdxSphere::FResult& R = GSphere->R;
+    appMemcpy(L.Blend, L.Texels, L.W * L.H * 4);
+    const RdxMath::FVec3 Base  = ToVec(L.Base);
+    const RdxMath::FVec3 AxisU = ToVec(L.AxisU);
+    const RdxMath::FVec3 AxisV = ToVec(L.AxisV);
+    // How far past a side a texel still takes the light across in: as far as the map's filtering reads it, a texel and
+    // a half.
+    RdxMath::FVec3 P00, P10, P01;
+    if (!RdxMath::LightTexelPlace(0, 0, L.W, L.H, L.PanU, L.PanV, L.InvU, L.InvV, Base, AxisU, AxisV, P00) ||
+        !RdxMath::LightTexelPlace(1, 0, L.W, L.H, L.PanU, L.PanV, L.InvU, L.InvV, Base, AxisU, AxisV, P10) ||
+        !RdxMath::LightTexelPlace(0, 1, L.W, L.H, L.PanU, L.PanV, L.InvU, L.InvV, Base, AxisU, AxisV, P01))
+        return;
+    const FVector V00(P00.X, P00.Y, P00.Z), V10(P10.X, P10.Y, P10.Z), V01(P01.X, P01.Y, P01.Z);
+    const FLOAT   Past = 1.5f * Max((V10 - V00).Size(), (V01 - V00).Size());
+    enum { MOST_SIDES = 16 };
+    // Each side's line - its start, its way along and into the polygon - worked out once for all the texels, as each
+    // texel would work it out. Past MOST_LINES sides a texel works out the rest itself.
+    enum { MOST_LINES = 64 };
+    struct FSideLine
+    {
+        FVector A, Dir, Into;
+        UBOOL   bLong;
+    };
+    auto LineOf = [](const RdxSphere::FLightSide& Sd, FSideLine& Out)
+    {
+        const FVector A((FLOAT)Sd.A.X, (FLOAT)Sd.A.Y, (FLOAT)Sd.A.Z);
+        const FVector B((FLOAT)Sd.B.X, (FLOAT)Sd.B.Y, (FLOAT)Sd.B.Z);
+        const FLOAT   Long = (B - A).Size();
+        Out.A     = A;
+        Out.Into  = FVector((FLOAT)Sd.Into.X, (FLOAT)Sd.Into.Y, (FLOAT)Sd.Into.Z);
+        Out.bLong = (Long < 1e-3f) ? 0 : 1;
+        if (Out.bLong)
+            Out.Dir = (B - A) / Long;
+    };
+    FSideLine        Lines[MOST_LINES];
+    static FSideLine Extra;
+    const INT        LineCount = Min(L.SideCount, (INT)MOST_LINES);
+    for (INT q = 0; q < LineCount; q++)
+        LineOf(R.LightSides[GSphereLightSides[L.SideFirst + q]], Lines[q]);
+    // Texel (i, j) blended; whether a side reaches it.
+    auto Mix = [&](INT i, INT j) -> UBOOL
+    {
+        RdxMath::FVec3 Pv;
+        if (!RdxMath::LightTexelPlace(i, j, L.W, L.H, L.PanU, L.PanV, L.InvU, L.InvV, Base, AxisU, AxisV, Pv))
+            return 0;
+        const FVector P(Pv.X, Pv.Y, Pv.Z);
+        FLOAT         Shares[MOST_SIDES], Across[MOST_SIDES * 4];
+        INT           Count    = 0;
+        UBOOL         bReached = 0;
+        BYTE* const   Texel    = L.Blend + 4 * (j * L.W + i);
+        FLOAT         Own[4];
+        for (INT c = 0; c < 4; c++)
+            Own[c] = (FLOAT)Texel[c];
+        for (INT q = L.SideFirst; q < L.SideFirst + L.SideCount && Count < MOST_SIDES; q++)
+        {
+            const RdxSphere::FLightSide& Sd = R.LightSides[GSphereLightSides[q]];
+            const FSideLine*             Ln = &Extra;
+            if (q - L.SideFirst < LineCount)
+                Ln = &Lines[q - L.SideFirst];
+            else
+                LineOf(Sd, Extra);
+            if (!Ln->bLong)
+                continue;
+            const FVector& A   = Ln->A;
+            const FVector& Dir = Ln->Dir;
+            const FLOAT    D   = (P - A) | Ln->Into;
+            const FLOAT    T   = (P - A) | Dir;
+            if (D < -Past)
+                continue;
+            // The run beside the texel, or the nearest, and how far past its end the texel lies.
+            INT   Best = -1;
+            FLOAT Off  = 0.0f;
+            for (INT k = Sd.PartFirst; k < Sd.PartFirst + Sd.PartCount; k++)
+            {
+                const RdxSphere::FLightPart& Pt = R.LightParts[k];
+                const FLOAT O = (T < (FLOAT)Pt.T0) ? (FLOAT)Pt.T0 - T : (T > (FLOAT)Pt.T1) ? T - (FLOAT)Pt.T1 : 0.0f;
+                if (Best < 0 || O < Off)
+                {
+                    Best = k;
+                    Off  = O;
+                }
+            }
+            if (Best < 0)
+                continue;
+            const RdxSphere::FLightPart& Pt    = R.LightParts[Best];
+            const FLOAT                  Reach = Max((FLOAT)Pt.Reach, 1e-3f);
+            const FLOAT Share = RdxMath::SoftLightShare(D, Reach) * Max(0.0f, 1.0f - Off / Reach);
+            if (Share <= 0.0f)
+                continue;
+            bReached       = 1;
+            const INT Slot = SphereLightSlotOf(M, Pt.Other);
+            if (Slot < 0 || !GSphereLights[Slot].Texels)
+                continue;
+            // The step the light makes at the side, beside the texel (RdxMath::SoftLightAcross): the polygon across's
+            // light and this one's, each a texel and a half inside the side - inside the polygon across no further than
+            // it reaches - at the texel's place along the side.
+            const FLOAT   Tc   = Clamp(T, (FLOAT)Pt.T0, (FLOAT)Pt.T1);
+            const FVector E    = A + Dir * Tc;
+            const FVector QO   = E + FVector((FLOAT)Pt.Into.X, (FLOAT)Pt.Into.Y, (FLOAT)Pt.Into.Z) *
+                                         Min(Past, (FLOAT)Pt.Depth);
+            const FVector QH   = E + Ln->Into * Past;
+            const FSphereLight& O  = GSphereLights[Slot];
+            const FLOAT         LU = (((QO - O.Base) | O.AxisU) - O.PanU) * O.InvU;
+            const FLOAT         LV = (((QO - O.Base) | O.AxisV) - O.PanV) * O.InvV;
+            const FLOAT         HU = (((QH - L.Base) | L.AxisU) - L.PanU) * L.InvU;
+            const FLOAT         HV = (((QH - L.Base) | L.AxisV) - L.PanV) * L.InvV;
+            FLOAT OtherEdge[4], OwnEdge[4];
+            RdxMath::SampleLightTexels(O.Texels, O.W, O.H, O.LitU, O.LitV, LU, LV, OtherEdge);
+            RdxMath::SampleLightTexels(L.Texels, L.W, L.H, L.LitU, L.LitV, HU, HV, OwnEdge);
+            RdxMath::SoftLightAcross(Own, OwnEdge, OtherEdge, &Across[Count * 4]);
+            Shares[Count++] = Share;
+        }
+        if (!Count)
+            return bReached;
+        FLOAT Mixed[4];
+        RdxMath::SoftLightMix(Own, Shares, Across, Count, Mixed);
+        for (INT c = 0; c < 4; c++)
+            Texel[c] = (BYTE)Clamp(appRound(Mixed[c]), 0, 255);
+        return bReached;
+    };
+    const FSphereLightPlace Place = SphereLightPlaceOf(L);
+    if (L.Near && memcmp(&Place, &L.NearPlace, sizeof(Place)) == 0)
+    {
+        for (INT r = 0; r < L.NearRuns; r++)
+        {
+            const INT j = L.Near[2 * r] / L.W, i0 = L.Near[2 * r] - j * L.W;
+            for (INT i = i0; i < i0 + L.Near[2 * r + 1]; i++)
+                Mix(i, j);
+        }
+        return;
+    }
+    if (L.Near)
+    {
+        appFree(L.Near);
+        L.Near     = nullptr;
+        L.NearRuns = 0;
+    }
+    const UBOOL bKeep = (L.MadeCount > 0);
+    UBOOL       bRuns = bKeep;
+    GSphereLightRuns.Clear();
+    for (INT j = 0; j < L.LitV; j++)
+        for (INT i = 0; i < L.LitU; i++)
+            if (Mix(i, j) && bRuns)
+            {
+                const INT At = j * L.W + i, n = GSphereLightRuns.Num;
+                if (i > 0 && n >= 2 && GSphereLightRuns.Data[n - 2] + GSphereLightRuns.Data[n - 1] == At)
+                    GSphereLightRuns.Data[n - 1]++;
+                else
+                    bRuns = GSphereLightRuns.Add(At) && GSphereLightRuns.Add(1);
+            }
+    if (!bRuns)
+        return;
+    // At least one INT, so that a map no side reaches has its (empty) list too.
+    L.Near = (INT*)appMalloc(Max(GSphereLightRuns.Num, 1) * sizeof(INT), TEXT("RdxSphereLight"));
+    if (!L.Near)
+        return;
+    if (GSphereLightRuns.Num)
+        appMemcpy(L.Near, GSphereLightRuns.Data, GSphereLightRuns.Num * sizeof(INT));
+    L.NearRuns  = GSphereLightRuns.Num / 2;
+    L.NearPlace = Place;
+}
+
+// The light map a facet is drawn with where the spherifier rounded the level along its surface: its copy with the
+// light across the soft edges blended in - its slot in the texture heap - or -1 for the engine's own. Map: the engine's
+// light map, laid on as the caller lays it (PanU .. InvV).
+static INT SphereLightBlend(FBackend& Backend, const FSceneNode* Frame, const FTextureInfo& Map,
+                            const FSurfaceFacet& Facet, FLOAT PanU, FLOAT PanV, FLOAT InvU, FLOAT InvV, INT EngineFrame)
+{
+    if (!GSphere->bOn || !Frame || !Frame->Level || !Frame->Level->Model || !Facet.Polys)
+        return -1;
+    // A measurement only (SecondRevision-sphere-light-off.txt): every surface with the engine's own light map, nothing
+    // blended across the soft edges.
+    static const UBOOL bBlendOff = FreshMarker(L"SecondRevision-sphere-light-off.txt");
+    if (bBlendOff)
+        return -1;
+    const UModel* const M = Frame->Level->Model;
+    if (M != GSphere->Model)
+        return -1;
+    if (GSphereLightModel != M || GSphereLightGen != GSphereGen || GSphereLightSurfs != M->Surfs.Num())
+        SphereLightFind(M);
+    const INT Node = Facet.Polys->iNode;
+    const INT sf   = (Node >= 0 && Node < M->Nodes.Num()) ? M->Nodes(Node).iSurf : -1;
+    const INT Slot = (GSphereLightOfSurf && sf >= 0 && sf < GSphereLightSurfs) ? GSphereLightOfSurf[sf] : -1;
+    if (Slot < 0)
+        return -1;
+    FSphereLight& L = GSphereLights[Slot];
+    // Its light map read anew where the engine's is new - in the world's view, where the facet's frame is the level's.
+    if (Map.CacheID != L.CacheID && IsWorldView(Frame, EngineFrame) && Map.Format == TEXF_RGBA7 && Map.NumMips > 0 &&
+        Map.Mips[0] && Map.Mips[0]->DataPtr && Map.Mips[0]->USize > 0 && Map.Mips[0]->VSize > 0)
+    {
+        const INT   W        = Map.Mips[0]->USize, H = Map.Mips[0]->VSize;
+        const UBOOL bNewSize = (W != L.W || H != L.H || !L.Texels || !L.Blend);
+        if (bNewSize)
+        {
+            if (L.Texels)
+                appFree(L.Texels);
+            if (L.Blend)
+                appFree(L.Blend);
+            // The textures of the old size are left to the cache; the copies of this one take new ones.
+            L.Tex[0] = L.Tex[1] = 0;
+            L.Texels = (BYTE*)appMalloc(W * H * 4, TEXT("RdxSphereLight"));
+            L.Blend  = (BYTE*)appMalloc(W * H * 4, TEXT("RdxSphereLight"));
+            L.W      = W;
+            L.H      = H;
+            if (!L.Texels || !L.Blend)
+            {
+                if (L.Texels)
+                    appFree(L.Texels);
+                if (L.Blend)
+                    appFree(L.Blend);
+                L.Texels = L.Blend = nullptr;
+                return -1;
+            }
+        }
+        // The engine builds a flickering light's maps again every frame, most often just as they were: the same texels
+        // laid on the same way leave what was made of them as it is - no new Version.
+        const FSphereLightPlace Was = SphereLightPlaceOf(L);
+        L.LitU  = (Map.UClamp > 0 && Map.UClamp <= W) ? Map.UClamp : W;
+        L.LitV  = (Map.VClamp > 0 && Map.VClamp <= H) ? Map.VClamp : H;
+        L.PanU  = PanU;
+        L.PanV  = PanV;
+        L.InvU  = InvU;
+        L.InvV  = InvV;
+        L.Base  = Facet.MapCoords.Origin.TransformPointBy(Frame->Uncoords);
+        L.AxisU = Facet.MapCoords.XAxis.TransformVectorBy(Frame->Uncoords);
+        L.AxisV = Facet.MapCoords.YAxis.TransformVectorBy(Frame->Uncoords);
+        const FSphereLightPlace Now = SphereLightPlaceOf(L);
+        if (bNewSize || memcmp(&Was, &Now, sizeof(Now)) != 0 || memcmp(L.Texels, Map.Mips[0]->DataPtr, W * H * 4) != 0)
+        {
+            appMemcpy(L.Texels, Map.Mips[0]->DataPtr, W * H * 4);
+            L.Version++;
+        }
+        L.CacheID = Map.CacheID;
+    }
+    if (!L.Texels || !L.Blend || L.CacheID != Map.CacheID)
+        return -1;
+    const INT Key = SphereLightKey(M, L);
+    if (Key != L.MadeKey)
+    {
+        const DOUBLE T0 = appSeconds();
+        SphereLightMake(M, L);
+        GSphereLightMs += (appSeconds() - T0) * 1000.0;
+        L.MadeKey = Key;
+        L.MadeCount++;
+        GSphereLightMade++;
+        L.Info         = Map;
+        L.Mip          = *Map.Mips[0];
+        L.Mip.DataPtr  = L.Blend;
+        L.Info.NumMips = 1;
+        L.Info.Mips[0] = &L.Mip;
+        for (INT m = 1; m < MAX_MIPS; m++)
+            L.Info.Mips[m] = nullptr;
+        // Into the other of its pair of textures, written over in place - unless that one was written in this frame
+        // already, for a copy this frame's draws show: then into one of its own.
+        const INT r = L.MadeCount & 1;
+        L.Info.bRealtimeChanged = 0;
+        if (!L.Tex[r])
+        {
+            L.Tex[r]       = ++GSphereLightTexNext;
+            L.TexFrame[r]  = EngineFrame;
+            L.Info.CacheID = SphereLightTexBase + L.Tex[r];
+        }
+        else if (L.TexFrame[r] != EngineFrame)
+        {
+            L.TexFrame[r]           = EngineFrame;
+            L.Info.CacheID          = SphereLightTexBase + L.Tex[r];
+            L.Info.bRealtimeChanged = 1;
+        }
+        else
+            L.Info.CacheID = SphereLightTexBase + ++GSphereLightTexNext;
+    }
+    if (EngineFrame - GSphereLightSaid >= 600 || EngineFrame < GSphereLightSaid)
+    {
+        if (GSphereLightSaid >= 0 && GSphereLightMade)
+            RDX_LOGF("spherifier light: %i copies made over the last %i frames, %.2f ms a frame", GSphereLightMade,
+                     EngineFrame - GSphereLightSaid, GSphereLightMs / (DOUBLE)Max(EngineFrame - GSphereLightSaid, 1));
+        GSphereLightSaid = EngineFrame;
+        GSphereLightMade = 0;
+        GSphereLightMs   = 0.0;
+    }
+    const INT Srv = Backend.PrepareTexture(L.Info, 0, 0);
+    // Written over, it is the copy as made until the next one; not yet - the frame's uploads were full - each draw of
+    // it asks again.
+    if (L.Info.bRealtimeChanged && Srv >= 0 && Backend.TextureWrittenThisFrame(L.Info, 0, 0))
+        L.Info.bRealtimeChanged = 0;
+    return Srv;
+}
+
+// The relief's axes at a corner of a piece of the spherifier's (FSpherePiece::Turn): the surface's own, turned round
+// the level's upright as far as the surface has turned there - in the level's space, so that a mirror's view, whose
+// axes are the world's turned inside out, turns them the same way the surface went. World: F's axes (T, B, N) in the
+// level's space, the same for each of a surface's pieces; Trig: the turn's cosine and sine, where the piece has them
+// (FSpherePiece::Trig) - a frame turns tens of thousands of pieces.
+static RdxMath::FPomFrame TurnedPomFrameOf(const RdxMath::FPomFrame& F, const FSceneNode* Frame, const FVector* World,
+                                           FLOAT Turn, const FLOAT* Trig)
+{
+    if (Turn > -1e-5f && Turn < 1e-5f)
+        return F;
+    const FLOAT C = Trig ? Trig[0] : (FLOAT)appCos(Turn), S = Trig ? Trig[1] : (FLOAT)appSin(Turn);
+    RdxMath::FPomFrame G = F;
+    if (GTransformAllOk)
+    {
+        FLOAT In[9], Out[9];
+        for (INT a = 0; a < 3; a++)
+        {
+            In[a * 3]     = World[a].X * C - World[a].Y * S;
+            In[a * 3 + 1] = World[a].X * S + World[a].Y * C;
+            In[a * 3 + 2] = World[a].Z;
+        }
+        TransformAllAsEngine(In, Out, 3, Frame->Coords, 0);
+        RdxMath::FVec3* const Axes[3] = { &G.T, &G.B, &G.N };
+        for (INT a = 0; a < 3; a++)
+        {
+            Axes[a]->X = Out[a * 3];
+            Axes[a]->Y = Out[a * 3 + 1];
+            Axes[a]->Z = Out[a * 3 + 2];
+        }
+        return G;
+    }
+    auto Spin = [&](const FVector& W) -> RdxMath::FVec3
+    {
+        const FVector O = FVector(W.X * C - W.Y * S, W.X * S + W.Y * C, W.Z).TransformVectorBy(Frame->Coords);
+        RdxMath::FVec3 Out;
+        Out.X = O.X;
+        Out.Y = O.Y;
+        Out.Z = O.Z;
+        return Out;
+    };
+    G.T = Spin(World[0]);
+    G.B = Spin(World[1]);
+    G.N = Spin(World[2]);
+    return G;
+}
+
 // The level's occluding polygons for the shadow maps' world maps, as triangles: every BSP node's polygon (Engine\Inc\
-// UnModel.h, UnObj.h: its points through Verts(iVertPool + k).pVertex), a fan over its points. Once a level, logged.
+// UnModel.h, UnObj.h: its points through Verts(iVertPool + k).pVertex), a fan over its points - or the spherifier's
+// triangles in its place, where it moved. Once a level, logged.
 static void PlantCensus(ULevel* Level);
 // The grass for the mirror rays alone (MakeMirrorGrass): its triangles into Out, how many; the picture its blades wear
 // there, its place in the texture heap or -1 (MirrorGrassSrv).
@@ -11175,12 +13998,15 @@ static const INT   MirrorGrassBlades = 200000;
 
 static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
 {
+    // The spherifier's rounding first: the shadows and the rays have the walls where they are drawn.
+    EnsureSphere(Backend, Level);
     const DOUBLE T0 = appSeconds();
     GatherShadowMovers(Level);
     UModel* const M = Level ? Level->Model : nullptr;
     if (!M)
     {
-        Backend.SetShadowWorld(nullptr, 0, nullptr, 0, nullptr, nullptr, 0, nullptr, 0, nullptr, 0, nullptr);
+        Backend.SetShadowRtWorld(nullptr, 0, nullptr, nullptr, 0, nullptr, 0, nullptr, 0, nullptr);
+        Backend.SetShadowMapsWorld(nullptr, 0);
         RDX_LOG("shadow level: the level has no model");
         return;
     }
@@ -11216,33 +14042,64 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
             }
         }
         if (ShadowNodeUsable(M, Node, Why))
-            Tris += Node.NumVertices - 2;
+        {
+            const INT Rounded = SphereNodeTris(M, n);
+            Tris += Rounded ? Rounded : Node.NumVertices - 2;
+        }
         else
             Skipped[Why]++;
     }
-    FLOAT* const Xyz = (Tris > 0) ? (FLOAT*)appMalloc(Tris * 9 * sizeof(FLOAT), TEXT("RdxShadowWorld")) : nullptr;
+    // The lists as long as the level's triangles come from RdxAllocLarge: refused, the level goes without them - no
+    // walls in the shadow maps, no level for the rays - where the engine's allocator would end the game.
+    FLOAT* const Xyz = (Tris > 0) ? (FLOAT*)RdxAllocLarge((SIZE_T)Tris * 9 * sizeof(FLOAT)) : nullptr;
+    if (Tris > 0 && !Xyz)
+        RDX_LOGF("shadow level: no room in the address space for the level's %i triangles (%.1f MB in one piece) - the "
+                 "shadow maps have no walls and the rays no level here", Tris, (DOUBLE)Tris * 36.0 / (1024.0 * 1024.0));
     // The ray tracing scene's own list beside it: the see-through surfaces left out (RdxMath::BspBlocksLightSeeThrough) -
     // an invisible blocking brush, glass, a grate. The maps keep them, and their generous bias hides the shadows those
     // cast near what they stand on; a ray is exact, and would lay a hard shadow wherever such a surface stands in the
     // light - one the light map does not have.
-    FLOAT* const RtXyz = (Tris > 0) ? (FLOAT*)appMalloc(Tris * 9 * sizeof(FLOAT), TEXT("RdxShadowWorldRt")) : nullptr;
+    // Not a list of its own beside the maps' one, but which of the maps' triangles it keeps (RtKeep): once the maps have
+    // their list, the same memory is pressed down to the rays' (ShadowRtWorld below). Two lists of a large rounded
+    // level's every triangle at once were more of the 32-bit address space than a level's load can spare.
+    BYTE* const RtKeep = (Tris > 0) ? (BYTE*)RdxAllocLarge((SIZE_T)Tris) : nullptr;
     // For the RT water's colours: each of those triangles' surface, and each surface's colour - its texture's average
     // (UBitmap::MipZero, the engine's own), and whether it carries its own light (PF_Unlit).
-    DWORD* const RtSurf     = (Tris > 0) ? (DWORD*)appMalloc(Tris * sizeof(DWORD), TEXT("RdxShadowWorldRtSurf")) : nullptr;
+    DWORD* const RtSurf     = (Tris > 0) ? (DWORD*)RdxAllocLarge((SIZE_T)Tris * sizeof(DWORD)) : nullptr;
     // And the sky walls (PF_FakeBackdrop) for the water's rays alone (FRtPass::SetLevel): where a ray leaves the level.
-    FLOAT* const RtSky      = (Tris > 0) ? (FLOAT*)appMalloc(Tris * 9 * sizeof(FLOAT), TEXT("RdxShadowWorldRtSky")) : nullptr;
-    INT          SkyWritten = 0;
+    // This list and the see-through one below grow as their triangles come: a level holds few of them, and room for
+    // every triangle of a large rounded level, twice over, is more of the address space than a level's load can spare.
+    FLOAT* RtSky      = nullptr;
+    INT    SkyWritten = 0, SkyRoom = 0;
+    // Room for one more triangle in a growing list (and its surfaces, where it has them): false where there is no memory.
+    auto RoomFor = [](FLOAT*& Xyz, DWORD** Surf, INT Count, INT& Room, const TCHAR* Tag) -> UBOOL
+    {
+        if (Count < Room)
+            return 1;
+        const INT    More   = Max(Room * 2, 1024);
+        FLOAT* const NewXyz = (FLOAT*)appRealloc(Xyz, More * 9 * sizeof(FLOAT), Tag);
+        if (!NewXyz)
+            return 0;
+        Xyz = NewXyz;
+        if (Surf)
+        {
+            DWORD* const NewSurf = (DWORD*)appRealloc(*Surf, More * sizeof(DWORD), Tag);
+            if (!NewSurf)
+                return 0;
+            *Surf = NewSurf;
+        }
+        Room = More;
+        return 1;
+    };
     // And the see-through surfaces the level draws - a pane, a grating, a force field's sheet - with each triangle's
     // surface, for the mirror rays alone (FRtPass::SetThin): a ray passes them and takes their colour along.
     // And after them the grass for the mirror rays alone (MakeMirrorGrass), its triangles a surface's of their own:
     // one more than the level's.
     TArray<FLOAT> Blades;
     const INT     BladeTris = MakeMirrorGrass(Level, Blades);
-    FLOAT* const RtThin     = (Tris + BladeTris > 0)
-                                  ? (FLOAT*)appMalloc((Tris + BladeTris) * 9 * sizeof(FLOAT), TEXT("RdxWorldRtThin")) : nullptr;
-    DWORD* const RtThinSurf = (Tris + BladeTris > 0)
-                                  ? (DWORD*)appMalloc((Tris + BladeTris) * sizeof(DWORD), TEXT("RdxWorldRtThinSurf")) : nullptr;
-    INT          ThinWritten = 0;
+    FLOAT* RtThin      = nullptr;
+    DWORD* RtThinSurf  = nullptr;
+    INT    ThinWritten = 0, ThinRoom = 0;
     const INT    Surfs      = M->Surfs.Num();
     const INT    RaySurfs   = Surfs + ((BladeTris > 0) ? 1 : 0);
     DWORD* const SurfAlbedo = (Surfs > 0) ? (DWORD*)appMalloc(RaySurfs * sizeof(DWORD), TEXT("RdxShadowWorldAlbedo")) : nullptr;
@@ -11293,41 +14150,79 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
             const FBspSurf& Sf       = M->Surfs(Node.iSurf);
             const UBOOL     bMarker  = Sf.Texture && appStricmp(Sf.Texture->GetName(), TEXT("Marker_sky")) == 0;
             const DWORD     RtFlags  = Sf.PolyFlags | (Sf.Texture ? Sf.Texture->PolyFlags : 0) | (bMarker ? PF_FakeBackdrop : 0);
-            const UBOOL     bRtKeeps = RtXyz && !bSky && RdxMath::BspBlocksLightSeeThrough((unsigned int)RtFlags);
+            const UBOOL     bRtKeeps = RtKeep && !bSky && RdxMath::BspBlocksLightSeeThrough((unsigned int)RtFlags);
             if (bSky)
             {
-                SkyTris += Node.NumVertices - 2;
+                const INT Rounded = SphereNodeTris(M, n);
+                SkyTris += Rounded ? Rounded : Node.NumVertices - 2;
                 SkyBox  += M->Points(M->Verts(Node.iVertPool).pVertex);
             }
-            const FVector& P0 = M->Points(M->Verts(Node.iVertPool).pVertex);
-            Box += P0;
-            for (INT k = 1; k + 1 < Node.NumVertices && Written < Tris; k++)
+            // The spherifier's triangles where the node moved, the fan over its own corners where it did not.
+            const INT Rounded  = SphereNodeTris(M, n);
+            const INT NodeTris = Rounded ? Rounded : Node.NumVertices - 2;
+            for (INT k = 0; k < NodeTris && Written < Tris; k++)
             {
-                const FVector& P1 = M->Points(M->Verts(Node.iVertPool + k).pVertex);
-                const FVector& P2 = M->Points(M->Verts(Node.iVertPool + k + 1).pVertex);
+                FVector P0, P1, P2;
+                if (Rounded)
+                    SphereTriangle(n, k, P0, P1, P2);
+                else
+                {
+                    P0 = M->Points(M->Verts(Node.iVertPool).pVertex);
+                    P1 = M->Points(M->Verts(Node.iVertPool + k + 1).pVertex);
+                    P2 = M->Points(M->Verts(Node.iVertPool + k + 2).pVertex);
+                }
+                Box += P0;
                 FLOAT* const W = Xyz + Written * 9;
                 W[0] = P0.X; W[1] = P0.Y; W[2] = P0.Z;
                 W[3] = P1.X; W[4] = P1.Y; W[5] = P1.Z;
                 W[6] = P2.X; W[7] = P2.Y; W[8] = P2.Z;
+                if (RtKeep)
+                    RtKeep[Written] = bRtKeeps ? 1 : 0;
                 if (bRtKeeps)
                 {
                     if (RtSurf)
                         RtSurf[RtWritten] = (DWORD)Node.iSurf;
-                    appMemcpy(RtXyz + RtWritten++ * 9, W, 9 * sizeof(FLOAT));
+                    RtWritten++;
                 }
-                else if (RtSky && !bSky && (RtFlags & PF_FakeBackdrop))
-                    appMemcpy(RtSky + SkyWritten++ * 9, W, 9 * sizeof(FLOAT));
-                else if (RtThin && RtThinSurf && !bSky && (RtFlags & (PF_Translucent | PF_Modulated | PF_Masked)) &&
+                else if (!bSky && (RtFlags & PF_FakeBackdrop))
+                {
+                    if (RoomFor(RtSky, nullptr, SkyWritten, SkyRoom, TEXT("RdxShadowWorldRtSky")))
+                        appMemcpy(RtSky + SkyWritten++ * 9, W, 9 * sizeof(FLOAT));
+                }
+                else if (!bSky && (RtFlags & (PF_Translucent | PF_Modulated | PF_Masked)) &&
                          !(RtFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal)))
                 {
-                    RtThinSurf[ThinWritten] = (DWORD)Node.iSurf;
-                    appMemcpy(RtThin + ThinWritten++ * 9, W, 9 * sizeof(FLOAT));
+                    if (RoomFor(RtThin, &RtThinSurf, ThinWritten, ThinRoom, TEXT("RdxWorldRtThin")))
+                    {
+                        RtThinSurf[ThinWritten] = (DWORD)Node.iSurf;
+                        appMemcpy(RtThin + ThinWritten++ * 9, W, 9 * sizeof(FLOAT));
+                    }
                 }
                 Box += P1;
                 Box += P2;
                 Written++;
             }
         }
+    }
+    // The mirror grass after the see-through surfaces, all its triangles the one surface's after the level's.
+    for (INT t = 0; t < BladeTris && RoomFor(RtThin, &RtThinSurf, ThinWritten, ThinRoom, TEXT("RdxWorldRtThin")); t++)
+    {
+        appMemcpy(RtThin + ThinWritten * 9, &Blades(t * 9), 9 * sizeof(FLOAT));
+        RtThinSurf[ThinWritten++] = (DWORD)Surfs;
+    }
+    // The maps' list first, then the same memory pressed down to the rays' triangles, in their order.
+    const UBOOL bSent = Backend.SetShadowMapsWorld(Xyz, Written * 3);
+    FLOAT* const RtXyz = (Xyz && RtKeep) ? Xyz : nullptr;
+    if (RtXyz)
+    {
+        INT Kept = 0;
+        for (INT t = 0; t < Written; t++)
+            if (RtKeep[t])
+            {
+                if (Kept != t)
+                    memmove(RtXyz + Kept * 9, RtXyz + t * 9, 9 * sizeof(FLOAT));
+                Kept++;
+            }
     }
     // A measurement only (the marker SecondRevision-rt-dump.txt): the ray tracing scene's level as it goes to the card, into
     // the game's folder - SecondRevision-rt-level.bin: the triangle count, then each triangle's nine floats and its surface;
@@ -11378,17 +14273,9 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
         }
         RDX_LOGF("shadow level (marker): the ray tracing level written out - %i triangles, %i surfaces", RtWritten, Surfs);
     }
-    // The mirror grass after the see-through surfaces, all its triangles the one surface's after the level's.
-    if (RtThin && RtThinSurf)
-        for (INT t = 0; t < BladeTris; t++)
-        {
-            appMemcpy(RtThin + ThinWritten * 9, &Blades(t * 9), 9 * sizeof(FLOAT));
-            RtThinSurf[ThinWritten++] = (DWORD)Surfs;
-        }
-    const UBOOL bSent = Backend.SetShadowWorld(Xyz, Written * 3, RtXyz, RtWritten * 3, (RtSurf && SurfAlbedo) ? RtSurf : nullptr,
-                                               SurfAlbedo, SurfAlbedo ? RaySurfs : 0, RtSky, SkyWritten * 3,
-                                               (RtThin && RtThinSurf && SurfAlbedo) ? RtThin : nullptr, ThinWritten * 3,
-                                               RtThinSurf);
+    Backend.SetShadowRtWorld(RtXyz, RtXyz ? RtWritten * 3 : 0, (RtSurf && SurfAlbedo) ? RtSurf : nullptr, SurfAlbedo,
+                             SurfAlbedo ? RaySurfs : 0, RtSky, SkyWritten * 3,
+                             (RtThin && RtThinSurf && SurfAlbedo) ? RtThin : nullptr, ThinWritten * 3, RtThinSurf);
     // Each surface's own face for the light the mirror rays work out on it (FBackend::SetRtSurfaceStatic): its
     // normal, the light all round the zone before it - its first node's - and whether it is lit specially.
     if (bSent && SurfAlbedo)
@@ -11440,12 +14327,9 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
         RDX_LOGF("grass: the mirror rays' own - %i blades, still, where a surface that mirrors stands within %.0f units",
                  BladeTris, MirrorGrassReach);
     }
-    if (Xyz)
-        appFree(Xyz);
-    if (RtXyz)
-        appFree(RtXyz);
-    if (RtSurf)
-        appFree(RtSurf);
+    RdxFreeLarge(Xyz);
+    RdxFreeLarge(RtKeep);
+    RdxFreeLarge(RtSurf);
     if (RtSky)
         appFree(RtSky);
     if (RtThin)
@@ -11461,7 +14345,7 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
              (INT)SkyBox.Max.X, (INT)SkyBox.Max.Y, (INT)SkyBox.Max.Z, SkyWritten, Surfs, NoAverage);
     RDX_LOGF("shadow level: %s - %i triangles from %i nodes (%.1f MB)%s; skipped: %i empty, %i by rule (%s), "
              "%i with a bad index; box (%i, %i, %i)..(%i, %i, %i); %.1f ms",
-             Level->GetOuter() ? Level->GetOuter()->GetName() : TEXT("?"), M->Nodes.Num(), Written,
+             Level->GetOuter() ? Level->GetOuter()->GetName() : TEXT("?"), Written, M->Nodes.Num(),
              (DOUBLE)Written * 9.0 * sizeof(FLOAT) / (1024.0 * 1024.0), bSent ? TEXT("") : TEXT(" - did NOT reach the card"),
              Skipped[1], Skipped[2], GShadowSeeThrough ? TEXT("translucents and the sky too - marker") : TEXT("portals only"),
              Skipped[3], (INT)Box.Min.X, (INT)Box.Min.Y, (INT)Box.Min.Z, (INT)Box.Max.X, (INT)Box.Max.Y, (INT)Box.Max.Z,
@@ -11551,6 +14435,24 @@ static BYTE  GPlantFaceLeaf[(65536 + 16) / 3];
 // WriteCasterShape packs them - the octahedron's two steps, a byte each.
 static FVector GShadowFrameNormals[65536 + 16];
 static WORD    GShadowFrameOct[65536 + 16];
+// A grown plant's faces as PreparePlantShape lays them and WriteCasterShape writes them, and where they are between the
+// two: the arrays above on the game's thread (GPlantFacesHere), a helper's own for a plant laid ahead (FPlantJob).
+// Ring: the wood's corners swayed; Corner: a leaf's foot and its four corners.
+struct FPlantFaces
+{
+    FVector* Verts;
+    FLOAT*   PlaceU;
+    FLOAT*   PlaceV;
+    BYTE*    FaceLeaf;
+    WORD*    Oct;
+    FVector* Ring;
+    FVector* Corner;
+};
+static FVector           GPlantRing[RdxTree::ShadowCornersMost];
+static FVector           GPlantCorner[5];
+static const FPlantFaces GPlantFacesHere = { GShadowFrameVerts, GPlantPlaceU, GPlantPlaceV, GPlantFaceLeaf,
+                                             GShadowFrameOct,   GPlantRing,   GPlantCorner };
+enum { PlantFacesMost = (65536 + 16) / 3 - 2 };
 // A mover's faces for the mirror rays, beside GShadowFrameVerts (PrepareMoverShape): each corner's place on its
 // polygon's texture, in repeats, and each face's texture - its number among the mover's own (MoverTextures) - with
 // whether the polygon carries its own light; and how much of a texture a unit of the level holds on the mover.
@@ -11899,6 +14801,38 @@ static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT
 static INT   AddLevelPlantCaster(FBackend& Backend, ULevel* Level, INT Plant, FLOAT Dist, INT EngineFrame, INT& Tris,
                                  INT& Why);
 
+// What a grown plant's faces are laid by (PlantFacesOf), worked out on the game's thread before them (PlantSwayOf): the
+// wind's push at its foot, and its beats' turns now - the engine's sines.
+struct FPlantSway
+{
+    RdxMath::FWind W;
+    FLOAT          PushX, PushY, Push2, Len;
+    UBOOL          bWind;
+    FLOAT          Sin1, Cos1, Sin2, Cos2, Sin3, Cos3, C, Sn;
+};
+// A grown plant laid ahead on a helper's thread (OpenPlantJobs to ClosePlantJobs): its shape as PreparePlantShape
+// leaves it, and its vertices as WriteCasterShape writes them into Data - S.Faces * 9 places, then as many texture
+// places. Room: the floats Data holds; Most: the faces it can have.
+struct FPlantJob
+{
+    AActor*       A;
+    FCasterShape  S;
+    FPlantSway    Sw;
+    INT           Most;
+    UBOOL         bRt;
+    UBOOL         bShaped;
+    INT           Why;
+    UBOOL         bMasked;
+    FLOAT*        Data;
+    INT           Room;
+    volatile LONG State;        // 0 not taken, 1 being laid, 2 laid
+};
+static FPlantJob* TakePlantJob(AActor* A);
+static void       OpenPlantJobs();
+static void       AddPlantJob(FBackend& Backend, AActor* A, FLOAT Dist, INT EngineFrame);
+static void       StartPlantJobs();
+static void       ClosePlantJobs();
+
 static UBOOL PrepareCasterShape(FBackend& Backend, AActor* A, FCasterShape& S, INT& Why)
 {
     Why             = 0;
@@ -12054,6 +14988,39 @@ static inline WORD PackShapeNormal(const FVector& N, FLOAT Sign)
     return (WORD)(X | (Y << 8));
 }
 
+// WriteCasterShape's way with a grown plant's faces (PreparePlantShape), F's: three corners a face, each face flat - its
+// normal turned out of the plant's middle; its wood solid, its leaves by the leaves' sheet's mask. No texture of the
+// model's is on it: the mirror rays take it by its colour. bRt: WriteCasterShape's.
+static UBOOL WritePlantShape(const FCasterShape& S, const FPlantFaces& F, UBOOL bRt, FLOAT* Out, FLOAT* Uvw)
+{
+    UBOOL bMasked = 0;
+    if (bRt)
+        for (INT f = 0; f < S.Faces; f++)
+        {
+            const FVector& P0 = F.Verts[f * 3];
+            const FVector& P1 = F.Verts[f * 3 + 1];
+            const FVector& P2 = F.Verts[f * 3 + 2];
+            const FVector  N  = (P1 - P0) ^ (P2 - P0);
+            const FLOAT    Sign = ((N | ((P0 + P1 + P2) * (1.0f / 3.0f) - S.Centre)) < 0.0f) ? -1.0f : 1.0f;
+            const WORD     Oct  = PackShapeNormal(N, Sign);
+            F.Oct[f * 3] = F.Oct[f * 3 + 1] = F.Oct[f * 3 + 2] = Oct;
+        }
+    for (INT v = 0; v < S.Faces * 3; v++)
+    {
+        const FVector& P    = F.Verts[v];
+        const INT      Slot = F.FaceLeaf[v / 3] ? S.PlantLeafSlot : 0;
+        const WORD     Oct  = bRt ? F.Oct[v] : 0;
+        bMasked |= (Slot > 0) ? 1 : 0;
+        *Out++ = P.X;
+        *Out++ = P.Y;
+        *Out++ = P.Z;
+        *Uvw++ = RdxMath::PackCasterPlace(F.PlaceU[v], Oct & 255);
+        *Uvw++ = RdxMath::PackCasterPlace(F.PlaceV[v], Oct >> 8);
+        *Uvw++ = bRt ? RdxMath::PackCasterSlot(Slot, 0, 0) : (FLOAT)Slot;
+    }
+    return bMasked;
+}
+
 // The faces that cast, three vertices each: the positions into Out, the texture places into Uvw - u and v, the mesh's
 // bytes over 256, and the face's mask slot. The same faces PrepareCasterShape counted.
 // With GShapeRtNow the three numbers carry more, for the mirror rays (RdxMath::PackCasterPlace, PackCasterSlot):
@@ -12069,36 +15036,7 @@ static UBOOL WriteCasterShape(const FCasterShape& S, FLOAT* Out, FLOAT* Uvw, FLO
     FLOAT Outward = 0.0f, World = 0.0f, UvSum = 0.0f;
     Density = 0.0f;
     if (S.Plant >= 0)
-    {
-        // A grown plant's (PreparePlantShape): three corners a face, each face flat - its normal turned out of the
-        // plant's middle; its wood solid, its leaves by the leaves' sheet's mask. No texture of the model's is on it:
-        // the mirror rays take it by its colour.
-        if (bRt)
-            for (INT f = 0; f < S.Faces; f++)
-            {
-                const FVector& P0 = GShadowFrameVerts[f * 3];
-                const FVector& P1 = GShadowFrameVerts[f * 3 + 1];
-                const FVector& P2 = GShadowFrameVerts[f * 3 + 2];
-                const FVector  N  = (P1 - P0) ^ (P2 - P0);
-                const FLOAT    Sign = ((N | ((P0 + P1 + P2) * (1.0f / 3.0f) - S.Centre)) < 0.0f) ? -1.0f : 1.0f;
-                const WORD     Oct  = PackShapeNormal(N, Sign);
-                GShadowFrameOct[f * 3] = GShadowFrameOct[f * 3 + 1] = GShadowFrameOct[f * 3 + 2] = Oct;
-            }
-        for (INT v = 0; v < S.Faces * 3; v++)
-        {
-            const FVector& P    = GShadowFrameVerts[v];
-            const INT      Slot = GPlantFaceLeaf[v / 3] ? S.PlantLeafSlot : 0;
-            const WORD     Oct  = bRt ? GShadowFrameOct[v] : 0;
-            bMasked |= (Slot > 0) ? 1 : 0;
-            *Out++ = P.X;
-            *Out++ = P.Y;
-            *Out++ = P.Z;
-            *Uvw++ = RdxMath::PackCasterPlace(GPlantPlaceU[v], Oct & 255);
-            *Uvw++ = RdxMath::PackCasterPlace(GPlantPlaceV[v], Oct >> 8);
-            *Uvw++ = bRt ? RdxMath::PackCasterSlot(Slot, 0, 0) : (FLOAT)Slot;
-        }
-        return bMasked;
-    }
+        return WritePlantShape(S, GPlantFacesHere, bRt, Out, Uvw);
     if (S.Mover)
     {
         // A brush's triangles share no corner here, and its faces are flat: each one's own normal on its three.
@@ -12965,6 +15903,10 @@ static INT         GRayLargeRoom  = 0;
 static INT         GRayLargeCount = 0;
 static BYTE*       GRayBlob       = nullptr;        // as it goes to the backend: lamps, buckets, lists, large lamps
 static INT         GRayBlobRoom   = 0;
+// The blob last made, as long as GRayBlob holds it whole: its length and its parts' places.
+static UBOOL       bRayBlobHeld   = 0;
+static INT         GRayBlobTotal  = 0;
+static DWORD       GRayBlobPart[4];
 static INT         GRayHead[RDX_RT_LAMP_BUCKETS], GRayLast[RDX_RT_LAMP_BUCKETS], GRayLength[RDX_RT_LAMP_BUCKETS];
 // The made light into the picture's measure, for the level's surfaces: what brings a room's traced mirror image to
 // the brightness of the engine's own mirror image of it (docs/nyitott-hibak.md, 168). One number, held against one
@@ -13000,38 +15942,52 @@ static inline INT RayLampBucket(INT X, INT Y, INT Z)
 
 static void GatherRayLamps(FBackend& Backend, ULevel* Level)
 {
-    GRayLampCount  = 0;
-    GRayLargeCount = 0;
-    INT Nodes = 0;
-    for (INT b = 0; b < RDX_RT_LAMP_BUCKETS; b++)
-    {
-        GRayHead[b]   = -1;
-        GRayLast[b]   = -1;
-        GRayLength[b] = 0;
-    }
+    GRayLampCount = 0;
     for (INT i = 0; Level && i < Level->Actors.Num(); i++)
     {
         FCasterLamp C;
         if (!CasterLampOf(Level->Actors(i), C) ||
             !RayRoom(GRayLamps, GRayLampRoom, GRayLampCount + 1, TEXT("RdxRayLamps")))
             continue;
-        const INT Id = GRayLampCount++;
-        FRayLamp& L  = GRayLamps[Id];
+        FRayLamp& L = GRayLamps[GRayLampCount++];
         L.At[0] = C.At.X;        L.At[1] = C.At.Y;        L.At[2] = C.At.Z;
         L.Reach = C.Reach;
         L.Colour[0] = C.Colour[0]; L.Colour[1] = C.Colour[1]; L.Colour[2] = C.Colour[2];
         L.ConeCos = C.ConeCos;
         L.Aim[0] = C.Aim.X;      L.Aim[1] = C.Aim.Y;      L.Aim[2] = C.Aim.Z;
         L.Flags = C.bSpecial ? 1u : 0u;
+    }
+    // The lists and the blob are made of the lamps alone, and the blob begins with them: the same lamps, byte for
+    // byte, as the blob held make the same blob - handed over again as it is, whatever moved elsewhere in the level.
+    const INT LampBytes = GRayLampCount * (INT)sizeof(FRayLamp);
+    if (bRayBlobHeld && GRayLampCount > 0 && GRayBlobPart[1] == (DWORD)LampBytes &&
+        memcmp(GRayBlob, GRayLamps, (size_t)LampBytes) == 0)
+    {
+        Backend.SetRtLamps(GRayBlob, GRayBlobTotal, GRayBlobPart, GRayLampCount, GRayLargeCount, GRayLampCell,
+                           GLevelLightFit);
+        return;
+    }
+    bRayBlobHeld   = 0;
+    GRayLargeCount = 0;
+    INT Nodes      = 0;
+    for (INT b = 0; b < RDX_RT_LAMP_BUCKETS; b++)
+    {
+        GRayHead[b]   = -1;
+        GRayLast[b]   = -1;
+        GRayLength[b] = 0;
+    }
+    for (INT Id = 0; Id < GRayLampCount; Id++)
+    {
+        const FRayLamp& C = GRayLamps[Id];
         if (C.Reach > GRayLampCell * 4.0f)
         {
             if (RayRoom(GRayLarge, GRayLargeRoom, GRayLargeCount + 1, TEXT("RdxRayLarge")))
                 GRayLarge[GRayLargeCount++] = Id;
             continue;
         }
-        const INT X0 = appFloor((C.At.X - C.Reach) / GRayLampCell), X1 = appFloor((C.At.X + C.Reach) / GRayLampCell);
-        const INT Y0 = appFloor((C.At.Y - C.Reach) / GRayLampCell), Y1 = appFloor((C.At.Y + C.Reach) / GRayLampCell);
-        const INT Z0 = appFloor((C.At.Z - C.Reach) / GRayLampCell), Z1 = appFloor((C.At.Z + C.Reach) / GRayLampCell);
+        const INT X0 = appFloor((C.At[0] - C.Reach) / GRayLampCell), X1 = appFloor((C.At[0] + C.Reach) / GRayLampCell);
+        const INT Y0 = appFloor((C.At[1] - C.Reach) / GRayLampCell), Y1 = appFloor((C.At[1] + C.Reach) / GRayLampCell);
+        const INT Z0 = appFloor((C.At[2] - C.Reach) / GRayLampCell), Z1 = appFloor((C.At[2] + C.Reach) / GRayLampCell);
         const INT Cells = (X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1);
         if (!RayRoom(GRayNodeLamp, GRayNodeRoom, Nodes + Cells, TEXT("RdxRayNodes")) ||
             !RayRoom(GRayNodeNext, GRayNodeRoom2, Nodes + Cells, TEXT("RdxRayNodes")))
@@ -13050,8 +16006,7 @@ static void GatherRayLamps(FBackend& Backend, ULevel* Level)
                     GRayLength[b]++;
                 }
     }
-    const INT LampBytes = GRayLampCount * (INT)sizeof(FRayLamp);
-    const INT Total     = LampBytes + RDX_RT_LAMP_BUCKETS * 8 + Nodes * 4 + GRayLargeCount * 4;
+    const INT Total = LampBytes + RDX_RT_LAMP_BUCKETS * 8 + Nodes * 4 + GRayLargeCount * 4;
     if (GRayLampCount <= 0 || !RayRoom(GRayBlob, GRayBlobRoom, Total, TEXT("RdxRayBlob")))
     {
         Backend.SetRtLamps(nullptr, 0, nullptr, 0, 0, GRayLampCell, GLevelLightFit);
@@ -13075,6 +16030,10 @@ static void GatherRayLamps(FBackend& Backend, ULevel* Level)
     for (INT k = 0; k < GRayLargeCount; k++)
         Large[k] = (DWORD)GRayLarge[k];
     Backend.SetRtLamps(GRayBlob, Total, Part, GRayLampCount, GRayLargeCount, GRayLampCell, GLevelLightFit);
+    bRayBlobHeld  = 1;
+    GRayBlobTotal = Total;
+    for (INT k = 0; k < 4; k++)
+        GRayBlobPart[k] = Part[k];
 }
 
 // The engine's own light on the casters. The engine lights every mesh it draws, corner by corner, and hands the
@@ -13661,7 +16620,14 @@ static INT AddShadowMapCaster(FBackend& Backend, AActor* A, FLOAT Dist, INT Engi
     }
     const DOUBLE TShape = appSeconds();
     FCasterShape S;
-    if (!PrepareCasterShape(Backend, A, S, Why))
+    // A grown plant laid ahead on a helper's thread: its shape, and its vertices as WriteCasterShape writes them.
+    FPlantJob* const Job = TakePlantJob(A);
+    if (Job)
+    {
+        S   = Job->S;
+        Why = Job->Why;
+    }
+    if (Job ? !Job->bShaped : !PrepareCasterShape(Backend, A, S, Why))
     {
         if (bSame)
         {
@@ -13678,7 +16644,17 @@ static INT AddShadowMapCaster(FBackend& Backend, AActor* A, FLOAT Dist, INT Engi
     // every shape while the motion vectors are drawn: where its vertices were the frame before is told from the kept
     // one (GatherMotionBodies), and an upload heap is no memory to read back from.
     const UBOOL bStore = bSame || (E && (Stride > 1 || GMotionShapesWanted));
-    if (bStore && E->Capacity < Floats * 2)
+    if (bStore && Job)
+    {
+        // The plant's vertices as laid are the entry's from now on, and its old room the job's, for its next plant.
+        FLOAT* const Kept = E->Xyz;
+        const INT    Room = E->Capacity;
+        E->Xyz      = Job->Data;
+        E->Capacity = Job->Room;
+        Job->Data   = Kept;
+        Job->Room   = Room;
+    }
+    else if (bStore && E->Capacity < Floats * 2)
     {
         FLOAT* const Grown = (FLOAT*)appRealloc(E->Xyz, Floats * 2 * sizeof(FLOAT), TEXT("RdxShadowShape"));
         if (Grown)
@@ -13697,7 +16673,13 @@ static INT AddShadowMapCaster(FBackend& Backend, AActor* A, FLOAT Dist, INT Engi
     if (bStore && E->Capacity >= Floats * 2)
     {
         // Into the cache first and copied from there: an upload heap is no memory to read back from.
-        E->bMasked  = WriteCasterShape(S, E->Xyz, E->Xyz + Floats, E->Density);
+        if (Job)
+        {
+            E->bMasked = Job->bMasked;
+            E->Density = 0.0f;
+        }
+        else
+            E->bMasked = WriteCasterShape(S, E->Xyz, E->Xyz + Floats, E->Density);
         E->Colour   = S.Colour;
         E->TexKeys  = S.TexKeys;
         E->bRt      = GShapeRtNow;
@@ -13717,7 +16699,14 @@ static INT AddShadowMapCaster(FBackend& Backend, AActor* A, FLOAT Dist, INT Engi
     else
     {
         FLOAT Density = 0.0f;
-        Backend.SetShadowCasterMasked(Index, WriteCasterShape(S, Out, Uvw, Density));
+        if (Job)
+        {
+            appMemcpy(Out, Job->Data, Floats * sizeof(FLOAT));
+            appMemcpy(Uvw, Job->Data + Floats, Floats * sizeof(FLOAT));
+            Backend.SetShadowCasterMasked(Index, Job->bMasked);
+        }
+        else
+            Backend.SetShadowCasterMasked(Index, WriteCasterShape(S, Out, Uvw, Density));
         NoteCasterMaterial(Backend, Index, A, E, S.Centre, S.Radius, S.Colour, S.TexKeys, Density, EngineFrame);
         GShapeFresh++;
     }
@@ -14655,8 +17644,11 @@ static void GatherWeaponLamps(ULevel* Level, APlayerPawn* Viewer, const FVector&
     }
 }
 
+static FLOAT OwnLampWetFloor(ULevel* Level, const FLOAT* At);
+
 // The frame's own lamps to the backend, at its end, once all its views are drawn: the flashlight's where a view not the
-// eye's may show it, then the weapon lamps; and where the world's view stands in the level.
+// eye's may show it, then the weapon lamps; and where the world's view stands in the level. Each with the wet floor
+// below it (OwnLampWetFloor).
 static void GatherOwnLamps(FBackend& Backend, UViewport* V, INT EngineFrame)
 {
     APlayerPawn* const Viewer = V ? V->Actor : nullptr;
@@ -14686,6 +17678,8 @@ static void GatherOwnLamps(FBackend& Backend, UViewport* V, INT EngineFrame)
         }
         if (GRunWeaponLamps)
             GatherWeaponLamps(Level, Viewer, C.Origin, EngineFrame, Lamps, Count);
+        for (INT i = 0; i < Count; i++)
+            Lamps[i].WetFloor = OwnLampWetFloor(Level, Lamps[i].At);
     }
     Backend.SetOwnLamps(Lamps, Count);
 }
@@ -14987,6 +17981,24 @@ static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame)
     if (CasterCount > 1)
         appQsort(Nearest, CasterCount, sizeof(INT), CompareCasterDist);
     HoldShapeCache(CasterCount);
+    // The grown plants among them whose shapes will be laid anew this frame, laid ahead on the helpers' threads while
+    // this one goes through the casters before them (TakePlantJob).
+    OpenPlantJobs();
+    for (INT o = 0; o < CasterCount; o++)
+    {
+        const INT c = Nearest[o];
+        if (!Casters[c].A || GrownPlantOf(Casters[c].A) < 0)
+            continue;
+        UBOOL bNear = 0;
+        for (INT k = 0; k < PickCount && !bNear; k++)
+        {
+            const FLOAT Reach = Choices[Picked[k]].Radius + Casters[c].Radius;
+            bNear = (Casters[c].Centre - ChoiceLight[Picked[k]]->Location).SizeSquared() < Reach * Reach;
+        }
+        if (bNear || bEveryCaster)
+            AddPlantJob(Backend, Casters[c].A, Casters[c].Dist, EngineFrame);
+    }
+    StartPlantJobs();
     INT   AddedCount = 0, Tris = 0, Shapeless = 0, MoverCasters = 0;
     // The casters left without a shape, by reason (AddShadowMapCaster's Why), with their first classes for the log line.
     INT   ShapelessWhy[3]       = { 0, 0, 0 };
@@ -15003,9 +18015,15 @@ static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame)
         if (!bNear && !bEveryCaster)
             continue;
         INT T = 0, Why = 0;
+        // The own body with what a mirror image of it needs - its skins by face, its corners' normals, the light on it -
+        // where the panes show it without rays (FMirrorBody): for it alone, as the rays would have it for every caster.
+        const UBOOL bShapeRtWas = GShapeRtNow;
+        if (Casters[c].A == V->Actor && !V->Actor->bBehindView && Backend.IsProbeMirrorRunning())
+            GShapeRtNow = 1;
         Added[c] = Casters[c].A ? AddShadowMapCaster(Backend, Casters[c].A, Casters[c].Dist, EngineFrame, T, Why)
                                 : AddLevelPlantCaster(Backend, Level, Casters[c].Plant, Casters[c].Dist, EngineFrame,
                                                       T, Why);
+        GShapeRtNow = bShapeRtWas;
         // The player's own body, which first person does not draw: it casts, but the RT occlusion passes it
         // (FShadowMaps::SetCasterOwnBody).
         if (Added[c] >= 0 && Casters[c].A == V->Actor && !V->Actor->bBehindView)
@@ -15027,6 +18045,7 @@ static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame)
                                 Casters[c].A ? Casters[c].A->GetClass()->GetName() : TEXT("(the level's plant)"));
         }
     }
+    ClosePlantJobs();
     AddShadowPart(PartSum[3], TPart);
     GCasterViewport = nullptr;
     if (CasterDumpDue(0))
@@ -15337,13 +18356,17 @@ static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame)
         for (INT k = 0; k < PickCount; k++)
             AppendCount(Buf, 768, ChoiceLight[Picked[k]]->GetName(), (INT)Choices[Picked[k]].Distance);
         RDX_LOGF("shadows (frame %i): %i lights out of %i candidates%s, %i casters out of the %i nearby (%i triangles, %i with no shape), "
-                 "CPU %.2f ms; previous frame: %i level maps, %i actor draws; since the level loaded: %i level maps (%i "
+                 "CPU %.2f ms; previous frame: %i level maps, %i actor draws, %i actor faces kept as drawn (drawn "
+                 "again: %i for a caster that moves, %i for others than before); since the level loaded: %i level maps "
+                 "(%i "
                  "deferred, %i with a stale map, %.0f triangles), %i new lights in the selection; shadow blobs skipped: "
                  "complex %i, gouraud %i, tile %i; pairs skipped because the shadow is invisible: %i; casters left out for "
                  "lack of a slot: %i - lights (distance): %s",
                  EngineFrame, PickCount, Candidates, Overflow ? TEXT(" (the candidates did not fit)") : TEXT(""), AddedCount,
                  CasterCount, Tris, Shapeless, (appSeconds() - T0) * 1000.0, M.GetWorldRedraws(), M.GetActorDraws(),
-                 M.GetTotalWorldRedraws(), M.GetTotalDeferred(), M.GetTotalStaleUsed(), M.GetTotalWorldTriangles(),
+                 M.GetFacesKept(), M.GetFacesMoving(), M.GetFacesChanged(), M.GetTotalWorldRedraws(),
+                 M.GetTotalDeferred(), M.GetTotalStaleUsed(),
+                 M.GetTotalWorldTriangles(),
                  GPickChanges, GBlobSkipped[0], GBlobSkipped[1], GBlobSkipped[2], GShadowUnseenCulled,
                  GShadowCastersDropped, PickCount ? Buf : TEXT("-"));
         if (GShapeRtNow)
@@ -15596,11 +18619,674 @@ static RdxMath::FVec3 ReliefAlong(const RdxMath::FVec3& Axis, const RdxMath::FVe
     return A;
 }
 
+static UBOOL ZoneRains(ULevel* Level, INT Zone);
+static void  MakeWetCover(ULevel* Level);
+static void  GiveWetCover(FBackend& Backend);
+static void  CoverUnderCrowns(BYTE* Open, const FLOAT* Top, INT W, INT H, FLOAT X0, FLOAT Y0, FLOAT Cell);
+// How many times the level's plants were read (ReadLevelTrees): the rain's cover under their crowns is made again after.
+static INT   GTreesRead = 0;
+
+// The lamps' bodies' list (RdxMath::ParseLampSurfaces): SecondRevisionLampSurfaces.txt in SecondRevision\Assets
+// (AssetPath), read the first time it is asked for. Without the file no puddle gives back a lamp's streak.
+static RdxMath::FLampSurface GLampSurfaces[128];
+static INT                   GLampSurfaceCount = 0;
+static UBOOL                 GLampLoaded       = 0;
+static void LoadLampSurfaces()
+{
+    GLampLoaded = 1;
+    WCHAR Path[MAX_PATH + 64];
+    AssetPath(Path, MAX_PATH + 64, L"SecondRevisionLampSurfaces.txt");
+    if (!Path[0])
+        return;
+    HANDLE F = ::CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (F == INVALID_HANDLE_VALUE)
+    {
+        RDX_LOG("wet floors: there is no SecondRevisionLampSurfaces.txt in SecondRevision\\Assets - the puddles "
+                "give back no lamp's streak");
+        return;
+    }
+    static char Text[32768];
+    DWORD       Got   = 0;
+    const BOOL  bRead = ::ReadFile(F, Text, sizeof(Text), &Got, nullptr);
+    ::CloseHandle(F);
+    if (!bRead)
+        Got = 0;
+    INT Bad = 0;
+    GLampSurfaceCount =
+        RdxMath::ParseLampSurfaces(Text, (INT)Got, GLampSurfaces, (INT)ARRAY_COUNT(GLampSurfaces), Bad);
+    RDX_LOGF("wet floors: %i lamps' bodies read from SecondRevisionLampSurfaces.txt, %i lines not read%s",
+             GLampSurfaceCount, Bad, (Got == sizeof(Text)) ? TEXT(" - the file is longer than is read of it") : TEXT(""));
+}
+
+// A texture's package and own name, as the readout and the lists say it - the group in the middle is neither.
+static void PackageDotName(UTexture* T, TCHAR* Out, INT Max)
+{
+    const TCHAR* const Full = T->GetPathName();
+    INT Len = 0, First = -1, Last = -1;
+    for (; Full[Len]; Len++)
+        if (Full[Len] == TEXT('.'))
+        {
+            if (First < 0)
+                First = Len;
+            Last = Len;
+        }
+    INT w = 0;
+    for (INT c = 0; c < ((First >= 0) ? First : Len) && w < Max - 2; c++)
+        Out[w++] = Full[c];
+    if (First >= 0 && w < Max - 2)
+    {
+        Out[w++] = TEXT('.');
+        for (INT c = Last + 1; c < Len && w < Max - 1; c++)
+            Out[w++] = Full[c];
+    }
+    Out[Min(w, Max - 1)] = 0;
+}
+
+// How thick the rain falls on the floors around the camera this frame (RdxFloorRainThick), and the level's clock its
+// rings run by: noted once a frame with the puddles' lamps, read by the late pass and the rays' layer alike.
+static FLOAT GWetRainThick = 0.0f;
+static FLOAT GWetRainClock = 0.0f;
+
+// The puddles' lamps (docs/terv-nedves-feluletek.md 8.7), found once a level where it rains in it: the list's lamps'
+// bodies - a surface of a listed texture (the box about its polygons' points), an actor of a listed class (its place) -,
+// the ones standing within LampBodyGap of each other one lamp. A lamp's streak is the lamp's own, not that of a light
+// the level put near it.
+static const FLOAT LampBodyGap     = 8.0f;
+// A lamp's glass shines as bright as its own colour is, white at this brightness, the picture's white being 1 - a
+// lamp's streak is as strong as its glass is bright and large (WetReflect.hlsl's WetStreak); a white lamp of the middle
+// size as strong as the level's lights near the lamps made their streaks before. No glass smaller than LampLeastRadius; a body larger
+// than LampMostRadius is no lamp but a wall of a listed texture, and gives no streak - the water mirrors it as it is.
+static const FLOAT LampGlassBright = 6.0f;
+static const FLOAT LampLeastRadius = 4.0f;
+static const FLOAT LampMostRadius  = 48.0f;
+// A fire's glow as a ball of this radius about its light.
+static const FLOAT FireRadius      = 16.0f;
+// LAMP_BODIES: the room for a level's lamp bodies, as many as a frame's streaks can take (RdxMath::WetLampMax), several
+// times the most any level has. LAMP_SIGHTS: the line checks NoteWetLamps makes a frame - each is the game's own
+// thread's time; every lamp before the eye is still asked, only spread over a few frames.
+enum { LAMP_BODIES = 2047, LAMP_ACTOR_ROOM = 256, LAMP_SIGHTS = 48 };
+static RdxMath::FLampBody GLampBodies[LAMP_BODIES];
+// Whether a lamp body's glass is lit by the level's light map rather than its own light (no PF_Unlit): it then shines
+// only by a light of its own - one the lamp holds, within twice its glass's radius of its middle: the glass and the
+// head round it -, as bright as that light (LightAtLamp). The level's other lights play no part: a lamp whose own
+// light is gone is burnt out, however many lamps burn near it.
+static BYTE               GLampBodyLit[LAMP_BODIES];
+static FLOAT LightAtLamp(ULevel* Level, const FVector& At, FLOAT Radius)
+{
+    FLOAT Sum = 0.0f;
+    for (INT i = 0; i < Level->Actors.Num() && Sum < 1.0f; i++)
+    {
+        const AActor* const A = Level->Actors(i);
+        if (!A || A->bDeleteMe || A->LightType == LT_None || A->LightBrightness == 0)
+            continue;
+        if ((A->Location - At).Size() <= 2.0f * Radius)
+            Sum += (FLOAT)A->LightBrightness / 255.0f;
+    }
+    return Min(Sum, 1.0f);
+}
+// Each body's streak's weight now (NoteWetLamps), and how long it takes to come or to go.
+static FLOAT              GLampWeight[LAMP_BODIES];
+static const FLOAT        LampFadeSeconds = 0.3f;
+static INT                GLampBodyCount = 0;
+// A glass lit by the light map shines as bright as the game draws it: each such listed surface's lamp (GLampSurfOf, by
+// the surface's number, -1 none), and for each lamp its glass's own colour and the light its light map gave it when
+// drawn (NoteLampMapLight; -1 not yet drawn - until then it shines by its own light alone, LightAtLamp).
+static INT*   GLampSurfOf    = nullptr;
+static QWORD* GLampSurfCache = nullptr;
+static INT    GLampSurfCount = 0;
+static FLOAT  GLampMapLight[LAMP_BODIES];
+static FLOAT  GLampMapTex[LAMP_BODIES][3];
+static void ForgetLampSurfaces()
+{
+    if (GLampSurfOf)
+        appFree(GLampSurfOf);
+    if (GLampSurfCache)
+        appFree(GLampSurfCache);
+    GLampSurfOf    = nullptr;
+    GLampSurfCache = nullptr;
+    GLampSurfCount = 0;
+}
+// A drawn surface's light map: where the surface is a lamp's glass lit by the light map, the lamp's light is the map's
+// average (RdxMath::RtLightAverage, by the gain the surface is drawn with), its brightest colour - the brightest of its
+// glass's surfaces. Each map once.
+static void NoteLampMapLight(INT Surf, const FTextureInfo& Map, FLOAT Gain)
+{
+    if (!GLampSurfOf || Surf < 0 || Surf >= GLampSurfCount || GLampSurfOf[Surf] < 0 ||
+        GLampSurfCache[Surf] == Map.CacheID || Map.Format != TEXF_RGBA7 || Map.NumMips < 1 || !Map.Mips[0] ||
+        !Map.Mips[0]->DataPtr)
+        return;
+    GLampSurfCache[Surf]   = Map.CacheID;
+    const unsigned int Lit = RdxMath::RtLightAverage(Map.Mips[0]->DataPtr, Map.Mips[0]->USize * Map.Mips[0]->VSize, Gain);
+    if (Lit == RdxMath::RtLightUnknown)
+        return;
+    const FLOAT Most = Max(RdxMath::UnpackRtLight(Lit, 0), Max(RdxMath::UnpackRtLight(Lit, 1), RdxMath::UnpackRtLight(Lit, 2)));
+    FLOAT&      Was  = GLampMapLight[GLampSurfOf[Surf]];
+    Was              = Max(Was, Most);
+}
+
+static void FindLampBodies(ULevel* Level)
+{
+    GLampBodyCount = 0;
+    ForgetLampSurfaces();
+    for (INT b = 0; b < LAMP_BODIES; b++)
+    {
+        GLampWeight[b]    = 0.0f;
+        GLampMapLight[b]  = -1.0f;
+        GLampMapTex[b][0] = GLampMapTex[b][1] = GLampMapTex[b][2] = 0.0f;
+    }
+    static INT   MadeLit[LAMP_BODIES];
+    static FLOAT MadeMid[LAMP_BODIES][3], MadeTex[LAMP_BODIES][3];
+    if (!GLampLoaded)
+        LoadLampSurfaces();
+    if (!Level || GLampSurfaceCount == 0)
+        return;
+    UBOOL bRains = 0;
+    for (INT z = 0; z < FBspNode::MAX_ZONES && !bRains; z++)
+        bRains = ZoneRains(Level, z);
+    if (!bRains)
+        return;
+    UModel* const M        = Level->Model;
+    INT           Surfaces = 0, Brushes = 0, Actors = 0, Walls = 0;
+    INT           UnlitOf[ARRAY_COUNT(GLampSurfaces)], AllOf[ARRAY_COUNT(GLampSurfaces)];
+    for (INT t = 0; t < (INT)ARRAY_COUNT(GLampSurfaces); t++)
+        UnlitOf[t] = AllOf[t] = 0;
+    if (M && M->Surfs.Num() > 0)
+    {
+        // Each listed surface's body, by its number - one body for the listed surfaces of one brush, a lamp's glass
+        // being its brush's faces -; then the box over the points of every node that draws them.
+        INT* const BodyOf = (INT*)appMalloc(sizeof(INT) * M->Surfs.Num(), TEXT("RdxLampBodyOf"));
+        if (BodyOf)
+        {
+            static const ABrush* BrushOf[LAMP_BODIES];   // compared only
+            for (INT s = 0; s < M->Surfs.Num(); s++)
+            {
+                BodyOf[s]         = -1;
+                UTexture* const T = M->Surfs(s).Texture;
+                if (!T)
+                    continue;
+                TCHAR Name[RdxMath::WetNameChars + 1];
+                PackageDotName(T, Name, RdxMath::WetNameChars + 1);
+                if (!RdxMath::LampListed(GLampSurfaces, GLampSurfaceCount, Name, RdxMath::Lamp_Texture))
+                    continue;
+                Surfaces++;
+                // Each listed texture's surfaces, and how many of them carry their own light (PF_Unlit) - a lamp's
+                // glass lit by the level's light map instead is as bright as the lights near it make it.
+                for (INT t = 0; t < GLampSurfaceCount; t++)
+                    if (RdxMath::LampListed(&GLampSurfaces[t], 1, Name, RdxMath::Lamp_Texture))
+                    {
+                        UnlitOf[t] += (M->Surfs(s).PolyFlags & PF_Unlit) ? 1 : 0;
+                        AllOf[t]++;
+                    }
+                const ABrush* const Brush = M->Surfs(s).Actor;
+                INT                 B     = -1;
+                for (INT b = 0; b < GLampBodyCount && Brush && B < 0; b++)
+                    if (BrushOf[b] == Brush)
+                        B = b;
+                if (B < 0)
+                {
+                    // The surfaces' bodies leave room for the listed actors' after them.
+                    if (GLampBodyCount >= LAMP_BODIES - LAMP_ACTOR_ROOM)
+                        continue;
+                    B               = GLampBodyCount++;
+                    BrushOf[B]      = Brush;
+                    GLampBodyLit[B] = (M->Surfs(s).PolyFlags & PF_Unlit) ? 0 : 1;
+                    RdxMath::FLampBody& L = GLampBodies[B];
+                    L.X = L.Y = L.Z = 0.0f;
+                    L.Extent = -1.0f;     // no point yet
+                    // Its glass's own colour, the texture's average (the engine's MipZero), its strongest 1. How
+                    // bright it shines is its own light's: a glass with its own light (PF_Unlit) whole, one lit by
+                    // the light map by that map or the light it holds (LightAtLamp, NoteLampMapLight).
+                    const FLOAT Most = (FLOAT)Max((INT)T->MipZero.R, Max((INT)T->MipZero.G, (INT)T->MipZero.B));
+                    L.TR = (Most > 0.0f) ? T->MipZero.R / Most : 0.0f;
+                    L.TG = (Most > 0.0f) ? T->MipZero.G / Most : 0.0f;
+                    L.TB = (Most > 0.0f) ? T->MipZero.B / Most : 0.0f;
+                }
+                BodyOf[s] = B;
+            }
+            // The boxes: the low corner in X, Y, Z and the high one in R, G, B until the body is made of them.
+            for (INT n = 0; n < M->Nodes.Num(); n++)
+            {
+                const FBspNode& Node = M->Nodes(n);
+                const INT       B    = (Node.iSurf >= 0 && Node.iSurf < M->Surfs.Num()) ? BodyOf[Node.iSurf] : -1;
+                if (B < 0)
+                    continue;
+                RdxMath::FLampBody& L = GLampBodies[B];
+                for (INT k = 0; k < Node.NumVertices; k++)
+                {
+                    const INT P = M->Verts(Node.iVertPool + k).pVertex;
+                    if (P < 0 || P >= M->Points.Num())
+                        continue;
+                    const FVector& Q = M->Points(P);
+                    if (L.Extent < 0.0f)
+                    {
+                        L.X = L.R = Q.X;
+                        L.Y = L.G = Q.Y;
+                        L.Z = L.B = Q.Z;
+                        L.Extent  = 0.0f;
+                        continue;
+                    }
+                    L.X = Min(L.X, Q.X);
+                    L.Y = Min(L.Y, Q.Y);
+                    L.Z = Min(L.Z, Q.Z);
+                    L.R = Max(L.R, Q.X);
+                    L.G = Max(L.G, Q.Y);
+                    L.B = Max(L.B, Q.Z);
+                }
+            }
+            // The light-mapped glass's surfaces, by their body here - made the final lamp's below.
+            GLampSurfCount = M->Surfs.Num();
+            GLampSurfOf    = (INT*)appMalloc(sizeof(INT) * GLampSurfCount, TEXT("RdxLampSurfOf"));
+            GLampSurfCache = (QWORD*)appMalloc(sizeof(QWORD) * GLampSurfCount, TEXT("RdxLampSurfCache"));
+            if (!GLampSurfOf || !GLampSurfCache)
+                ForgetLampSurfaces();
+            for (INT s = 0; s < GLampSurfCount && GLampSurfOf; s++)
+            {
+                GLampSurfOf[s]    = (BodyOf[s] >= 0 && GLampBodyLit[BodyOf[s]]) ? BodyOf[s] : -1;
+                GLampSurfCache[s] = 0;
+            }
+            appFree(BodyOf);
+            static INT CompactOf[LAMP_BODIES];
+            INT        Made = 0;
+            for (INT b = 0; b < GLampBodyCount; b++)
+            {
+                CompactOf[b]         = -1;
+                RdxMath::FLampBody L = GLampBodies[b];
+                if (L.Extent < 0.0f)
+                    continue;
+                const FVector Lo(L.X, L.Y, L.Z), Hi(L.R, L.G, L.B);
+                const FVector Mid = (Lo + Hi) * 0.5f;
+                L.X      = Mid.X;
+                L.Y      = Mid.Y;
+                L.Z      = Mid.Z;
+                L.Extent = (Hi - Lo).Size() * 0.5f;
+                L.R = L.G = L.B = 0.0f;
+                const FLOAT Tex[3] = { L.TR, L.TG, L.TB };
+                if (GLampBodyLit[b])
+                {
+                    const FLOAT Lit = LightAtLamp(Level, Mid, L.Extent);
+                    L.TR *= Lit;
+                    L.TG *= Lit;
+                    L.TB *= Lit;
+                }
+                if (L.Extent > LampMostRadius)
+                {
+                    Walls++;
+                    continue;
+                }
+                CompactOf[b]  = Made;
+                MadeLit[Made] = GLampBodyLit[b];
+                MadeMid[Made][0] = Mid.X;
+                MadeMid[Made][1] = Mid.Y;
+                MadeMid[Made][2] = Mid.Z;
+                for (INT c = 0; c < 3; c++)
+                    MadeTex[Made][c] = Tex[c];
+                GLampBodies[Made++] = L;
+            }
+            for (INT s = 0; s < GLampSurfCount && GLampSurfOf; s++)
+                if (GLampSurfOf[s] >= 0)
+                    GLampSurfOf[s] = CompactOf[GLampSurfOf[s]];
+            GLampBodyCount = Made;
+            Brushes        = Made;
+        }
+    }
+    for (INT i = 0; i < Level->Actors.Num() && GLampBodyCount < LAMP_BODIES; i++)
+    {
+        AActor* const A = Level->Actors(i);
+        if (!A || A->bDeleteMe ||
+            !RdxMath::LampListed(GLampSurfaces, GLampSurfaceCount, A->GetClass()->GetName(), RdxMath::Lamp_Class))
+            continue;
+        RdxMath::FLampBody& L = GLampBodies[GLampBodyCount++];
+        L.X      = A->Location.X;
+        L.Y      = A->Location.Y;
+        L.Z      = A->Location.Z;
+        L.Extent = Max(8.0f, Max(A->CollisionRadius, A->CollisionHeight));
+        L.R = L.G = L.B = 0.0f;
+        // A model's lamp: its own light's colour where it is a light, as bright as that light is (LightBrightness, 255
+        // the full); with no light of its own, white where the game draws it as giving its own light (bUnlit) - and
+        // dark otherwise: a lamp switched off or knocked over is lit by the level like any other thing, and is no lamp.
+        L.TR = L.TG = L.TB = A->bUnlit ? 1.0f : 0.0f;
+        if (A->LightType != LT_None && A->LightBrightness > 0)
+        {
+            const FPlane C    = FGetHSV(A->LightHue, A->LightSaturation, 255);
+            const FLOAT  Most = Max(C.X, Max(C.Y, C.Z));
+            if (Most > 0.0f)
+            {
+                const FLOAT Bright = (FLOAT)A->LightBrightness / 255.0f;
+                L.TR = C.X / Most * Bright;
+                L.TG = C.Y / Most * Bright;
+                L.TB = C.Z / Most * Bright;
+            }
+        }
+        Actors++;
+    }
+    const INT Merged = RdxMath::MergeLampBodies(GLampBodies, GLampBodyCount, LampBodyGap, LampMostRadius);
+    // Each light-mapped glass's final lamp - the merged one whose ball holds its middle - and that lamp's glass colour.
+    if (GLampSurfOf)
+    {
+        static INT FinalOf[LAMP_BODIES];
+        for (INT m = 0; m < Brushes; m++)
+        {
+            FinalOf[m] = -1;
+            for (INT f = 0; f < Merged && FinalOf[m] < 0; f++)
+            {
+                const RdxMath::FLampBody& F = GLampBodies[f];
+                const FVector             D(MadeMid[m][0] - F.X, MadeMid[m][1] - F.Y, MadeMid[m][2] - F.Z);
+                if (D.Size() <= F.Extent + 1.0f)
+                    FinalOf[m] = f;
+            }
+            if (MadeLit[m] && FinalOf[m] >= 0)
+                for (INT c = 0; c < 3; c++)
+                    GLampMapTex[FinalOf[m]][c] = Max(GLampMapTex[FinalOf[m]][c], MadeTex[m][c]);
+        }
+        for (INT s = 0; s < GLampSurfCount; s++)
+            if (GLampSurfOf[s] >= 0)
+                GLampSurfOf[s] = FinalOf[GLampSurfOf[s]];
+    }
+    // Each lamp's streak its own: its glass's colour and brightness (a model's, its own light's where it is one, else
+    // white) - a lamp like another gives the streak the other does, whatever light the level put near it, a darker one a
+    // dimmer one, and a larger lamp a stronger one.
+    for (INT b = 0; b < Merged; b++)
+    {
+        RdxMath::FLampBody& L = GLampBodies[b];
+        L.Extent  = Max(L.Extent, LampLeastRadius);
+        L.R       = L.TR * LampGlassBright;
+        L.G       = L.TG * LampGlassBright;
+        L.B       = L.TB * LampGlassBright;
+        L.Flicker = 0.0f;
+    }
+    GLampBodyCount = Merged;
+    // The fires: a fire's own light (FireWaver) is its body - the puddle under a burning barrel gives its flame's glow
+    // back, wavering (RdxMath::LampFlicker); the flame itself, drawn as a volume, is no mirror image's to give.
+    INT Fires = 0;
+    for (INT i = 0; i < Level->Actors.Num() && GLampBodyCount < LAMP_BODIES; i++)
+    {
+        const AActor* const A = Level->Actors(i);
+        if (!A || A->bDeleteMe || A->LightType == LT_None || A->LightBrightness == 0 || A->LightEffect != LE_FireWaver ||
+            (A->Owner && A->Owner->IsA(APlayerPawn::StaticClass())))
+            continue;
+        const FPlane        C = FGetHSV(A->LightHue, A->LightSaturation, 255);
+        const FLOAT         B = A->LightBrightness / 255.0f;
+        RdxMath::FLampBody& L = GLampBodies[GLampBodyCount++];
+        // The glow stands where the flame does: a burning barrel is its own light, and its place is the barrel's middle -
+        // the flame rises from the top of what burns (its collision's top), the ball of glow resting on it.
+        L.X       = A->Location.X;
+        L.Y       = A->Location.Y;
+        L.Z       = A->Location.Z + A->CollisionHeight + FireRadius;
+        // As strong as its own light: its colour by its brightness at half its light's reach, from a ball of FireRadius.
+        const FLOAT Half  = 0.5f * A->WorldLightRadius();
+        const FLOAT Glow  = B * Half * Half / (PI * FireRadius * FireRadius);
+        L.Extent  = FireRadius;
+        L.R       = C.X * Glow;
+        L.G       = C.Y * Glow;
+        L.B       = C.Z * Glow;
+        L.Flicker = 1.0f;
+        L.TR = L.TG = L.TB = 0.0f;
+        Fires++;
+    }
+    RDX_LOGF("wet floors: %i lamps for the puddles' streaks in %s - of %i listed surfaces in %i brushes (and %i walls "
+             "larger than a lamp, left out) and %i actors, the near ones made one; and %i fires", Merged,
+             Level->GetOuter()->GetName(), Surfaces, Brushes, Walls, Actors, Fires);
+    if (Merged > 0)
+    {
+        static FLOAT Sizes[LAMP_BODIES];
+        static INT   BySize[LAMP_BODIES];
+        for (INT b = 0; b < Merged; b++)
+            Sizes[b] = GLampBodies[b].Extent;
+        RdxMath::LampsByDistance(Sizes, Merged, BySize);
+        RDX_LOGF("wet floors:   the lamps' radii - the least %.1f, the middle one %.1f, the largest %.1f", Sizes[BySize[0]],
+                 Sizes[BySize[Merged / 2]], Sizes[BySize[Merged - 1]]);
+    }
+    for (INT t = 0; t < GLampSurfaceCount; t++)
+        if (AllOf[t] > 0)
+            RDX_LOGF("wet floors:   %s - %i surfaces, %i of them unlit", appFromAnsi(GLampSurfaces[t].Name), AllOf[t],
+                     UnlitOf[t]);
+}
+
+// The frame's lamps for the puddles' streaks (FBackend::SetWetLamps): every body of the level before the eye whose light
+// reaches the floor its streak would lie on - none left out by a count. That floor: the lamp's mirror image's point on
+// the floor under the eye, where the puddles the eye sees a lamp in lie; the level's own line check from the body's near
+// side to that point, the body's own glass no hindrance. Whether the eye itself sees the lamp plays no part: a lamp
+// behind a post still shines in the puddle before the post. A lamp no higher than the eye's floor - a lower terrace's -
+// is asked from the eye, as no floor of its own is known. The checks are spread over the frames, LAMP_SIGHTS a frame
+// round the lamps in turn, each one's last answer kept (GLampLit) - and all of them at once after a load or a jump of
+// the eye, so that a view's streaks are right from its first frame.
+static BYTE GLampLit[LAMP_BODIES];
+static INT  GLampNextSight = 0;
+static void NoteWetLamps(FBackend& Backend, const FSceneNode* Frame)
+{
+    // A measurement (the marker SecondRevision-wet-lamps-off.txt): no lamp's streak for this start - the pictures with
+    // and without them, the same views, their difference the streaks.
+    static const UBOOL bOff = FreshMarker(L"SecondRevision-wet-lamps-off.txt");
+    if (bOff || !Frame || !Frame->Level || !GRunPuddles)
+        return;
+    static ULevel* Seen        = nullptr;     // compared only, never followed
+    static INT     SeenFlushes = -1;
+    static INT     CoverTrees  = -1;          // the plants' reading the cover was made with
+    UBOOL          bAllSights  = 0;
+    if (Frame->Level != Seen || SeenFlushes != GLevelFlushes)
+    {
+        Seen        = Frame->Level;
+        SeenFlushes = GLevelFlushes;
+        FindLampBodies(Frame->Level);
+        MakeWetCover(Frame->Level);
+        GiveWetCover(Backend);
+        CoverTrees = GTreesRead;
+        for (INT b = 0; b < LAMP_BODIES; b++)
+            GLampLit[b] = 0;
+        GLampNextSight = 0;
+        bAllSights     = 1;
+    }
+    else if (CoverTrees != GTreesRead)
+    {
+        // The level's plants read since: the cover again, with their crowns.
+        CoverTrees = GTreesRead;
+        MakeWetCover(Frame->Level);
+        GiveWetCover(Backend);
+    }
+    UModel* const M = Frame->Level->Model;
+    // The lamps' streaks are a reflection: none at the Default reflections, the puddles' cover all the same.
+    if (GRunReflections == RdxMath::Reflections_Default)
+    {
+        static const FLOAT NoLamps[8] = {};
+        Backend.SetWetLamps(NoLamps, 0);
+        return;
+    }
+    if (GLampBodyCount == 0 || !M)
+        return;
+    const FVector Cam = Frame->Coords.Origin;
+    // A jump of the eye - a load, a teleport - asks every lamp again at once.
+    static FVector LastCam(0.0f, 0.0f, 0.0f);
+    if ((Cam - LastCam).SizeSquared() > 256.0f * 256.0f)
+        bAllSights = 1;
+    LastCam = Cam;
+    static FLOAT  Dist[LAMP_BODIES];
+    static INT    Order[LAMP_BODIES];
+    for (INT b = 0; b < GLampBodyCount; b++)
+        Dist[b] = (FVector(GLampBodies[b].X, GLampBodies[b].Y, GLampBodies[b].Z) - Cam).Size();
+    RdxMath::LampsByDistance(Dist, GLampBodyCount, Order);
+    const FVector None(0.0f, 0.0f, 0.0f);
+    const FLOAT   Now = Frame->Level->GetLevelInfo() ? Frame->Level->GetLevelInfo()->TimeSeconds : 0.0f;
+    // Before the eye: a lamp behind it gives its mirror image away from it, no streak it could see.
+    auto Before = [&](const RdxMath::FLampBody& L) -> UBOOL {
+        return FVector(L.X, L.Y, L.Z).TransformPointBy(Frame->Coords).Z >= -L.Extent;
+    };
+    // The floor under the eye, where the streaks it sees lie.
+    FLOAT Floor  = 0.0f;
+    UBOOL bFloor = 0;
+    {
+        FCheckResult Down(1.0f);
+        if (!M->LineCheck(Down, nullptr, Cam - FVector(0.0f, 0.0f, 1024.0f), Cam, None, 0))
+        {
+            Floor  = Down.Location.Z;
+            bFloor = Cam.Z > Floor + 1.0f;
+        }
+    }
+    // A lamp's streak's floor point: where the eye's line to the lamp's mirror image meets the floor - taken on the floor
+    // under the eye first, then on the floor actually there, until the two agree (three times at most), and in the end
+    // always on the floor found there, never under it. The puddles can lie higher or lower than where the eye stands - a
+    // kerb, steps down -, a point under the floor there is hidden from every lamp, and over steps the passes need not
+    // agree. Looked for from the eye's height down, so a roof over the eye is no floor. The eye itself where no floor was
+    // found under it.
+    auto FloorPointOf = [&](const FVector& At) -> FVector {
+        FVector To = Cam;
+        FLOAT   F  = Floor;
+        for (INT Pass = 0; bFloor && Pass < 3 && At.Z > F + 1.0f; Pass++)
+        {
+            const FVector Image(At.X, At.Y, 2.0f * F - At.Z);
+            To   = Cam + (Image - Cam) * ((Cam.Z - F) / (Cam.Z - Image.Z));
+            To.Z = F + 2.0f;
+            FCheckResult There(1.0f);
+            if (M->LineCheck(There, nullptr, FVector(To.X, To.Y, F - 1024.0f), FVector(To.X, To.Y, Cam.Z), None, 0) ||
+                There.Location.Z >= Cam.Z - 1.0f)
+                break;
+            To.Z = There.Location.Z + 2.0f;
+            if (Abs(There.Location.Z - F) <= 1.0f)
+                break;
+            F = There.Location.Z;
+        }
+        return To;
+    };
+    // This frame's checks, round the lamps before the eye from where the last frame's stopped.
+    INT Asked = 0, Went = 0;
+    for (; Went < GLampBodyCount && (bAllSights || Asked < LAMP_SIGHTS); Went++)
+    {
+        const INT                 b = (GLampNextSight + Went) % GLampBodyCount;
+        const RdxMath::FLampBody& L = GLampBodies[b];
+        if (!Before(L))
+            continue;
+        Asked++;
+        const FVector At(L.X, L.Y, L.Z);
+        const FVector To = FloorPointOf(At);
+        // From the floor towards the lamp: what is met first from the floor's side. The lamp's own fitting - the frame
+        // round its glass, the top of its post - lies within about its size again of its glass, and hides nothing.
+        auto Reaches = [&](const FVector& Floor) -> UBOOL {
+            const FVector Way  = Floor - At;
+            const FLOAT   Long = Way.Size();
+            if (Long <= L.Extent + 4.0f)
+                return 1;
+            FCheckResult Hit(1.0f);
+            if (M->LineCheck(Hit, nullptr, At + Way * ((L.Extent + 4.0f) / Long), Floor, None, 0))
+                return 1;
+            return (Hit.Location - At).SizeSquared() <= Square(2.0f * L.Extent + 16.0f);
+        };
+        // The mirror image's floor point may lie in the shade of a curb or a planter's lip the lamp stands behind while
+        // the floor nearer the eye, along which its streak runs, is lit: the lamp is lit where it reaches that point,
+        // or the floor a quarter or a half of the way from it to the eye's foot.
+        UBOOL bLit = Reaches(To);
+        for (INT k = 1; k <= 2 && !bLit; k++)
+            bLit = Reaches(To + (FVector(Cam.X, Cam.Y, To.Z) - To) * (0.25f * (FLOAT)k));
+        GLampLit[b] = bLit ? 1 : 0;
+    }
+    GLampNextSight = (GLampNextSight + Went) % GLampBodyCount;
+    // A measurement (the marker SecondRevision-wet-lamps-log.txt): every 30th frame the floor under the eye and, for the
+    // nearest lamps before it, where their streak's floor point was taken and what the line from the lamp met.
+    static const UBOOL bLampLog = FreshMarker(L"SecondRevision-wet-lamps-log.txt");
+    static INT         LampLogTick = 0;
+    if (bLampLog && ++LampLogTick % 30 == 0)
+    {
+        RDX_LOGF("wet lamps (marker): the eye at %.0f %.0f %.0f, the floor under it %s %.1f; %i bodies", Cam.X, Cam.Y,
+                 Cam.Z, bFloor ? TEXT("at") : TEXT("not found, would be"), Floor, GLampBodyCount);
+        INT Told = 0;
+        for (INT k = 0; k < GLampBodyCount && Told < 6; k++)
+        {
+            const RdxMath::FLampBody& L = GLampBodies[Order[k]];
+            if (!Before(L))
+                continue;
+            Told++;
+            const FVector At(L.X, L.Y, L.Z);
+            const FVector To = FloorPointOf(At);
+            FCheckResult  Under(1.0f);
+            const UBOOL  bUnder = !M->LineCheck(Under, nullptr, FVector(To.X, To.Y, To.Z - 1024.0f),
+                                                FVector(To.X, To.Y, Cam.Z), None, 0);
+            const FVector Way  = To - At;
+            const FLOAT   Long = Way.Size();
+            FCheckResult  Hit(1.0f);
+            const UBOOL   bHit = Long > L.Extent + 4.0f &&
+                               !M->LineCheck(Hit, nullptr, At + Way * ((L.Extent + 4.0f) / Long), To, None, 0);
+            RDX_LOGF("wet lamps (marker):   lamp %i at %.0f %.0f %.0f, %.0f away, glass %.0f across, colour %.2f %.2f "
+                     "%.2f; its floor point %.0f %.0f %.0f (the floor there from the eye's height down: %s %.1f); lit "
+                     "%i%s", Order[k], At.X, At.Y, At.Z,
+                     Dist[Order[k]], 2.0f * L.Extent, L.R, L.G, L.B, To.X, To.Y, To.Z, bUnder ? TEXT("at") : TEXT("none,"),
+                     bUnder ? Under.Location.Z : 0.0f, GLampLit[Order[k]],
+                     *(bHit ? FString::Printf(TEXT(", the line met something at %.0f %.0f %.0f, %.0f from the lamp"),
+                                              Hit.Location.X, Hit.Location.Y, Hit.Location.Z,
+                                              (Hit.Location - At).Size())
+                            : FString(TEXT(""))));
+        }
+    }
+    // Which lamps a streak is due to this frame: those before the eye whose light reaches their streak's floor.
+    static BYTE Due[LAMP_BODIES];
+    INT         DueCount = 0;
+    for (INT b = 0; b < GLampBodyCount; b++)
+    {
+        Due[b] = (GLampLit[b] && Before(GLampBodies[b])) ? 1 : 0;
+        DueCount += Due[b];
+    }
+    // Each lamp's streak comes and goes over LampFadeSeconds, never at once - the eye moving, a lamp passing the edge
+    // of the chosen or of sight, would make it blink. The level's time; a jump in it (a load) is a step of none.
+    static FLOAT LastNow = 0.0f;
+    const FLOAT  Step    = Clamp(Now - LastNow, 0.0f, 0.1f) / LampFadeSeconds;
+    LastNow              = Now;
+    for (INT b = 0; b < GLampBodyCount; b++)
+        GLampWeight[b] = Clamp(GLampWeight[b] + (Due[b] ? Step : -Step), 0.0f, 1.0f);
+    // The streaks: every lamp whose weight is not yet none, the nearest first - the ones coming and going among them.
+    // The constant buffer's room holds a level's every body (LAMP_BODIES).
+    static_assert(LAMP_BODIES <= RdxMath::WetLampMax, "every lamp body fits the frame's streaks");
+    static FLOAT Lamps[8 * RdxMath::WetLampMax];
+    INT          N = 0;
+    for (INT k = 0; k < GLampBodyCount && N < RdxMath::WetLampMax; k++)
+    {
+        const INT                 i = Order[k];
+        const RdxMath::FLampBody& L = GLampBodies[i];
+        if (GLampWeight[i] <= 0.0f)
+            continue;
+        const FVector V    = FVector(L.X, L.Y, L.Z).TransformPointBy(Frame->Coords);
+        const FLOAT   Glow = GLampWeight[i] * ((L.Flicker > 0.0f) ? RdxMath::LampFlicker(Now, (FLOAT)i) : 1.0f);
+        FLOAT* const  Out  = Lamps + N * 8;
+        Out[0] = V.X;
+        Out[1] = V.Y;
+        Out[2] = V.Z;
+        Out[3] = L.Extent;
+        // A glass lit by the light map, once drawn: its own colour by the light the game drew it with.
+        const UBOOL bDrawn = GLampMapLight[i] >= 0.0f;
+        const FLOAT Map    = bDrawn ? GLampMapLight[i] * LampGlassBright : 0.0f;
+        Out[4] = (bDrawn ? GLampMapTex[i][0] * Map : L.R) * Glow;
+        Out[5] = (bDrawn ? GLampMapTex[i][1] * Map : L.G) * Glow;
+        Out[6] = (bDrawn ? GLampMapTex[i][2] * Map : L.B) * Glow;
+        Out[7] = (L.Flicker > 0.0f) ? 1.0f : 0.0f;    // a fire: its glow is its flame's (WetReflect.hlsl's PSWetFlames)
+        N++;
+    }
+    Backend.SetWetLamps(Lamps, N);
+    // Said once a level: the first frame's lamps, the nearest few with where they stand on the screen.
+    static ULevel* Said        = nullptr;     // compared only, never followed
+    static INT     SaidFlushes = -1;
+    if (Said != Frame->Level || SaidFlushes != GLevelFlushes)
+    {
+        Said        = Frame->Level;
+        SaidFlushes = GLevelFlushes;
+        RDX_LOGF("wet floors: the first frame's lamps for the puddles - %i of the level's %i due a streak, %i asked "
+                 "whether their light reaches their streak's floor point (the floor under the eye %s), %i coming in",
+                 DueCount, GLampBodyCount, Asked, bFloor ? TEXT("found") : TEXT("none found: asked from the eye"), N);
+        for (INT k = 0; k < Min(N, 4); k++)
+        {
+            const FLOAT* const L = Lamps + k * 8;
+            const FLOAT        Z = Max(L[2], 1.0f);
+            RDX_LOGF("wet floors:   %.0f away, on the screen at %.0f, %.0f, radius %.0f, colour %.2f %.2f %.2f",
+                     appSqrt(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]), Frame->FX15 + L[0] * Frame->Proj.Z / Z,
+                     Frame->FY15 + L[1] * Frame->Proj.Z / Z, L[3], L[4], L[5], L[6]);
+        }
+    }
+}
+
+
 void URevisionRenderDevice::SetSceneNode(FSceneNode* Frame)
 {
     SplashCanvas(URenderDevice::Viewport);
     NoteTreeWorldNode(Backend, Frame, FrameCounter);
+    // The spherifier's pieces the world view drew last, made ahead in its view now (StartPieceJobs).
+    StartPieceJobs(Frame, FrameCounter);
     FDrawTimer Timer(3);
+    RoundRelease(Backend);
     FlushMeshFog(Backend);       // drawn in the node it was gathered in
     NoteNode(Frame);
     NoteLights(Frame, FrameCounter);
@@ -15655,6 +19341,21 @@ void URevisionRenderDevice::SetSceneNode(FSceneNode* Frame)
                          "reach, the nearest %i taken - %s; %i corners of the liquids' borders", FrameCounter,
                          CamWet - 1, RdxWaterBoxesNear(), N, Said, Corners);
             }
+        }
+    }
+    // The puddles' lamps (NoteWetLamps), the world's view's, once a frame.
+    if (Frame && !Frame->Parent && IsWorldView(Frame, FrameCounter))
+    {
+        static INT WetLampFrame = -1;
+        if (WetLampFrame != FrameCounter)
+        {
+            WetLampFrame = FrameCounter;
+            NoteWetLamps(Backend, Frame);
+            // And the rain on the floors, for the puddles' rings.
+            const ALevelInfo* const Info = Frame->Level ? Frame->Level->GetLevelInfo() : nullptr;
+            GWetRainThick = RdxFloorRainThick(Frame->Level, Frame->Coords.Origin);
+            GWetRainClock = Info ? (FLOAT)appFmod(Info->TimeSeconds, 4096.0f) : 0.0f;
+            Backend.SetWetRain(GWetRainThick, GWetRainClock);
         }
     }
     // Once a frame, with the water on: the lamps over the water - the glints on it with the reflections on, the light
@@ -15839,6 +19540,7 @@ void URevisionRenderDevice::EndFlash()
 {
     FDrawTimer Timer(3);
     SplashCanvas(URenderDevice::Viewport);
+    RoundRelease(Backend);
     FlushMeshFog(Backend);
     // The engine's cue to tint the frame with its FlashScale and FlashFog:
     // dst * (2 * Scale) + Fog - the engine's usual doubling, where 0.5 leaves the picture
@@ -15887,6 +19589,7 @@ void URevisionRenderDevice::ClearZ(FSceneNode* Frame)
     // and the 2D overlay must not be occluded by it.
     if (GHud.bSwitched)
         GHud.bClearAfter = 1;
+    RoundRelease(Backend);
     FlushMeshFog(Backend);       // the fog needs the depth it was gathered against
     EndMirrorView(Backend, FrameCounter);
     Backend.SetReliefMirrorPlane(nullptr);      // a mirror's view ends here: the relief's lamps stand where they are
@@ -15960,10 +19663,19 @@ static INT         GReliefDecalsLift = 0;         // and of them brought forward
 
 struct FReliefTri
 {
-    FSolidVertex V[3];      // PX: the corner's distance to the nearest held edge (the shader's Rim)
+    FSolidVertex V[3];      // PX: the corner's distance to the nearest held edge (the shader's Rim); A: ReliefEdgeA
     FLOAT        Dist[3];   // each corner's distance from the eye (ReliefCornerDistance)
     UBOOL        bInside;   // wholly inside the widened view - and so are its halves, which are not tested again
 };
+
+// What a patch's corner carries in its colour's alpha, which the relief's passes do not read: the polygon's outline
+// record it lies on (ReliefOutlineRecs), as -2 - the record, or -1 where it lies on none (DSRelief's ReliefOutlineOf).
+// A corner of the polygon lies on two edges, so the record is a patch's own: both corners of a patch's side on the
+// outline carry that edge's. A side's middle lies on the record both its ends carry, or on none (ReliefEmitSplit).
+static inline FLOAT ReliefEdgeA(INT Rec)
+{
+    return (Rec >= 0) ? -2.0f - (FLOAT)Rec : -1.0f;
+}
 
 // A corner's distance from the eye, as ReliefEdgeCuts takes it: worked out once for a corner and carried with it, the
 // same arithmetic on the same numbers from whichever triangle it is reached.
@@ -16102,7 +19814,7 @@ static UBOOL ReliefEmitSplit(FBackend& Backend, const FReliefTri& First, FLOAT F
         M.R     = (P.R + Q.R) * 0.5f;
         M.G     = (P.G + Q.G) * 0.5f;
         M.B     = (P.B + Q.B) * 0.5f;
-        M.A     = (P.A + Q.A) * 0.5f;
+        M.A     = (P.A == Q.A) ? P.A : -1.0f;   // ReliefEdgeA
         M.PX    = (P.PX + Q.PX) * 0.5f;
         M.PY    = (P.PY + Q.PY) * 0.5f;       // the direction to lift along: the shader makes it unit again
         M.PN    = (P.PN + Q.PN) * 0.5f;
@@ -16124,11 +19836,12 @@ static UBOOL ReliefEmitSplit(FBackend& Backend, const FReliefTri& First, FLOAT F
 // A polygon's fan around its middle Mid, written straight out when no edge of it needs halving - round the rim or to
 // the middle - which is most polygons: the same patches in the same order ReliefEmitSplit would give, without its
 // stack, and with each edge's need and each point's side of the view's planes asked once rather than for every patch.
+// EdgeA: the edge from each corner to the next, as its patch's two corners on it carry it (ReliefEdgeA).
 // 1: written; 0: the frame's vertex buffer is full; -1: an edge needs halving, nothing was written, and the fan goes
 // through ReliefEmitSplit.
-static INT ReliefEmitWholeFan(FBackend& Backend, const FSolidVertex& Mid, const FSolidVertex* Corner, INT Num,
-                              FLOAT Focal, FLOAT Edge, FLOAT Depth, INT Srv, INT LightSrv, EBlendMode Mode,
-                              UBOOL bNoSmooth, const RdxMath::FVec3* PlaneN, const FLOAT* PlaneD)
+static INT ReliefEmitWholeFan(FBackend& Backend, const FSolidVertex& Mid, const FSolidVertex* Corner,
+                              const FLOAT* EdgeA, INT Num, FLOAT Focal, FLOAT Edge, FLOAT Depth, INT Srv, INT LightSrv,
+                              EBlendMode Mode, UBOOL bNoSmooth, const RdxMath::FVec3* PlaneN, const FLOAT* PlaneD)
 {
     FLOAT       DistAt[MAX_POLY_POINTS];
     const FLOAT DistMid = ReliefCornerDistance(Mid);
@@ -16164,9 +19877,10 @@ static INT ReliefEmitWholeFan(FBackend& Backend, const FSolidVertex& Mid, const 
         if (GReliefBatchCount >= ReliefBatchRoom && !ReliefFlushBatch(Backend, Srv, LightSrv, Mode, bNoSmooth))
             return 0;
         FSolidVertex* const Out = GReliefBatch + GReliefBatchCount * 3;
-        Out[0] = Mid;
-        Out[1] = Corner[i];
-        Out[2] = Corner[j];
+        Out[0]   = Mid;
+        Out[1]   = Corner[i];
+        Out[2]   = Corner[j];
+        Out[1].A = Out[2].A = EdgeA[i];
         GReliefBatchCount++;
         GReliefPatches++;
     }
@@ -16273,6 +19987,25 @@ static INT ReliefNodePolygon(const FSceneNode* Frame, const FSavedPoly* Poly, Rd
     return Num;
 }
 
+// Each edge of the relief's polygon ReliefNodePolygon gave - Num corners, the node's own in their order - its outline
+// record in the spherifier's rounding, into Recs (FResult's PolyChordFirst; DSRelief's SphereChordAt): the edge from
+// corner k to k + 1 is the node's first record plus k. -1 each where the run is not rounded, the polygon is not the
+// node's whole one, or the rounding has no ring round it.
+static void ReliefOutlineRecs(const FSceneNode* Frame, const FSavedPoly* Poly, UBOOL bRounded, INT Num, INT* Recs)
+{
+    INT First = -1;
+    if (bRounded && Num >= 3 && SphereTris(Frame, Poly) > 0)
+    {
+        const UModel* const       M = Frame->Level->Model;
+        const RdxSphere::FResult& R = GSphere->R;
+        const INT                 n = Poly->iNode;
+        if (n < R.PolyChordFirst.Num && M->Nodes(n).NumVertices == Num)
+            First = R.PolyChordFirst[n];
+    }
+    for (INT k = 0; k < Num; k++)
+        Recs[k] = (First >= 0) ? First + k : -1;
+}
+
 // A polygon of the relief's in a mirror's view: only what lies beyond the mirror's plane is in that view. The engine
 // cuts its own pieces along it (FSceneNode::NearClip, in the view's space), and the node's whole polygon is cut here
 // alike - the side kept is the one the engine's piece lies on, or where that piece is a sliver in the plane itself, the
@@ -16280,8 +20013,10 @@ static INT ReliefNodePolygon(const FSceneNode* Frame, const FSavedPoly* Poly, Rd
 // sliver along the floor, and its part under the floor, left whole, would stand between the view's eye and the mirror
 // and hide all the mirror shows. An edge the cut makes is no end of the surface: the relief goes on up to it (Made).
 // Returns the corners left; 0 where the polygon cannot be cut to fit; -1 where nothing of it lies beyond the mirror.
+// Recs, each edge's outline record (ReliefOutlineRecs), go with the edges: a part of an edge keeps its record, an edge
+// the cut makes has none.
 static INT ReliefCutAlongMirror(const FSceneNode* Frame, const FSavedPoly* Piece, RdxMath::FVec3* Pts, bool* Made,
-                                INT Num, INT Room)
+                                INT* Recs, INT Num, INT Room)
 {
     const FPlane& Clip = Frame->NearClip;
     if (Clip.X * Clip.X + Clip.Y * Clip.Y + Clip.Z * Clip.Z < 0.25f)
@@ -16295,6 +20030,7 @@ static INT ReliefCutAlongMirror(const FSceneNode* Frame, const FSavedPoly* Piece
         return Num;
     RdxMath::FVec3 Cut[MAX_POLY_POINTS + 2];
     bool           CutMade[MAX_POLY_POINTS + 2];
+    INT            CutRec[MAX_POLY_POINTS + 2];
     INT            Got = 0;
     FLOAT          Beyond = 0.0f;       // how far beyond the plane the polygon reaches
     for (INT i = 0; i < Num; i++)
@@ -16311,6 +20047,7 @@ static INT ReliefCutAlongMirror(const FSceneNode* Frame, const FSavedPoly* Piece
         if (bA)
         {
             Cut[Got]       = A;
+            CutRec[Got]    = Recs[i];
             CutMade[Got++] = Made[i];
         }
         if (bA != bB)
@@ -16320,6 +20057,7 @@ static INT ReliefCutAlongMirror(const FSceneNode* Frame, const FSavedPoly* Piece
             Cut[Got].Y = A.Y + (B.Y - A.Y) * T;
             Cut[Got].Z = A.Z + (B.Z - A.Z) * T;
             // Leaving the kept side, the next edge runs along the plane; coming back, it is the rest of this one.
+            CutRec[Got]    = bA ? -1 : Recs[i];
             CutMade[Got++] = bA ? true : Made[i];
         }
     }
@@ -16331,6 +20069,7 @@ static INT ReliefCutAlongMirror(const FSceneNode* Frame, const FSavedPoly* Piece
     {
         Pts[i]  = Cut[i];
         Made[i] = CutMade[i];
+        Recs[i] = CutRec[i];
     }
     return Got;
 }
@@ -18623,6 +22362,462 @@ static UBOOL IsGlassTexture(UTexture* T)
     return Is;
 }
 
+// The wet floors' list (RdxMath::ParseWetSurfaces): SecondRevisionWetSurfaces.txt in SecondRevision\Assets
+// (AssetPath), read the first time it is asked for. Without the file no floor gets wet.
+static RdxMath::FWetSurface GWetSurfaces[256];
+static INT                  GWetCount  = 0;
+static UBOOL                GWetLoaded = 0;
+static void LoadWetSurfaces()
+{
+    GWetLoaded = 1;
+    WCHAR Path[MAX_PATH + 64];
+    AssetPath(Path, MAX_PATH + 64, L"SecondRevisionWetSurfaces.txt");
+    if (!Path[0])
+        return;
+    HANDLE F = ::CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (F == INVALID_HANDLE_VALUE)
+    {
+        RDX_LOG("wet floors: there is no SecondRevisionWetSurfaces.txt in SecondRevision\\Assets - no floor gets wet");
+        return;
+    }
+    static char Text[65536];
+    DWORD       Got   = 0;
+    const BOOL  bRead = ::ReadFile(F, Text, sizeof(Text), &Got, nullptr);
+    ::CloseHandle(F);
+    if (!bRead)
+        Got = 0;
+    INT Bad = 0;
+    GWetCount = RdxMath::ParseWetSurfaces(Text, (INT)Got, GWetSurfaces, (INT)ARRAY_COUNT(GWetSurfaces), Bad);
+    RDX_LOGF("wet floors: %i textures read from SecondRevisionWetSurfaces.txt, %i lines not read%s", GWetCount, Bad,
+             (Got == sizeof(Text)) ? TEXT(" - the file is longer than is read of it") : TEXT(""));
+}
+
+// The kind the wet floors' list gives a texture: by its package and its own name, as the readout shows them.
+static RdxMath::EWetKind WetKindOfTexture(UTexture* T)
+{
+    if (!GWetLoaded)
+        LoadWetSurfaces();
+    if (!T || GWetCount == 0)
+        return RdxMath::Wet_None;
+    static FTextureFacts Facts;
+    UBOOL     bKnown = 0;
+    const INT At     = Facts.Find((QWORD)(size_t)T, bKnown);
+    if (bKnown)
+        return (RdxMath::EWetKind)Facts.Get(At);
+    // The package and the texture's own name - the group in the middle is neither (the readout's line, GPomPickName).
+    const TCHAR* const Full = T->GetPathName();
+    INT Len = 0, First = -1, Last = -1;
+    for (; Full[Len]; Len++)
+        if (Full[Len] == TEXT('.'))
+        {
+            if (First < 0)
+                First = Len;
+            Last = Len;
+        }
+    TCHAR Name[RdxMath::WetNameChars + 1];
+    INT   w = 0;
+    for (INT c = 0; c < ((First >= 0) ? First : Len) && w < RdxMath::WetNameChars - 1; c++)
+        Name[w++] = Full[c];
+    if (First >= 0 && w < RdxMath::WetNameChars - 1)
+    {
+        Name[w++] = TEXT('.');
+        for (INT c = Last + 1; c < Len && w < RdxMath::WetNameChars; c++)
+            Name[w++] = Full[c];
+    }
+    Name[Min(w, (INT)RdxMath::WetNameChars)] = 0;
+    const RdxMath::EWetKind Kind = RdxMath::WetKindOf(GWetSurfaces, GWetCount, Name);
+    Facts.Set(At, (QWORD)(size_t)T, (INT)Kind);
+    return Kind;
+}
+
+static void FindSkyZones(const UModel* M, UBOOL* Out);
+
+// Whether it rains in a zone of the level (docs/terv-nedves-feluletek.md 8.4): the rain falls in the zones whose zone
+// actor is a PrecipitationZone (the rain's own ZoneInfo) - the dust that falls in Area 51's (a SnowZone, its own kind)
+// wets the floors as well; a level with the rain's generators (a Precipitator, the
+// Precipitation package's - IsRainSplash) and no such zone has it in its zones with sky (FindSkyZones). Asked again for
+// each level loaded, and said once.
+static UBOOL ZoneRains(ULevel* Level, INT Zone)
+{
+    static ULevel* Asked   = nullptr;   // compared only, never followed
+    static INT     Flushes = -1;
+    static UBOOL   Rains[FBspNode::MAX_ZONES];
+    UModel* const  M = Level ? Level->Model : nullptr;
+    if (!M)
+        return 0;
+    if (Level != Asked || Flushes != GLevelFlushes)
+    {
+        Asked   = Level;
+        Flushes = GLevelFlushes;
+        for (INT z = 0; z < FBspNode::MAX_ZONES; z++)
+            Rains[z] = 0;
+        static FName ZoneClass(NAME_None), Generator(NAME_None);
+        if (ZoneClass == NAME_None)
+            ZoneClass = FName(TEXT("PrecipitationZone"), FNAME_Find);
+        if (Generator == NAME_None)
+            Generator = FName(TEXT("Precipitator"), FNAME_Find);
+        INT Own = 0;
+        for (INT z = 1; z < M->NumZones && z < FBspNode::MAX_ZONES && ZoneClass != NAME_None; z++)
+        {
+            const AActor* const A = M->Zones[z].ZoneActor;
+            for (UClass* C = A ? A->GetClass() : nullptr; C && !Rains[z]; C = C->GetSuperClass())
+                Rains[z] = (C->GetFName() == ZoneClass) ? 1 : 0;
+            Own += Rains[z] ? 1 : 0;
+        }
+        UBOOL bGenerators = 0;
+        for (INT i = 0; Own == 0 && Generator != NAME_None && i < Level->Actors.Num() && !bGenerators; i++)
+        {
+            const AActor* const A = Level->Actors(i);
+            for (UClass* C = (A && !A->bDeleteMe) ? A->GetClass() : nullptr; C && !bGenerators; C = C->GetSuperClass())
+                bGenerators = (C->GetFName() == Generator) ? 1 : 0;
+        }
+        INT Wet = Own;
+        if (Own == 0 && bGenerators)
+        {
+            FindSkyZones(M, Rains);
+            for (INT z = 1; z < M->NumZones && z < FBspNode::MAX_ZONES; z++)
+                Wet += Rains[z] ? 1 : 0;
+        }
+        RDX_LOGF("wet floors: it rains in %i of the level's %i zones%s", Wet, M->NumZones - 1,
+                 (Own > 0) ? TEXT(" - its rain's own zones")
+                           : (bGenerators ? TEXT(" - those with sky: the level has the rain's generators, no zone of its own")
+                                          : TEXT(" - every floor is dry")));
+    }
+    return (Zone > 0 && Zone < FBspNode::MAX_ZONES) ? Rains[Zone] : 0;
+}
+
+// The rain's cover over the level's wet floors (docs/terv-nedves-feluletek.md 8.4), made once a level where it rains:
+// a grid over X and Y (RdxMath::WetCoverCell units a cell) about the wet floors - the polygons of a listed texture,
+// facing up within RdxMath::WetFloorUpMin, in a zone it rains in -, each cell under one keeping the height of the
+// highest such floor over it and whether that floor sees the sky there: a line up from it into the level, 255 where it
+// meets nothing, 0 where a roof keeps the rain off. A floor lower than that height in the cell is under the higher
+// one, and so covered too: the lower floors' own share (GWetCoverLow) is none where a cell holds a floor more than
+// RdxMath::WetUnderFloor below its highest, and elsewhere the cell's floor's. Both shares softened alike
+// (RdxMath::ErodeWetCover, BlurWetCover), so a pier dries towards its roof's edge as a floor does towards a shelter's;
+// and the highest floor near each cell (GWetCoverNear, RdxMath::GrowWetTop, as far as the softening reaches) says which
+// of the two a floor takes. A cell under no floor counts as open.
+static BYTE*  GWetCoverOpen = nullptr;
+static FLOAT* GWetCoverTop  = nullptr;
+static BYTE*  GWetCoverLow  = nullptr;
+static FLOAT* GWetCoverNear = nullptr;
+static INT    GWetCoverW = 0, GWetCoverH = 0;
+static FLOAT  GWetCoverX = 0.0f, GWetCoverY = 0.0f, GWetCoverCellNow = RdxMath::WetCoverCell;
+enum { WET_COVER_MOST = 1024 * 1024 };   // cells at most - a level wider is not given a cover
+
+// An own lamp's wet floor, for its light off the water (SolidPass.hlsl's OwnBounce): the level's floor straight below
+// it, within the lamp's reach, where it is one the rain wets - a floor of a listed texture in a zone it rains in, with
+// Puddles on and Reflections above Default - as one number: its height's whole part and, as the fraction (0.99 the
+// wettest), how wet it is there by its patches and the rain's cover; FBackend::NoWetFloor where there is none.
+static FLOAT OwnLampWetFloor(ULevel* Level, const FLOAT* At)
+{
+    UModel* const M = Level ? Level->Model : nullptr;
+    if (!M || !GRunPuddles || GRunReflections == RdxMath::Reflections_Default)
+        return FBackend::NoWetFloor;
+    const FVector From(At[0], At[1], At[2]);
+    FCheckResult  Hit(1.0f);
+    if (M->LineCheck(Hit, nullptr, From - FVector(0.0f, 0.0f, RdxMath::OwnLampReach), From, FVector(0.0f, 0.0f, 0.0f), 0) ||
+        Hit.Item < 0 || Hit.Item >= M->Nodes.Num())
+        return FBackend::NoWetFloor;
+    const FBspNode& Node = M->Nodes(Hit.Item);
+    if (Node.iSurf < 0 || Node.iSurf >= M->Surfs.Num())
+        return FBackend::NoWetFloor;
+    const FBspSurf& Sf = M->Surfs(Node.iSurf);
+    if (Sf.vNormal < 0 || Sf.vNormal >= M->Vectors.Num() || M->Vectors(Sf.vNormal).Z < RdxMath::WetFloorUpMin ||
+        WetKindOfTexture(Sf.Texture) == RdxMath::Wet_None || !ZoneRains(Level, Node.iZone[1]))
+        return FBackend::NoWetFloor;
+    const FVector& P     = Hit.Location;
+    FLOAT          Cover = 1.0f;
+    if (GWetCoverOpen && GWetCoverW > 0 && GWetCoverH > 0 && GWetCoverCellNow > 0.0f)
+    {
+        const INT X = appFloor((P.X - GWetCoverX) / GWetCoverCellNow);
+        const INT Y = appFloor((P.Y - GWetCoverY) / GWetCoverCellNow);
+        if (X >= 0 && Y >= 0 && X < GWetCoverW && Y < GWetCoverH)
+        {
+            const INT C   = Y * GWetCoverW + X;
+            const UBOOL bLow = GWetCoverNear && GWetCoverLow && P.Z < GWetCoverNear[C] - RdxMath::WetUnderFloor;
+            Cover = (FLOAT)(bLow ? GWetCoverLow[C] : GWetCoverOpen[C]) / 255.0f;
+        }
+    }
+    const FLOAT Wet = Min(RdxMath::WetLevelOf(RdxMath::WetPatch(P.X, P.Y)) * Cover, 1.0f);
+    return (Wet > 0.0f) ? (FLOAT)appFloor(P.Z) + 0.99f * Wet : FBackend::NoWetFloor;
+}
+
+static void ForgetWetCover()
+{
+    if (GWetCoverOpen)
+        appFree(GWetCoverOpen);
+    if (GWetCoverTop)
+        appFree(GWetCoverTop);
+    if (GWetCoverLow)
+        appFree(GWetCoverLow);
+    if (GWetCoverNear)
+        appFree(GWetCoverNear);
+    GWetCoverOpen = nullptr;
+    GWetCoverTop  = nullptr;
+    GWetCoverLow  = nullptr;
+    GWetCoverNear = nullptr;
+    GWetCoverW = GWetCoverH = 0;
+}
+
+static void MakeWetCover(ULevel* Level)
+{
+    ForgetWetCover();
+    UModel* const M = Level ? Level->Model : nullptr;
+    if (!M || M->Nodes.Num() == 0)
+        return;
+    // The wet floors' nodes, and the box over them. A floor of the list in a zone it does not rain in - under a
+    // shelter's roof, in a doorway - is covered as it stands: the wet floor beside it dries towards it.
+    auto IsListedFloor = [&](const FBspNode& Node) -> UBOOL {
+        if (Node.iSurf < 0 || Node.iSurf >= M->Surfs.Num() || Node.NumVertices < 3)
+            return 0;
+        const FBspSurf& Sf = M->Surfs(Node.iSurf);
+        if (Sf.vNormal < 0 || Sf.vNormal >= M->Vectors.Num() || M->Vectors(Sf.vNormal).Z < RdxMath::WetFloorUpMin ||
+            (Sf.PolyFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal | PF_Mirrored | PF_Translucent | PF_Modulated |
+                             PF_Masked)))
+            return 0;
+        return WetKindOfTexture(Sf.Texture) != RdxMath::Wet_None;
+    };
+    auto IsWetFloor = [&](const FBspNode& Node) -> UBOOL {
+        return IsListedFloor(Node) && ZoneRains(Level, Node.iZone[1]);
+    };
+    FLOAT Lo[2] = { 1e30f, 1e30f }, Hi[2] = { -1e30f, -1e30f };
+    INT   Floors = 0;
+    for (INT n = 0; n < M->Nodes.Num(); n++)
+    {
+        const FBspNode& Node = M->Nodes(n);
+        if (!IsWetFloor(Node))
+            continue;
+        Floors++;
+        for (INT k = 0; k < Node.NumVertices; k++)
+        {
+            const INT P = M->Verts(Node.iVertPool + k).pVertex;
+            if (P < 0 || P >= M->Points.Num())
+                continue;
+            const FVector& Q = M->Points(P);
+            Lo[0] = Min(Lo[0], Q.X);
+            Lo[1] = Min(Lo[1], Q.Y);
+            Hi[0] = Max(Hi[0], Q.X);
+            Hi[1] = Max(Hi[1], Q.Y);
+        }
+    }
+    if (Floors == 0 || Hi[0] < Lo[0])
+        return;
+    // The cell twice as wide again where a wide level's floors would take more of them than are made.
+    FLOAT Cell = RdxMath::WetCoverCell;
+    INT   W = 0, H = 0;
+    for (INT Tries = 0; Tries < 6; Tries++, Cell *= 2.0f)
+    {
+        W = (INT)((Hi[0] - Lo[0]) / Cell) + 2;
+        H = (INT)((Hi[1] - Lo[1]) / Cell) + 2;
+        if (W * H <= WET_COVER_MOST)
+            break;
+    }
+    if (W * H > WET_COVER_MOST)
+    {
+        RDX_LOGF("wet floors: %s's wet floors span %i x %i cells of their cover, more than is made - no cover",
+                 Level->GetOuter()->GetName(), W, H);
+        return;
+    }
+    const DOUBLE Began = appSeconds();
+    GWetCoverOpen = (BYTE*)appMalloc(W * H, TEXT("RdxWetCover"));
+    GWetCoverTop  = (FLOAT*)appMalloc(sizeof(FLOAT) * W * H, TEXT("RdxWetCover"));
+    GWetCoverLow  = (BYTE*)appMalloc(W * H, TEXT("RdxWetCover"));
+    GWetCoverNear = (FLOAT*)appMalloc(sizeof(FLOAT) * W * H, TEXT("RdxWetCover"));
+    BYTE* const  Work    = (BYTE*)appMalloc(W * H, TEXT("RdxWetCover"));
+    FLOAT* const TopWork = (FLOAT*)appMalloc(sizeof(FLOAT) * W * H, TEXT("RdxWetCover"));
+    if (!GWetCoverOpen || !GWetCoverTop || !GWetCoverLow || !GWetCoverNear || !Work || !TopWork)
+    {
+        if (Work)
+            appFree(Work);
+        if (TopWork)
+            appFree(TopWork);
+        ForgetWetCover();
+        return;
+    }
+    GWetCoverW = W;
+    GWetCoverH = H;
+    GWetCoverX = Lo[0] - 0.5f * Cell;
+    GWetCoverY = Lo[1] - 0.5f * Cell;
+    // GWetCoverNear holds each cell's lowest floor while the floors are laid.
+    for (INT i = 0; i < W * H; i++)
+    {
+        GWetCoverOpen[i] = 255;
+        GWetCoverTop[i]  = -1e30f;
+        GWetCoverNear[i] = 1e30f;
+    }
+    // Each floor laid on the grid: the cells whose middle its polygon holds (seen from above), each with the floor's
+    // height there - the highest floor of a cell keeps it.
+    INT Cells = 0, Covered = 0, Dry = 0;
+    const FVector None(0.0f, 0.0f, 0.0f);
+    for (INT n = 0; n < M->Nodes.Num(); n++)
+    {
+        const FBspNode& Node = M->Nodes(n);
+        if (!IsListedFloor(Node))
+            continue;
+        const UBOOL bWet = ZoneRains(Level, Node.iZone[1]);
+        FVector     Pts[FBspNode::MAX_FINAL_VERTICES];
+        INT     Num = 0;
+        for (INT k = 0; k < Node.NumVertices && Num < FBspNode::MAX_FINAL_VERTICES; k++)
+        {
+            const INT P = M->Verts(Node.iVertPool + k).pVertex;
+            if (P >= 0 && P < M->Points.Num())
+                Pts[Num++] = M->Points(P);
+        }
+        if (Num < 3)
+            continue;
+        const FVector  Nrm = M->Vectors(M->Surfs(Node.iSurf).vNormal);
+        FLOAT          X0 = Pts[0].X, X1 = Pts[0].X, Y0 = Pts[0].Y, Y1 = Pts[0].Y;
+        for (INT k = 1; k < Num; k++)
+        {
+            X0 = Min(X0, Pts[k].X);
+            X1 = Max(X1, Pts[k].X);
+            Y0 = Min(Y0, Pts[k].Y);
+            Y1 = Max(Y1, Pts[k].Y);
+        }
+        const INT CX0 = Max(0, (INT)((X0 - GWetCoverX) / Cell)), CX1 = Min(W - 1, (INT)((X1 - GWetCoverX) / Cell));
+        const INT CY0 = Max(0, (INT)((Y0 - GWetCoverY) / Cell)), CY1 = Min(H - 1, (INT)((Y1 - GWetCoverY) / Cell));
+        for (INT cy = CY0; cy <= CY1; cy++)
+            for (INT cx = CX0; cx <= CX1; cx++)
+            {
+                const FLOAT MX = GWetCoverX + ((FLOAT)cx + 0.5f) * Cell, MY = GWetCoverY + ((FLOAT)cy + 0.5f) * Cell;
+                // The middle inside the polygon seen from above: on the same side of every edge.
+                INT Side = 0;
+                UBOOL bIn = 1;
+                for (INT k = 0; k < Num && bIn; k++)
+                {
+                    const FVector& A = Pts[k];
+                    const FVector& B = Pts[(k + 1) % Num];
+                    const FLOAT    C = (B.X - A.X) * (MY - A.Y) - (B.Y - A.Y) * (MX - A.X);
+                    const INT      S = (C > 0.0f) ? 1 : ((C < 0.0f) ? -1 : 0);
+                    if (S != 0)
+                    {
+                        if (Side == 0)
+                            Side = S;
+                        else if (S != Side)
+                            bIn = 0;
+                    }
+                }
+                if (!bIn)
+                    continue;
+                // The floor's height there, on its plane.
+                const FLOAT Z = (Abs(Nrm.Z) > 1e-3f)
+                                    ? Pts[0].Z - (Nrm.X * (MX - Pts[0].X) + Nrm.Y * (MY - Pts[0].Y)) / Nrm.Z
+                                    : Pts[0].Z;
+                const INT At = cy * W + cx;
+                GWetCoverNear[At] = Min(GWetCoverNear[At], Z);
+                if (Z <= GWetCoverTop[At])
+                    continue;
+                if (!bWet)
+                {
+                    GWetCoverTop[At]  = Z;
+                    GWetCoverOpen[At] = 0;
+                    Dry++;
+                    continue;
+                }
+                if (GWetCoverTop[At] < -1e29f)
+                    Cells++;
+                GWetCoverTop[At] = Z;
+                FCheckResult Hit(1.0f);
+                const FVector From(MX, MY, Z + 4.0f);
+                UBOOL bOpen = M->LineCheck(Hit, nullptr, From + FVector(0.0f, 0.0f, 4096.0f), From, None, 0) != 0;
+                // What a line up meets of the sky - the level's backdrop, a surface like any other to it - is open.
+                if (!bOpen && Hit.Item >= 0 && Hit.Item < M->Nodes.Num())
+                {
+                    const INT iSurf = M->Nodes(Hit.Item).iSurf;
+                    bOpen = iSurf >= 0 && iSurf < M->Surfs.Num() && (M->Surfs(iSurf).PolyFlags & PF_FakeBackdrop) != 0;
+                }
+                GWetCoverOpen[At] = bOpen ? 255 : 0;
+            }
+    }
+    for (INT i = 0; i < W * H; i++)
+        Covered += (GWetCoverTop[i] > -1e29f && GWetCoverOpen[i] == 0) ? 1 : 0;
+    // A measurement (the marker SecondRevision-wet-cover-band.txt, a number of units): the edge's band for this start.
+    static const INT Band   = MarkerNumber(L"SecondRevision-wet-cover-band.txt", (INT)RdxMath::WetCoverBand,
+                                           (INT)RdxMath::WetCoverBand);
+    CoverUnderCrowns(GWetCoverOpen, GWetCoverTop, W, H, GWetCoverX, GWetCoverY, Cell);
+    // The lower floors' share: none under a higher floor of their own cell, elsewhere the cell's floor's.
+    INT Under = 0;
+    for (INT i = 0; i < W * H; i++)
+    {
+        const UBOOL bUnder = GWetCoverTop[i] > -1e29f && GWetCoverTop[i] - GWetCoverNear[i] > RdxMath::WetUnderFloor;
+        GWetCoverLow[i] = bUnder ? 0 : GWetCoverOpen[i];
+        Under += bUnder ? 1 : 0;
+    }
+    const INT        Radius = RdxMath::WetCoverRadius(Cell, (FLOAT)Band);
+    RdxMath::ErodeWetCover(GWetCoverOpen, W, H, Radius, Work);
+    RdxMath::BlurWetCover(GWetCoverOpen, W, H, Radius, Work);
+    RdxMath::ErodeWetCover(GWetCoverLow, W, H, Radius, Work);
+    RdxMath::BlurWetCover(GWetCoverLow, W, H, Radius, Work);
+    // The highest floor near each cell, as far as the softening reaches: within it a lower floor's share eases from the
+    // edge of the floor above; past it the two shares are alike again.
+    for (INT i = 0; i < W * H; i++)
+        GWetCoverNear[i] = GWetCoverTop[i];
+    RdxMath::GrowWetTop(GWetCoverNear, W, H, 2 * Radius + 1, TopWork);
+    appFree(Work);
+    appFree(TopWork);
+    RDX_LOGF("wet floors: %s's rain cover - %i x %i cells of %.0f units over %i wet floors' polygons, %i cells under "
+             "them, %i of those covered from above, %i under the list's floors where it does not rain, %i with a floor "
+             "under a higher one; the edge eased over %i cells either way; %.0f ms", Level->GetOuter()->GetName(), W, H,
+             Cell, Floors, Cells, Covered, Dry, Under, Radius, 1000.0 * (appSeconds() - Began));
+    GWetCoverCellNow = Cell;
+}
+
+// The level's rain cover to the backend (FBackend::SetWetCover): each cell's open share, its highest wet floor's height,
+// the lower floors' open share and the highest floor near it, four floats a cell; none where the level has no cover.
+static void GiveWetCover(FBackend& Backend)
+{
+    const INT N = GWetCoverW * GWetCoverH;
+    FLOAT* const Cells = (N > 0 && GWetCoverOpen && GWetCoverTop && GWetCoverLow && GWetCoverNear)
+                             ? (FLOAT*)appMalloc(sizeof(FLOAT) * 4 * N, TEXT("RdxWetCoverCells"))
+                             : nullptr;
+    if (!Cells)
+    {
+        Backend.SetWetCover(nullptr, 0, 0, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    for (INT i = 0; i < N; i++)
+    {
+        Cells[4 * i + 0] = GWetCoverOpen[i] / 255.0f;
+        Cells[4 * i + 1] = GWetCoverTop[i];
+        Cells[4 * i + 2] = GWetCoverLow[i] / 255.0f;
+        Cells[4 * i + 3] = GWetCoverNear[i];
+    }
+    Backend.SetWetCover(Cells, GWetCoverW, GWetCoverH, GWetCoverX, GWetCoverY, GWetCoverCellNow);
+    appFree(Cells);
+}
+
+// The kind a surface of the world's view is drawn wet as (FBackend::SetSurfaceWet): a floor of a texture the list names,
+// in a zone it rains in, with the puddles on - opaque and not masked, not a mirror, the sky or a portal, facing up
+// within RdxMath::WetFloorUpMin by the level's own polygon (the spherifier's rounding moves where it is drawn, not what
+// it is). Wet_None for everything else.
+static RdxMath::EWetKind WetKindOfSurface(const FSceneNode* Frame, const FSurfaceFacet& Facet, DWORD PolyFlags,
+                                          RdxMath::EWetKind Listed)
+{
+    if (Listed == RdxMath::Wet_None || !GRunPuddles || !Frame || !Frame->Level || !Frame->Level->Model || !Facet.Polys)
+        return RdxMath::Wet_None;
+    if (PolyFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal | PF_Mirrored | PF_Translucent | PF_Modulated |
+                     PF_Masked))
+        return RdxMath::Wet_None;
+    UModel* const M    = Frame->Level->Model;
+    const INT     Node = Facet.Polys->iNode;
+    const INT     Surf = (Node >= 0 && Node < M->Nodes.Num()) ? M->Nodes(Node).iSurf : -1;
+    if (Surf < 0 || Surf >= M->Surfs.Num())
+        return RdxMath::Wet_None;
+    const FBspSurf& Sf = M->Surfs(Surf);
+    if (Sf.vNormal < 0 || Sf.vNormal >= M->Vectors.Num() || M->Vectors(Sf.vNormal).Z < RdxMath::WetFloorUpMin)
+        return RdxMath::Wet_None;
+    // The zone above the floor: the one its front faces.
+    return ZoneRains(Frame->Level, M->Nodes(Node).iZone[1]) ? Listed : RdxMath::Wet_None;
+}
+
+// The wet kind for the draws of one surface, set back when the surface is done, however it leaves.
+struct FWetSurfaceScope
+{
+    FBackend& Backend;
+    FWetSurfaceScope(FBackend& InBackend, RdxMath::EWetKind Kind) : Backend(InBackend) { Backend.SetSurfaceWet((INT)Kind); }
+    ~FWetSurfaceScope() { Backend.SetSurfaceWet(0); }
+};
+
 // A pane's numbers for its mirror layer (SolidPass.hlsl, GlassMirror), in the water's constants: the engine's
 // projection, the view's axes in the world and the screen's centre where a water run has them, and the pane's normal
 // in the world, on the camera's side. False where the pane's polygons say no normal.
@@ -18670,6 +22865,105 @@ static UBOOL GlassRunConstants(const FSceneNode* Frame, const FSurfaceFacet& Fac
     Consts[28] = N.X * C.XAxis.X + N.Y * C.YAxis.X + N.Z * C.ZAxis.X;
     Consts[29] = N.X * C.XAxis.Y + N.Y * C.YAxis.Y + N.Z * C.ZAxis.Y;
     Consts[30] = N.X * C.XAxis.Z + N.Y * C.YAxis.Z + N.Z * C.ZAxis.Z;
+    return 1;
+}
+
+// The wet floors' water layer on rays (FBackend::AddWetLayer; SolidPass.hlsl's WetMirror): a pane's numbers, as
+// GlassRunConstants fills them for this view - with the level's up for the normal, no pane's number and no lamp.
+static void WetLayerConstants(const FSceneNode* Frame, FLOAT* Consts)
+{
+    for (INT i = 0; i < FSolidPass::WATER_CONSTANTS; i++)
+        Consts[i] = 0.0f;
+    const FCoords& C = Frame->Coords;
+    Consts[4]  = GWetRainClock;
+    Consts[5]  = Frame->Proj.Z;
+    Consts[8]  = C.Origin.X;
+    Consts[9]  = C.Origin.Y;
+    Consts[10] = C.XAxis.X;
+    Consts[11] = C.XAxis.Y;
+    Consts[12] = C.YAxis.X;
+    Consts[13] = C.YAxis.Y;
+    Consts[14] = C.ZAxis.X;
+    Consts[15] = C.ZAxis.Y;
+    Consts[16] = Frame->FX15 + (FLOAT)Frame->XB;
+    Consts[17] = Frame->FY15 + (FLOAT)Frame->YB;
+    Consts[21] = C.XAxis.Z;
+    Consts[22] = C.YAxis.Z;
+    Consts[23] = C.ZAxis.Z;
+    Consts[30] = 1.0f;
+    Consts[33] = 0.25f * GWetRainThick;       // WaterRainOn's quarter, as a water run carries it
+}
+
+// A pane's mirror probe (Reflections=High, no rays; FMirrorProbe): the pane noted for where the probe stands - its
+// polygons' middle in the world, the normal GlassRunConstants put into Consts (towards the camera), and how much of the
+// screen they take up, in the engine's pixels - and the probe's centre from the camera and its reach in the run's
+// constants (SolidPass.hlsl's GlassProbe). False where no probe serves the pane yet, or the pane lies beyond its reach.
+static UBOOL ProbeRunConstants(FBackend& Backend, const FSceneNode* Frame, const FSurfaceFacet& Facet, FLOAT* Consts)
+{
+    RdxMath::FVec3 Sum    = { 0.0f, 0.0f, 0.0f };
+    INT            Points = 0;
+    DOUBLE         Area   = 0.0;
+    for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+    {
+        FLOAT Sx[MAX_POLY_POINTS], Sy[MAX_POLY_POINTS];
+        INT   Count = 0;
+        for (INT i = 0; i < Poly->NumPts && Count < MAX_POLY_POINTS; i++)
+            if (Poly->Pts[i])
+            {
+                const FVector& P = Poly->Pts[i]->Point;
+                Sum.X += P.X;
+                Sum.Y += P.Y;
+                Sum.Z += P.Z;
+                Points++;
+                // On the screen; a corner at or behind the eye as if just before it - the pane is that close.
+                const FLOAT Z = Max(P.Z, 1.0f);
+                Sx[Count]     = P.X * Frame->Proj.Z / Z;
+                Sy[Count]     = P.Y * Frame->Proj.Z / Z;
+                Count++;
+            }
+        DOUBLE Twice = 0.0;
+        for (INT i = 0; i < Count; i++)
+        {
+            const INT j = (i + 1) % Count;
+            Twice += (DOUBLE)Sx[i] * Sy[j] - (DOUBLE)Sx[j] * Sy[i];
+        }
+        Area += 0.5 * ((Twice < 0.0) ? -Twice : Twice);
+    }
+    if (Points == 0)
+        return 0;
+    const FCoords& C  = Frame->Coords;
+    const FLOAT    Mx = Sum.X / Points, My = Sum.Y / Points, Mz = Sum.Z / Points;
+    const FLOAT Middle[3] = { C.Origin.X + Mx * C.XAxis.X + My * C.YAxis.X + Mz * C.ZAxis.X,
+                              C.Origin.Y + Mx * C.XAxis.Y + My * C.YAxis.Y + Mz * C.ZAxis.Y,
+                              C.Origin.Z + Mx * C.XAxis.Z + My * C.YAxis.Z + Mz * C.ZAxis.Z };
+    Backend.NoteProbePane(Middle, &Consts[28], (FLOAT)Area);
+    FLOAT Centre[3], Reach;
+    if (!Backend.GetProbePlace(Centre, Reach))
+        return 0;
+    const FLOAT Dx = Middle[0] - Centre[0], Dy = Middle[1] - Centre[1], Dz = Middle[2] - Centre[2];
+    if (Dx * Dx + Dy * Dy + Dz * Dz >= Reach * Reach)
+        return 0;
+    Consts[24] = Centre[0] - C.Origin.X;
+    Consts[25] = Centre[1] - C.Origin.Y;
+    Consts[26] = Centre[2] - C.Origin.Z;
+    Consts[27] = Reach;
+    // A measurement only (SecondRevision-probe-view.txt): the pane shows what the probe holds, whole (GlassProbeView).
+    static const UBOOL bProbeView = FreshMarker(L"SecondRevision-probe-view.txt");
+    Consts[20] = bProbeView ? 1.0f : 0.0f;
+    // The probe alone, without the picture's trace over it (GlassProbeAlone): Reflections=Medium.
+    Consts[19] = RdxMath::ReflectionsGlassTrace(Backend.GetReflections()) ? 0.0f : 1.0f;
+    // Whether the own body's picture (FMirrorBody) is this pane's (GlassBody): the body is mirrored by the plane of the
+    // pane the probe stands before, so a pane in that plane - turned the same way, as far off - shows it.
+    FLOAT PaneN[3], PaneM[3];
+    if (Backend.GetProbePane(PaneN, PaneM))
+    {
+        const FLOAT* const N  = &Consts[28];
+        const FLOAT        Dn = (N[0] - PaneN[0]) * (N[0] - PaneN[0]) + (N[1] - PaneN[1]) * (N[1] - PaneN[1]) +
+                                (N[2] - PaneN[2]) * (N[2] - PaneN[2]);
+        const FLOAT Off = PaneN[0] * (Middle[0] - PaneM[0]) + PaneN[1] * (Middle[1] - PaneM[1]) +
+                          PaneN[2] * (Middle[2] - PaneM[2]);
+        Consts[18] = (Dn < 1e-4f && Off > -2.0f && Off < 2.0f) ? 1.0f : 0.0f;
+    }
     return 1;
 }
 
@@ -20388,6 +24682,43 @@ static void ReadLevelGrass(ULevel* Level)
         GGrassTris   = (FLOAT*)appMalloc(Tris * 9 * sizeof(FLOAT), TEXT("RdxGrassTris"));
         GGrassSurfFirst = (INT*)appMalloc(Surfs * sizeof(INT), TEXT("RdxGrassSurfFirst"));
     }
+    // The floors laid over the grass (RdxMath::GrassSubtract): the level's solid, upward pieces that are no grass - each
+    // with its box from above - for the lawn's pieces to be cut by where one lies within a blade's height over them.
+    struct FGrassCover
+    {
+        INT   Node;
+        FLOAT MinX, MinY, MaxX, MaxY;
+    };
+    TArray<FGrassCover> Covers;
+    if (Nodes > 0)
+        for (INT n = 0; n < M->Nodes.Num(); n++)
+        {
+            const FBspNode& Node = M->Nodes(n);
+            if (!GrassNodeReadable(M, Node) || SurfKind[Node.iSurf] || Node.NumVertices > RdxMath::GrassPieceCorners)
+                continue;
+            const FBspSurf& Sf = M->Surfs(Node.iSurf);
+            if (Sf.PolyFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal | PF_Mirrored | PF_Translucent | PF_Modulated |
+                                PF_Masked))
+                continue;
+            if (Sf.vNormal < 0 || Sf.vNormal >= M->Vectors.Num() || M->Vectors(Sf.vNormal).Z < RdxMath::GrassUpMin)
+                continue;
+            FGrassCover C;
+            C.Node = n;
+            C.MinX = C.MinY = 1e9f;
+            C.MaxX = C.MaxY = -1e9f;
+            for (INT k = 0; k < Node.NumVertices; k++)
+            {
+                const FVector& V = M->Points(M->Verts(Node.iVertPool + k).pVertex);
+                C.MinX = Min(C.MinX, V.X);
+                C.MaxX = Max(C.MaxX, V.X);
+                C.MinY = Min(C.MinY, V.Y);
+                C.MaxY = Max(C.MaxY, V.Y);
+            }
+            Covers.AddItem(C);
+        }
+    INT          TrisRoom = Tris, CutNodes = 0, CutPieces = 0, CutRefused = 0;
+    static FLOAT CutPiece[2][RdxMath::GrassPieceMost * 2 * RdxMath::GrassPieceCorners];
+    static INT   CutCount[2][RdxMath::GrassPieceMost];
     if (GGrassNodeAt && GGrassNodes && GGrassTris && GGrassSurfFirst)
     {
         GGrassNodeSlots = M->Nodes.Num();
@@ -20412,15 +24743,107 @@ static void ReadLevelGrass(ULevel* Level)
             G.View      = nullptr;
             G.TuftFirst = 0;
             G.TuftCount = 0;
-            const RdxMath::FVec3 A = ToVec(M->Points(M->Verts(Node.iVertPool).pVertex));
-            for (INT k = 1; k + 1 < Node.NumVertices && GGrassTriCount < Tris; k++)
+            // The lawn's piece less the floors laid on it within its blades' height (RdxMath::GrassSubtract) - by X
+            // and Y, its own plane giving the height back. Where the cutting would make more pieces than are kept,
+            // the piece stays whole, as it was.
+            INT Pieces = 1;
+            CutCount[0][0] = Min((INT)Node.NumVertices, (INT)RdxMath::GrassPieceCorners);
+            FLOAT MinX = 1e9f, MinY = 1e9f, MaxX = -1e9f, MaxY = -1e9f;
+            for (INT k = 0; k < CutCount[0][0]; k++)
             {
-                const RdxMath::FVec3 B = ToVec(M->Points(M->Verts(Node.iVertPool + k).pVertex));
-                const RdxMath::FVec3 C = ToVec(M->Points(M->Verts(Node.iVertPool + k + 1).pVertex));
-                if (RdxMath::GrassTriangle(A, B, C, GGrassTris + 9 * GGrassTriCount))
+                const FVector& V = M->Points(M->Verts(Node.iVertPool + k).pVertex);
+                CutPiece[0][2 * k]     = V.X;
+                CutPiece[0][2 * k + 1] = V.Y;
+                MinX = Min(MinX, V.X);
+                MaxX = Max(MaxX, V.X);
+                MinY = Min(MinY, V.Y);
+                MaxY = Max(MaxY, V.Y);
+            }
+            const FPlane& Pl     = Node.Plane;
+            const UBOOL   bLevel = (Pl.Z > 0.01f || Pl.Z < -0.01f) ? 1 : 0;
+            const FLOAT   Blade  = ((G.Kind == 2) ? GrassLongMost : GrassShortMost) + 0.5f;
+            INT           At     = 0;       // which of the two buffers holds the pieces now
+            UBOOL         bCut   = 0;
+            for (INT c = 0; c < Covers.Num() && SurfKind[Node.iSurf] && bLevel && Pieces > 0; c++)
+            {
+                const FGrassCover& Cv = Covers(c);
+                if (Cv.MaxX <= MinX || Cv.MinX >= MaxX || Cv.MaxY <= MinY || Cv.MinY >= MaxY)
+                    continue;
+                // Over the lawn's plane by a blade's height at the most at each of its corners, and not on it.
+                const FBspNode& Cn = M->Nodes(Cv.Node);
+                FLOAT Q[2 * RdxMath::GrassPieceCorners];
+                UBOOL bOver = 1;
+                for (INT k = 0; k < Cn.NumVertices && bOver; k++)
                 {
-                    GGrassTriCount++;
-                    G.Count++;
+                    const FVector& V    = M->Points(M->Verts(Cn.iVertPool + k).pVertex);
+                    const FLOAT    Rise = V.Z - (Pl.W - Pl.X * V.X - Pl.Y * V.Y) / Pl.Z;
+                    bOver        = (Rise > 0.25f && Rise <= Blade) ? 1 : 0;
+                    Q[2 * k]     = V.X;
+                    Q[2 * k + 1] = V.Y;
+                }
+                if (!bOver)
+                    continue;
+                INT Made = 0;
+                for (INT p = 0; p < Pieces && Made >= 0; p++)
+                {
+                    const INT Got = RdxMath::GrassSubtract(CutPiece[At] + 2 * RdxMath::GrassPieceCorners * p,
+                                                           CutCount[At][p], Q, Cn.NumVertices,
+                                                           CutPiece[1 - At] + 2 * RdxMath::GrassPieceCorners * Made,
+                                                           CutCount[1 - At] + Made, RdxMath::GrassPieceMost - Made);
+                    Made = (Got < 0) ? -1 : Made + Got;
+                }
+                if (Made < 0)
+                {
+                    // Too many pieces: the lawn's piece whole again, as it was.
+                    CutRefused++;
+                    Pieces         = 1;
+                    At             = 0;
+                    bCut           = 0;
+                    CutCount[0][0] = Min((INT)Node.NumVertices, (INT)RdxMath::GrassPieceCorners);
+                    for (INT k = 0; k < CutCount[0][0]; k++)
+                    {
+                        const FVector& V = M->Points(M->Verts(Node.iVertPool + k).pVertex);
+                        CutPiece[0][2 * k]     = V.X;
+                        CutPiece[0][2 * k + 1] = V.Y;
+                    }
+                    break;
+                }
+                Pieces = Made;
+                At     = 1 - At;
+                bCut   = 1;
+            }
+            CutNodes  += bCut ? 1 : 0;
+            CutPieces += bCut ? Pieces : 0;
+            for (INT p = 0; p < Pieces; p++)
+            {
+                const FLOAT* const Pc = CutPiece[At] + 2 * RdxMath::GrassPieceCorners * p;
+                const INT          Nc = bCut ? CutCount[At][p] : Node.NumVertices;
+                // A cut piece's corners off the lawn's plane by X and Y; an uncut piece's the level's own.
+                auto Corner = [&](INT k)
+                {
+                    if (!bCut)
+                        return ToVec(M->Points(M->Verts(Node.iVertPool + k).pVertex));
+                    const FLOAT          X = Pc[2 * k], Y = Pc[2 * k + 1];
+                    const RdxMath::FVec3 V = { X, Y, (Pl.W - Pl.X * X - Pl.Y * Y) / Pl.Z };
+                    return V;
+                };
+                const RdxMath::FVec3 A = Corner(0);
+                for (INT k = 1; k + 1 < Nc; k++)
+                {
+                    if (GGrassTriCount >= TrisRoom)
+                    {
+                        const INT    Room = TrisRoom * 2 + 64;
+                        FLOAT* const More = (FLOAT*)appRealloc(GGrassTris, Room * 9 * sizeof(FLOAT), TEXT("RdxGrassTris"));
+                        if (!More)
+                            break;
+                        GGrassTris = More;
+                        TrisRoom   = Room;
+                    }
+                    if (RdxMath::GrassTriangle(A, Corner(k), Corner(k + 1), GGrassTris + 9 * GGrassTriCount))
+                    {
+                        GGrassTriCount++;
+                        G.Count++;
+                    }
                 }
             }
             if (G.Count > 0)
@@ -20439,6 +24862,9 @@ static void ReadLevelGrass(ULevel* Level)
         GGrassOf    = Of;
         GGrassFlush = GLevelFlushes;
     }
+    if (CutNodes > 0 || CutRefused > 0)
+        RDX_LOGF("grass: %i of the lawn's pieces have a floor laid on them within a blade's height - cut into %i pieces "
+                 "round it, no blade under it; %i left whole (too many pieces)", CutNodes, CutPieces, CutRefused);
     ReadLevelTufts(M);
     // Each triangle's tiles by row, for GrowGrass: worked out here once rather than tried tile by tile in every frame.
     const DOUBLE TRows   = appSeconds();
@@ -21119,10 +25545,10 @@ static void GrowGrass(FBackend& Backend, FSceneNode* Frame, FSurfaceFacet& Facet
                     if (Kept <= 0.5f)
                         continue;
                     INT Band = (Kept > 32.5f) ? 0 : (Kept > 16.5f) ? 1 : (Kept > 8.5f) ? 2 : (Kept > 4.5f) ? 3 : 4;
-                    // High: where its thinning leaves none of a root's blades beyond Low's even at the tile's nearest
-                    // point, the tile is drawn with Low's alone (bands 5..9, GSpare[1].y) - the same picture, a third of
-                    // the blades to lay.
-                    if (GRunGrass == RdxMath::Grass_High &&
+                    // Where the thinning leaves none of a root's blades beyond the grass as it was made even at the
+                    // tile's nearest point, the tile is drawn with those alone (bands 5..9, GSpare[1].y) - the same
+                    // picture, a third of the blades to lay.
+                    if (RdxMath::GrassThinFarOf(GRunGrass) > 1.0f &&
                         RdxMath::GrassKeep(NearD * RdxMath::GrassThinFarOf(GRunGrass) / Stretch) *
                                 (FLOAT)RdxMath::GrassTileRoots <= 0.5f)
                         Band += 5;
@@ -21280,11 +25706,18 @@ static void GrowGrass(FBackend& Backend, FSceneNode* Frame, FSurfaceFacet& Facet
 // no light of their own: the frame's lamps near the eye light them, so they are seen in a lamp's light and nowhere
 // else, as dust is. Once a frame, in the world's view, as a see-through run laid with the world's others.
 
-enum { DustCellsAcross = 32, DustCellsUp = 14, DustLampMax = 16 };
+// The grid reaches DustCellsAcross / 2 cells either way of the eye - as far as a lamp's light shows dust in the air
+// across a square or a street, not only round the feet.
+enum { DustCellsAcross = 64, DustCellsUp = 14 };
 static const FLOAT DustCell  = 32.0f;    // a cell's side, level units: one mote in each
 static const FLOAT DustSize  = 0.22f;    // a mote's half-width
 static const FLOAT DustGain  = 3.0f;     // how bright a mote in a lamp's full light is
 static const FLOAT DustDrift = 300.0f;   // the motes' drift, level units a second, at RdxMath's full wind
+// A mote's half-width on the screen is held between these: the least in pixels - a far one still a dot, as much
+// fainter as it is drawn larger than it is -, the most as a share of the screen's height - one right before the eye
+// is a fleck, not a blot over the view.
+static const FLOAT DustLeastPixels = 0.5f;
+static const FLOAT DustMostOfScreen = 0.002f;
 
 // The renderer's own pictures' chains and infos (the trees', below).
 static INT  MakeTreeChain(BYTE* Top, INT W, INT H, UBOOL bCoverage, FMipmapBase* Mips, BYTE*& Room);
@@ -21342,6 +25775,8 @@ struct FFrameLamp
 static FFrameLamp GFrameLamps[FrameLampRoom];
 static INT        GFrameLampCount = 0;
 static INT        GFrameLampFrame = -1;
+// Every one of the frame's lamps may light the dust: its block has room for them all (DustShader.h's GLamps).
+enum { DustLampRoom = FrameLampRoom };
 static void GatherFrameLamps(FSceneNode* Frame, INT EngineFrame)
 {
     if (GFrameLampFrame == EngineFrame)
@@ -21369,19 +25804,21 @@ static void GatherFrameLamps(FSceneNode* Frame, INT EngineFrame)
             Exchange(GFrameLamps[b], GFrameLamps[b - 1]);
 }
 
-// The dust under a roof. For each column of the dust's grid - a cell's side square, standing in the world - how high
-// the open air above it reaches: the first face a line straight up from the eye's height meets, unless it is the sky's
-// own; DustOpen where none is - a roof below everything, so that all of an open column's air is above it. Kept by
-// column in a ring the grid's size, a few columns read a frame (all that are new at once, when the eye has come far);
-// the shader shows a mote only above its column's roof, fading in over a step above it, the columns read between, so
-// a mote the wind carries under a roof fades as it goes.
+// The dust under a roof. For each column of the dust's grid - a cell's side square, standing in the world - whether its
+// air is open to the sky: a line straight up from the eye's height that meets no face, or the sky's own first, leaves it
+// open - DustOpen, a roof below everything, so that all of the column's air is above it; any other face shuts it whole
+// - DustShut, a roof above everything: over a ceiling there is as often the storey above as the sky, and a line that
+// begins in a wall is a wall's column. Kept by column in a ring the grid's size, a few columns read a frame (all that
+// are new at once, when the eye has come far); the shader shows a mote only above its column's roof, fading in over a
+// step above it, the columns read between, so a mote the wind carries in under a roof fades as it goes.
 enum { DustRoofReads = 48 };
 static const FLOAT DustOpen = -1.0e9f;
+static const FLOAT DustShut = 1.0e9f;
 struct FDustRoof
 {
     INT   X, Y;             // the column, in cells of the world
     FLOAT From;             // the height its line went up from
-    FLOAT Z;                // its roof's height, DustOpen for none
+    FLOAT Z;                // its roof's height: DustOpen or DustShut
     INT   Flush;            // the level's number when it was read (GLevelFlushes); -1: never
 };
 static FDustRoof GDustRoofs[DustCellsAcross * DustCellsAcross];
@@ -21396,9 +25833,9 @@ static FLOAT DustRoofAt(UModel* M, INT Cx, INT Cy, FLOAT From)
     FCheckResult  Hit(1.0f);
     if (M->LineCheck(Hit, nullptr, Start + FVector(0.0f, 0.0f, 4096.0f), Start, FVector(0.0f, 0.0f, 0.0f), 0))
         return DustOpen;
-    // A line that began in the solid: a wall's column, roofed at the eye's height.
+    // A line that began in the solid: a wall's column.
     if (!(Hit.Time > 0.0f))
-        return From;
+        return DustShut;
     if (Hit.Item >= 0 && Hit.Item < M->Nodes.Num())
     {
         const INT iSurf = M->Nodes(Hit.Item).iSurf;
@@ -21409,12 +25846,12 @@ static FLOAT DustRoofAt(UModel* M, INT Cx, INT Cy, FLOAT From)
                 return DustOpen;
         }
     }
-    return Hit.Location.Z;
+    return DustShut;
 }
 
 // The grid's columns' roofs for the frame, into Out (the grid's columns, x first): a column read already for this place
 // and height is kept; of the rest a few are read a frame - all of them when most are new - and the others count as
-// open till then.
+// shut till then: no dust where it is not known to be open.
 static void DustRoofs(UModel* M, const FVector& Eye, FLOAT* Out)
 {
     if (!GDustRoofsMade)
@@ -21437,7 +25874,7 @@ static void DustRoofs(UModel* M, const FVector& Eye, FLOAT* Out)
             const UBOOL bHere = (R.Flush == GLevelFlushes && R.X == Cx && R.Y == Cy);
             if (!bHere || Abs(R.From - Eye.Z) > 64.0f)
                 Stale[StaleCount++] = j * DustCellsAcross + i;
-            Out[j * DustCellsAcross + i] = bHere ? R.Z : DustOpen;
+            Out[j * DustCellsAcross + i] = bHere ? R.Z : DustShut;
         }
     const INT Reads = (StaleCount > DustCellsAcross * DustCellsAcross / 2) ? StaleCount : Min(StaleCount, (INT)DustRoofReads);
     for (INT k = 0; k < Reads; k++)
@@ -21533,11 +25970,12 @@ static void EmitDust(FBackend& Backend, FSceneNode* Frame, INT EngineFrame)
         return;
     }
     const FFrameLamp* const Near  = GFrameLamps;
-    const INT               Lamps = Min(Count, (INT)DustLampMax);
+    const INT               Lamps = Count;
     D3D12_GPU_VIRTUAL_ADDRESS Address = 0;
     const INT    Srv = Backend.PrepareTexture(GDustInfo, 0, 1);
     // The rows: the view, the screen, the eye, the grid, the wind, the lamps' count; the lamps; the roofs; the gusts.
-    enum { DustGustRow = 8 + 2 * DustLampMax + DustCellsAcross * DustCellsAcross / 4 };
+    enum { DustGustRow = 8 + 2 * DustLampRoom + DustCellsAcross * DustCellsAcross / 4 };
+    static_assert(DustGustRow + 1 <= RdxMath::GrassBlockRows, "the dust's block fits one constant buffer");
     FLOAT* const B   = (Srv >= 0) ? Backend.GrassBlock(DustGustRow + 1, Address) : nullptr;
     if (!B)
         return;
@@ -21588,8 +26026,9 @@ static void EmitDust(FBackend& Backend, FSceneNode* Frame, INT EngineFrame)
     B[27] = DustSize;
     B[28] = (FLOAT)Lamps;
     B[29] = GDustFade;
-    B[30] = B[31] = 0.0f;
-    for (INT k = 0; k < DustLampMax; k++)
+    B[30] = DustLeastPixels;
+    B[31] = Max(DustLeastPixels, DustMostOfScreen * Frame->FY);
+    for (INT k = 0; k < DustLampRoom; k++)
     {
         FLOAT* const Q = B + 32 + 8 * k;
         if (k < Lamps)
@@ -21608,10 +26047,10 @@ static void EmitDust(FBackend& Backend, FSceneNode* Frame, INT EngineFrame)
             for (INT c = 0; c < 8; c++)
                 Q[c] = 0.0f;
     }
-    DustRoofs(M, Eye, B + 32 + 8 * DustLampMax);
+    DustRoofs(M, Eye, B + 32 + 8 * DustLampRoom);
+    INT Open = 0;
     {
-        const FLOAT* const Roofs = B + 32 + 8 * DustLampMax;
-        INT Open = 0;
+        const FLOAT* const Roofs = B + 32 + 8 * DustLampRoom;
         for (INT c = 0; c < DustCellsAcross * DustCellsAcross; c++)
             Open += (Roofs[c] <= DustOpen) ? 1 : 0;
         GDustOpenSum += (DOUBLE)Open / (DOUBLE)(DustCellsAcross * DustCellsAcross);
@@ -21619,6 +26058,9 @@ static void EmitDust(FBackend& Backend, FSceneNode* Frame, INT EngineFrame)
         GDustDrawn++;
         SayDust();
     }
+    // No column open to the sky: every mote is under a roof, none shows.
+    if (Open == 0)
+        return;
     Backend.AddDustDraw(Address, DustCellsAcross * DustCellsAcross * DustCellsUp, Srv);
     static INT Said = 0;
     if ((EngineFrame % 600) == 0 || Said++ == 0)
@@ -21661,6 +26103,8 @@ static UBOOL IsSmallTreeSheet(const UTexture* T)
 // The game's own tree and bush pictures laid on the level's surfaces (DeusExDeco's Tree1Tex.. and Bushes1Tex..: a
 // mapper's tree of crossed sheets built into the level) - the kind each is grown again as (ReadLevelTrees); -1 for none.
 // Tree3's and Tree4's pictures are a crown down to their foot, no trunk under it: on a sheet a dense bush, grown as one.
+// Revision's long-stemmed flowers of a bed (RevTexFoliage's pflanzentex150, each a crossed pair of sheets) are grown
+// as shrub roses.
 static INT LevelPlantPictureKind(const UTexture* T)
 {
     if (!T)
@@ -21668,6 +26112,21 @@ static INT LevelPlantPictureKind(const UTexture* T)
     const UObject* Package = T->GetOuter();
     while (Package && Package->GetOuter())
         Package = Package->GetOuter();
+    if (Package && !appStricmp(Package->GetName(), TEXT("RevTexFoliage")) && !appStricmp(T->GetName(), TEXT("pflanzentex150")))
+        return RdxTree::Kind_Rose;
+    if (Package && !appStricmp(Package->GetName(), TEXT("RevTexFoliage")) && !appStricmp(T->GetName(), TEXT("pflanzentex152")))
+        return RdxTree::Kind_RoseYellow;
+    // The bed's other flowers and its ferns, grown stem by stem (RdxTree::StemPlant).
+    if (Package && !appStricmp(Package->GetName(), TEXT("RevTexFoliage")))
+    {
+        if (!appStricmp(T->GetName(), TEXT("pflanzentex149")))
+            return RdxTree::Kind_Lily;
+        if (!appStricmp(T->GetName(), TEXT("pflanzentex148")))
+            return RdxTree::Kind_Pink;
+        if (!appStricmp(T->GetName(), TEXT("pflanzentex143")) || !appStricmp(T->GetName(), TEXT("pflanzentex145")) ||
+            !appStricmp(T->GetName(), TEXT("pflanzentex146")))
+            return RdxTree::Kind_Fern;
+    }
     if (!Package || appStricmp(Package->GetName(), TEXT("DeusExDeco")) != 0)
         return -1;
     static const TCHAR* const Starts[] = { TEXT("Tree1Tex"), TEXT("Tree2Tex"), TEXT("Tree3Tex"), TEXT("Tree4Tex"),
@@ -21687,13 +26146,380 @@ static UBOOL FacetIsTreeSheets(const FSurfaceFacet& Facet);
 static INT   TreeSheetPlant(INT iNode);
 static void  NoteTreeSheetLight(INT i, const FTextureInfo& Map);
 
+// What the spherifier's rounding brings out of a polygon the engine does not draw: one turned away from the eye across a
+// soft edge from a polygon it draws - at a round shape's outline the part of it beside that edge bends round towards
+// the eye. Its pieces that face the eye are drawn in its own picture, mapped as its surface maps it (the level's own
+// numbers: SphereMapOf), and lit by the light of the polygon drawn beside it, read across the edge as the light maps'
+// blending reads it (SphereLightMake) - the edge's light carries on over the bend. Once a view for each such polygon.
+static RdxSphere::TList<int> GSphereBackStamp;          // a node: the view its bulge was last drawn in
+static INT                   GSphereBackView  = 0;
+static INT                   GSphereBackFrame = -1;
+static const FSceneNode*     GSphereBackNode  = nullptr;
+static INT                   GSphereBackDrawn = 0;      // pieces drawn since the log's last line
+static INT                   GSphereBackSaid  = -1;
+// The check of SphereMapOf against the engine's own mapping of the surfaces it draws: how many were compared, and the
+// most they differed by - texels at the polygon's first corner, and the mapping's axes.
+static INT   GSphereMapChecked = 0;
+static FLOAT GSphereMapOff = 0.0f, GSphereMapAxisOff = 0.0f;
+
+// Surface sf's texture mapping in the view's space, from the level's own numbers - as the engine maps a surface it
+// draws: the texture's axes, a place on its origin, and the pan.
+static void SphereMapOf(const UModel* M, INT sf, const FSceneNode* Frame, RdxMath::FVec3& AxisU, RdxMath::FVec3& AxisV,
+                        RdxMath::FVec3& Origin, FLOAT& PanU, FLOAT& PanV)
+{
+    const FBspSurf& S = M->Surfs(sf);
+    AxisU  = ToVec(M->Vectors(S.vTextureU).TransformVectorBy(Frame->Coords));
+    AxisV  = ToVec(M->Vectors(S.vTextureV).TransformVectorBy(Frame->Coords));
+    Origin = ToVec(M->Points(S.pBase).TransformPointBy(Frame->Coords));
+    PanU   = -(FLOAT)S.PanU;
+    PanV   = -(FLOAT)S.PanV;
+}
+
+// SphereMapOf checked against the mapping the engine hands over with a surface it draws (Map, Pan; the node n's), on the
+// first few hundred - its finding logged once.
+static void SphereMapCheck(const UModel* M, INT n, const FSceneNode* Frame, const FCoords& Map, const FVector& Pan,
+                           const FSavedPoly* Poly)
+{
+    if (GSphereMapChecked > 400 || n < 0 || n >= M->Nodes.Num() || !Poly || Poly->NumPts < 1 || !Poly->Pts[0])
+        return;
+    const INT sf = M->Nodes(n).iSurf;
+    if (sf < 0 || sf >= M->Surfs.Num() || (M->Surfs(sf).PolyFlags & (PF_AutoUPan | PF_AutoVPan)))
+        return;
+    RdxMath::FVec3 AxisU, AxisV, Origin;
+    FLOAT          PanU, PanV;
+    SphereMapOf(M, sf, Frame, AxisU, AxisV, Origin, PanU, PanV);
+    const RdxMath::FVec3 At = ToVec(Poly->Pts[0]->Point);
+    const FLOAT U0 = RdxMath::SurfaceCoord(ToVec(Map.XAxis), ToVec(Map.Origin), At, Pan.X);
+    const FLOAT V0 = RdxMath::SurfaceCoord(ToVec(Map.YAxis), ToVec(Map.Origin), At, Pan.Y);
+    const FLOAT U1 = RdxMath::SurfaceCoord(AxisU, Origin, At, PanU);
+    const FLOAT V1 = RdxMath::SurfaceCoord(AxisV, Origin, At, PanV);
+    GSphereMapOff     = Max(GSphereMapOff, Max(Abs(U0 - U1), Abs(V0 - V1)));
+    GSphereMapAxisOff = Max(GSphereMapAxisOff, Max((Map.XAxis - FVector(AxisU.X, AxisU.Y, AxisU.Z)).Size(),
+                                                   (Map.YAxis - FVector(AxisV.X, AxisV.Y, AxisV.Z)).Size()));
+    if (++GSphereMapChecked == 400)
+        RDX_LOGF("spherifier: the level's own texture mapping against the engine's, over 400 surfaces drawn - %.4f "
+                 "texels apart at most, the axes %.5f", GSphereMapOff, GSphereMapAxisOff);
+}
+
+// The bulges beside the engine's polygons of a facet drawn in the world's view or a mirror of the level's (Facet, its
+// pan Pan; LightSrv its light map, laid on by LMapU, LMapV, LMapOrigin, LPanU .. LInvV and held within LEdge).
+static void SphereBackBulges(FBackend& Backend, const FSceneNode* Frame, const FSurfaceFacet& Facet, const FVector& Pan,
+                             INT LightSrv,
+                             const RdxMath::FVec3& LMapU, const RdxMath::FVec3& LMapV, const RdxMath::FVec3& LMapOrigin,
+                             FLOAT LPanU, FLOAT LPanV, FLOAT LInvU, FLOAT LInvV, const FLOAT* LEdge, FLOAT OffX,
+                             FLOAT OffY, INT EngineFrame)
+{
+    UModel* const M = Frame->Level->Model;
+    if (!GSphere->bOn || M != GSphere->Model || !Frame->Viewport)
+        return;
+    const RdxSphere::FResult& R = GSphere->R;
+    if (R.PolySideCount.Num < GSphere->Nodes)
+        return;
+    if (GSphereBackFrame != EngineFrame || GSphereBackNode != Frame)
+    {
+        GSphereBackView++;
+        GSphereBackFrame = EngineFrame;
+        GSphereBackNode  = Frame;
+    }
+    if (GSphereBackStamp.Num != GSphere->Nodes)
+    {
+        if (!GSphereBackStamp.Resize(GSphere->Nodes))
+            return;
+        for (INT n = 0; n < GSphereBackStamp.Num; n++)
+            GSphereBackStamp[n] = -1;
+    }
+    const FVector Eye = Frame->Coords.Origin;
+    // Made once: its arrays' constructors are calls into Core.dll, and this is asked of every facet drawn.
+    static FSpherePiece Piece;
+    for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+    {
+        const INT p = Poly->iNode;
+        if (Poly->User == (void*)&GRingTag || !SphereNodeTris(M, p))
+            continue;
+        SphereMapCheck(M, p, Frame, Facet.MapCoords, Pan, Poly);
+        for (INT s = R.PolySideFirst[p]; s < R.PolySideFirst[p] + R.PolySideCount[p]; s++)
+        {
+            const RdxSphere::FLightSide& Sd = R.LightSides[s];
+            for (INT k = Sd.PartFirst; k < Sd.PartFirst + Sd.PartCount; k++)
+            {
+                const RdxSphere::FLightPart& Pt = R.LightParts[k];
+                const INT                    q  = Pt.Other;
+                if (q < 0 || q >= GSphereBackStamp.Num || GSphereBackStamp[q] == GSphereBackView || !SphereNodeTris(M, q))
+                    continue;
+                const FBspNode& Nq = M->Nodes(q);
+                if (Nq.Plane.PlaneDot(Eye) >= 0.0f || Nq.iSurf < 0 || Nq.iSurf >= M->Surfs.Num())
+                    continue;
+                GSphereBackStamp[q] = GSphereBackView;
+                // Its picture: drawn solid or masked, not panning by itself, not seen from both sides (the engine
+                // draws such a one), and lit where the polygon beside it is.
+                const FBspSurf& Sq  = M->Surfs(Nq.iSurf);
+                UTexture*       Tex = Sq.Texture;
+                if (!Tex)
+                    continue;
+                const DWORD Flags = Sq.PolyFlags | Tex->PolyFlags;
+                if ((Flags & (PF_TwoSided | PF_AutoUPan | PF_AutoVPan | PF_SmallWavy | PF_BigWavy | PF_Invisible |
+                              PF_Portal | PF_Mirrored | PF_FakeBackdrop)) ||
+                    RdxMath::BlendFor((unsigned int)Flags) != RdxMath::Blend_Opaque ||
+                    (LightSrv < 0 && !(Flags & PF_Unlit)))
+                    continue;
+                Tex = Tex->Get(Frame->Viewport->CurrentTime);
+                FTextureInfo Info;
+                Tex->Lock(Info, Frame->Viewport->CurrentTime, -1, Frame->Viewport->RenDev);
+                const INT Srv = Backend.PrepareTexture(Info, Flags, RdxMath::SamplesAsColour(RdxMath::Blend_Opaque));
+                // Its pieces from its node's block, their corners in the view turned once for them all.
+                const FPieceBlock* const Block = (Srv >= 0) ? SpherePieceBlock(Frame, q) : nullptr;
+                if (Block && PieceCornersInView(Frame, Block))
+                {
+                    RdxMath::FVec3 AxisU, AxisV, Origin;
+                    FLOAT          PanU, PanV;
+                    SphereMapOf(M, Nq.iSurf, Frame, AxisU, AxisV, Origin, PanU, PanV);
+                    const FLOAT InvU = 1.0f / RdxMath::LightDivisor(Info.UScale, Info.USize);
+                    const FLOAT InvV = 1.0f / RdxMath::LightDivisor(Info.VScale, Info.VSize);
+                    const FLOAT Gain = ((LightSrv >= 0 && !(Flags & PF_Unlit)) ? RdxMath::LightGain() : 1.0f) *
+                                       RdxMath::EmissiveBoost((RdxMath::EHdrMode)Backend.GetHdrRunning(),
+                                                              (unsigned int)Flags);
+                    const INT   Light = (Flags & PF_Unlit) ? -1 : LightSrv;
+                    const EBlendMode Mode = SurfaceBlendModeFor(Flags);
+                    const UBOOL      bNoSmooth = (Flags & PF_NoSmooth) ? 1 : 0;
+                    // Across the edge: a place of the polygon as far along the side and as far into the polygon drawn.
+                    const FVector A((FLOAT)Sd.A.X, (FLOAT)Sd.A.Y, (FLOAT)Sd.A.Z);
+                    const FVector B((FLOAT)Sd.B.X, (FLOAT)Sd.B.Y, (FLOAT)Sd.B.Z);
+                    const FVector IntoP((FLOAT)Sd.Into.X, (FLOAT)Sd.Into.Y, (FLOAT)Sd.Into.Z);
+                    const FVector IntoQ((FLOAT)Pt.Into.X, (FLOAT)Pt.Into.Y, (FLOAT)Pt.Into.Z);
+                    const FLOAT   Long = (B - A).Size();
+                    const FVector Dir  = (Long > 1e-3f) ? (B - A) / Long : FVector(0.0f, 0.0f, 0.0f);
+                    const FLOAT   Deep = 2.0f * (FLOAT)Pt.Reach;
+                    alignas(8) BYTE Head[sizeof(FSavedPoly) + sizeof(FTransform*)];
+                    FSavedPoly&     Own = *(FSavedPoly*)Head;
+                    Own.Next   = nullptr;
+                    Own.iNode  = q;
+                    Own.User   = nullptr;
+                    Own.NumPts = 0;
+                    const FVector          Nf = Nq.Plane;
+                    const FLOAT* const     Cs = PieceCorners(Block);
+                    const FPieceTri* const Ts = PieceTris(Block);
+                    for (INT t = 0; t < Block->Tris; t++)
+                    {
+                        const FPieceTri&   Tr = Ts[t];
+                        const FLOAT* const C0 = Cs + 6 * Tr.Corner[0];
+                        const FLOAT* const C1 = Cs + 6 * Tr.Corner[1];
+                        const FLOAT* const C2 = Cs + 6 * Tr.Corner[2];
+                        const FVector      W0(C0[0], C0[1], C0[2]), W1(C1[0], C1[1], C1[2]), W2(C2[0], C2[1], C2[2]);
+                        // Only what faces the eye: the moved piece's normal, the polygon's way round.
+                        FVector N = (W1 - W0) ^ (W2 - W0);
+                        if ((N | Nf) < 0.0f)
+                            N = -N;
+                        if (((Eye - W0) | N) <= 0.0f)
+                            continue;
+                        RdxMath::FVec3 P[3], O[3];
+                        FLOAT          Turn[3];
+                        for (INT k = 0; k < 3; k++)
+                        {
+                            P[k]    = GPieceView[Tr.Corner[k] * 2];
+                            O[k]    = GPieceView[Tr.Corner[k] * 2 + 1];
+                            Turn[k] = Tr.Turn;
+                        }
+                        if (!SpherePieceInView(Frame, &Own, P, O, Turn, Piece))
+                            continue;
+                        const FSavedPoly& Cut = Piece.Poly();
+                        FSolidVertex      Verts[8];
+                        for (INT i = 0; i < Cut.NumPts; i++)
+                        {
+                            const FTransform& P = *Cut.Pts[i];
+                            Verts[i].X     = P.ScreenX + OffX;
+                            Verts[i].Y     = P.ScreenY + OffY;
+                            Verts[i].Depth = RdxMath::DepthFromViewZ(P.Point.Z);
+                            const RdxMath::FVec3 At = ToVec(Piece.Was[i]);
+                            Verts[i].U = RdxMath::SurfaceCoord(AxisU, Origin, At, PanU) * InvU;
+                            Verts[i].V = RdxMath::SurfaceCoord(AxisV, Origin, At, PanV) * InvV;
+                            const FVector Lw = Piece.Was[i].TransformPointBy(Frame->Uncoords);
+                            const FVector Mirror = A + Dir * ((Lw - A) | Dir) + IntoP * Clamp((Lw - A) | IntoQ, 0.0f, Deep);
+                            const RdxMath::FVec3 Lv = ToVec(Mirror.TransformPointBy(Frame->Coords));
+                            Verts[i].LU = Clamp(RdxMath::SurfaceCoord(LMapU, LMapOrigin, Lv, LPanU) * LInvU, LEdge[0], LEdge[2]);
+                            Verts[i].LV = Clamp(RdxMath::SurfaceCoord(LMapV, LMapOrigin, Lv, LPanV) * LInvV, LEdge[1], LEdge[3]);
+                            Verts[i].R = Verts[i].G = Verts[i].B = Gain;
+                            Verts[i].A = 1.0f;
+                        }
+                        Backend.AddFan(Verts, Cut.NumPts, Srv, Light, Mode, bNoSmooth);
+                        GSphereBackDrawn++;
+                    }
+                }
+                Tex->Unlock(Info);
+            }
+        }
+    }
+    if (EngineFrame - GSphereBackSaid >= 600 || EngineFrame < GSphereBackSaid)
+    {
+        if (GSphereBackSaid >= 0 && GSphereBackDrawn)
+            RDX_LOGF("spherifier: %i pieces of polygons turned away drawn over the last %i frames, where the rounding "
+                     "brings them out beside the polygons drawn", GSphereBackDrawn, EngineFrame - GSphereBackSaid);
+        GSphereBackSaid  = EngineFrame;
+        GSphereBackDrawn = 0;
+    }
+}
+
+// The walk's decal (FPolyWalk::Decal), and DrawComplexSurface's piece and relief axes, made once: their arrays of the
+// engine's FVector are made element by element through calls into Core.dll - two of them hundreds long - and made on
+// the stack they were made again for every surface drawn. One surface is drawn at a time; each is filled before it is
+// read.
+static FSphereDecal GWalkDecal;
+static FSpherePiece GWalkPiece;
+static FVector      GWalkPomWorld[3];
+
+// The piece a walk is at, wherever it was made (FSpherePiece's, FAheadPiece's): where its corners' pictures are read,
+// their turns, and the cosine and sine of the turn they share where it has them.
+struct FWalkPiece
+{
+    const FVector* Was     = nullptr;
+    const FLOAT*   Turn    = nullptr;
+    UBOOL          bTrig   = 0;
+    FLOAT          TrigFor = 0.0f;
+    const FLOAT*   Trig    = nullptr;
+};
+
+// A facet's polygons one by one, as the engine hands them over - and where the spherifier moved a polygon's node, the
+// pieces of it that are in view in its place (SpherePiece, or made ahead: TakePieceJob), each one as the engine's
+// polygon would be. The sea's ring is the renderer's own and never rounded.
+struct FPolyWalk
+{
+    const FSurfaceInfo* Surface = nullptr;
+    const FSavedPoly*   Engine  = nullptr;  // the engine's polygon now
+    INT                 Rounded = 0;        // its pieces; none: the polygon itself
+    INT                 Pc      = 0;        // which of them now
+    UBOOL               bDecal  = 0;        // they are a decal's on a moved node (FSphereDecal), not the node's own
+    FSphereDecal&       Decal   = GWalkDecal;
+    const FPieceJob*    Job     = nullptr;  // the node's pieces made ahead, or none
+    UBOOL               bAhead  = 0;        // the pieces made ahead are this view's (PieceJobsFor)
+    INT                 ListIn  = -1;       // the frame the world view's rounded nodes are listed in; -1: not listed
+    FWalkPiece          Piece;              // the piece the walk is at
+
+    // The view the walk goes through: whether the pieces made ahead are its own, and whether it is the world view, whose
+    // rounded nodes the next frame makes ahead.
+    void InView(const FSceneNode* Frame, INT EngineFrame, UBOOL bWorld)
+    {
+        bAhead = PieceJobsFor(Frame, EngineFrame);
+        ListIn = (bWorld && GSphere->bOn && PieceNodesReady()) ? EngineFrame : -1;
+    }
+    const FSavedPoly* Begin(const FSceneNode* Frame, const FSurfaceInfo& Drawn, const FSavedPoly* First)
+    {
+        Surface = &Drawn;
+        Engine  = First;
+        return Enter(Frame);
+    }
+    const FSavedPoly* Step(const FSceneNode* Frame)
+    {
+        if (Rounded)
+            for (Pc++; Pc < Rounded; Pc++)
+                if (const FSavedPoly* const Made = Make(Frame))
+                    return Made;
+        Engine = Engine ? Engine->Next : nullptr;
+        return Enter(Frame);
+    }
+    // A piece of the node's own, whose corners carry the surface's turn (FSpherePiece::Turn).
+    UBOOL IsPiece() const { return Rounded > 0 && !bDecal; }
+    // A piece the spherifier made, the node's own or a decal's: its corners carry where they were (FSpherePiece::Was).
+    UBOOL IsMade() const { return Rounded > 0; }
+    // The engine's polygon the walk is at - a piece's own, whole and where the engine has it.
+    const FSavedPoly* EnginePoly() const { return Engine; }
+
+private:
+    // Piece Pc of the polygon Engine: its polygon, or null - nothing of it is left to draw.
+    const FSavedPoly* Make(const FSceneNode* Frame)
+    {
+        FSpherePiece& Own = GWalkPiece;
+        if (bDecal)
+        {
+            // A decal's picture is read as its surface's is (SphereReadAt).
+            static const FLOAT NoTurn[3] = { 0.0f, 0.0f, 0.0f };
+            if (!SpherePieceOf(Frame, Engine, &Decal.Tri[Pc * 3], &Decal.Was[Pc * 3], NoTurn, SphereDecalLift, Own))
+                return nullptr;
+        }
+        else if (Job && GPieceAhead[Job->First + Pc].Poly().NumPts >= 0)
+        {
+            GSphereMade += 1.0;
+            FAheadPiece& S = GPieceAhead[Job->First + Pc];
+            if (S.Poly().NumPts == 0)
+                return nullptr;
+            S.Poly().User = Engine->User;
+            Piece.Was     = S.Was;
+            Piece.Turn    = S.Turn;
+            Piece.bTrig   = 1;
+            Piece.TrigFor = S.TrigFor;
+            Piece.Trig    = S.Trig;
+            return &S.Poly();
+        }
+        else if (!SpherePiece(Frame, Engine, Pc, Own))
+            return nullptr;
+        Piece.Was     = Own.Was;
+        Piece.Turn    = Own.Turn;
+        Piece.bTrig   = Own.bTrig;
+        Piece.TrigFor = Own.TrigFor;
+        Piece.Trig    = Own.Trig;
+        return &Own.Poly();
+    }
+    // The polygon Engine itself, or the first of its pieces in view - and on past it where none is.
+    const FSavedPoly* Enter(const FSceneNode* Frame)
+    {
+        for (; Engine; Engine = Engine->Next)
+        {
+            Rounded = (Engine->User == (void*)&GRingTag) ? 0 : SphereTris(Frame, Engine);
+            bDecal  = 0;
+            Job     = nullptr;
+            if (!Rounded)
+                return Engine;
+            if (!SphereOwnSurface(Surface, Frame->Level->Model, Engine->iNode))
+            {
+                SphereDecalOf(Frame, Engine, Decal);
+                Rounded = Decal.Count;
+                bDecal  = 1;
+            }
+            else
+            {
+                if (ListIn >= 0)
+                    NotePieceDrawn(Engine->iNode, ListIn);
+                if (bAhead)
+                    Job = TakePieceJob(Engine->iNode);
+            }
+            for (Pc = 0; Pc < Rounded; Pc++)
+                if (const FSavedPoly* const Made = Make(Frame))
+                    return Made;
+        }
+        Rounded = 0;
+        bDecal  = 0;
+        Job     = nullptr;
+        return nullptr;
+    }
+};
+
 void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet)
 {
     NoteDraw(Frame, 0);
-    FDrawTimer Timer(0);
+    GSpherePieceFrame = FrameCounter;
+    if (Frame)
+        CheckTransformAll(Frame->Coords, FrameCounter);
+    FDrawTimer       Timer(0);
+    FSphereSurfTimer SphereTimer;
+    RoundRelease(Backend);
     FlushMeshFog(Backend);
     if (Frame && Frame->Parent)
         NoteChildView(Backend, Frame, FrameCounter);
+    // The spherifier's rounding of this level, made when it is first drawn if the shadows' level has not made it
+    // first: then that level is made again, with the walls where they are drawn.
+    if (Frame && Frame->Level && EnsureSphere(Backend, Frame->Level))
+        ForgetShadowLevel();
+    // And the relief's copy of the rounding (DSRelief), made again whenever the rounding drawn has changed.
+    if (Backend.SphereFieldGen() != GSphereGen)
+    {
+        // The words are the backend's own once handed over: it takes the list's block.
+        RdxSphere::TList<unsigned int> Words;
+        if (GSphere->bOn && RdxLevelRound::PackRound(GSphere->R, Words))
+        {
+            const INT Count = Words.Num;
+            Backend.TakeSphereField((DWORD*)Words.Release(), Count, GSphereGen);
+        }
+        else
+            Backend.SetSphereField(nullptr, 0, GSphereGen);
+    }
 
     // The world's view for the shadow maps: this frame's first BSP surface of a node without a parent. From here on the
     // depth buffer drawn into holds the world (FBackend::MarkWorldStart).
@@ -21794,7 +26620,15 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
         if (iSurf >= 0 && Backend.CanFireVolumes() &&
             RdxMath::BlendFor((unsigned int)Surface.PolyFlags) == RdxMath::Blend_Translucent &&
             OfferLevelFire(Backend, Frame, iSurf, FrameCounter, SheetView == FlameView_Mirror))
+        {
+            // The mirror rays still pass the sheet as the level draws it (RtThinOver), with its texture as the texture
+            // heap holds it - a fire that draws itself, which only a draw brings up to date: brought up to date here
+            // as the sheet's own draw would, or the mirrored flame stands still.
+            if (Backend.WantsRtSurfaceTexture())
+                Backend.PrepareTexture(*Surface.Texture, Surface.PolyFlags,
+                                       RdxMath::SamplesAsColour(RdxMath::Blend_Translucent));
             return;
+        }
     }
     // EndlessWater: the black walls at the sea's edge (RdxWaterIsSeaEdge) are not drawn in the world's view - the ring
     // runs on behind them, and the sky zone shows above it, as it does above the walls' tops. In a camera's window
@@ -21862,8 +26696,8 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     if (bWaterRun)
     {
         Backend.GetRippleOrigin(WaterConsts[18], WaterConsts[19]);
-        // The mirror image, with the reflections on.
-        WaterConsts[32] = RdxMath::ReflectionsHasMirror(Backend.GetReflections()) ? 1.0f : 0.0f;
+        // The mirror image by the reflections' level: the glints and the far image at Low, half the steps at Medium.
+        WaterConsts[32] = RdxMath::WaterMirrorSwitch(Backend.GetReflections());
         // Lifted, never lowered; and a quarter of how thick the rain is falling into the water (WaterRainRings takes
         // the two apart).
         WaterConsts[33] = (bSludge ? 1.0f : 0.0f) + 0.25f * RdxWaterRainThick();
@@ -21899,6 +26733,23 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     // Water=Low and up: a waterfall (IsFallSurface) as falling water over the water's copy of the picture (BLEND_Fall).
     // Water=Off - and so Vanilla - leaves it the modulated sheet it was.
     const UBOOL bFallRun = (!bWaterRun && Backend.GetWater() > 0 && IsFallSurface(Frame, Surface, Facet)) ? 1 : 0;
+    // A wet floor (WetKindOfSurface) is drawn wet from here on - its relief's patches too - until the surface is done.
+    const RdxMath::EWetKind WetListed = (IsWorldView(Frame, FrameCounter) && !GHud.bSwitched)
+                                      ? WetKindOfTexture(Surface.Texture->Texture) : RdxMath::Wet_None;
+    const RdxMath::EWetKind WetKind = (bWaterRun || bFallRun) ? RdxMath::Wet_None
+                                    : WetKindOfSurface(Frame, Facet, Surface.PolyFlags, WetListed);
+    const FWetSurfaceScope  WetScope(Backend, WetKind);
+    // Where the rays run, the wet floors' water is traced (FBackend::AddWetLayer): its layer added with the frame's first
+    // wet floor - laid over the world's solid runs, wherever in the frame it is added.
+    static INT WetLayerFrame = -1;
+    if ((WetKind == RdxMath::Wet_Stone || WetKind == RdxMath::Wet_Metal) && WetLayerFrame != FrameCounter &&
+        Backend.IsRtMirrorRunning())
+    {
+        WetLayerFrame = FrameCounter;
+        FLOAT Consts[FSolidPass::WATER_CONSTANTS];
+        WetLayerConstants(Frame, Consts);
+        Backend.AddWetLayer(Consts);
+    }
     FFallSheet* FallAt   = nullptr;
     if (bFallRun)
     {
@@ -22044,6 +26895,10 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                 LMaxU = ((FLOAT)LitU - 0.5f) / (FLOAT)L.USize;
                 LMaxV = ((FLOAT)LitV - 0.5f) / (FLOAT)L.VSize;
             }
+            // Where the spherifier rounded the level, the light across the soft edges blended in (SphereLightBlend).
+            const INT Blended = SphereLightBlend(Backend, Frame, L, Facet, LPanU, LPanV, LInvU, LInvV, FrameCounter);
+            if (Blended >= 0)
+                LightSrv = Blended;
         }
     }
 
@@ -22083,6 +26938,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
         const INT      Node  = Facet.Polys->iNode;
         const INT      Surf  = (Node >= 0 && Node < Model->Nodes.Num()) ? Model->Nodes(Node).iSurf : -1;
         const FTextureInfo& L = *Surface.LightMap;
+        NoteLampMapLight(Surf, L, Gain);
         if (Surf >= 0 && Backend.WantsRtSurfaceLight(Surf, L.CacheID) && L.Format == TEXF_RGBA7 && L.NumMips > 0 &&
             L.Mips[0] && L.Mips[0]->DataPtr)
             Backend.SetRtSurfaceLight(Surf, L.CacheID,
@@ -22212,10 +27068,31 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             // the flat surface is drawn after them, a hair further back, and shows only where they leave a crack -
             // with the same texture in the same place, so a crack does not show.
             const UBOOL bMirrorRelief = IsLevelMirrorView(Frame);
+            // A surface the spherifier rounded: its patches are laid out on the level's own polygons, as every
+            // surface's are, and moved on the card as its polygons are (DSRelief, SphereMoveAt) - its held edges and
+            // rim bands stay the level's.
+            UBOOL bRounded = 0;
+            INT   RoundNodes[FSolidPass::SPHERE_NODES], RoundNodeCount = 0;
+            for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+                if (Poly->User != (void*)&GRingTag && SphereTris(Frame, Poly) &&
+                    SphereOwnSurface(&Surface, Frame->Level->Model, Poly->iNode))
+                {
+                    bRounded = 1;
+                    UBOOL bListed = 0;
+                    for (INT k = 0; k < Min(RoundNodeCount, (INT)FSolidPass::SPHERE_NODES) && !bListed; k++)
+                        bListed = RoundNodes[k] == Poly->iNode;
+                    if (!bListed)
+                    {
+                        if (RoundNodeCount < FSolidPass::SPHERE_NODES)
+                            RoundNodes[RoundNodeCount] = Poly->iNode;
+                        RoundNodeCount++;
+                    }
+                }
             if (GRunGeometry == RdxMath::Geometry_Tess && (ReliefDrawsInView(Frame, FrameCounter) || bMirrorRelief) &&
                 SurfaceMode == BLEND_Opaque && Backend.CanTessellate())
             {
                 GReliefMirrorRaised += bMirrorRelief ? 1 : 0;
+                GReliefRoundRaised += bRounded ? 1 : 0;
                 // All of the surface's polygons first: which edges they share with each other decides what may stand
                 // out and what has to stay on the wall (RdxMath::ReliefSharedEdges).
                 static INT PatchFrame = -1;
@@ -22273,7 +27150,11 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         if (GReliefMirrorRaised > 0)
                             RDX_LOGF("relief tessellation: %i surfaces raised in mirrors' views since the last such line",
                                      GReliefMirrorRaised);
+                        if (GReliefRoundRaised > 0)
+                            RDX_LOGF("relief tessellation: %i surfaces raised on the spherifier's rounding since the last "
+                                     "such line", GReliefRoundRaised);
                         GReliefMirrorRaised = 0;
+                        GReliefRoundRaised  = 0;
                     }
                     GReliefListWorstFrame = Max(GReliefListWorstFrame, GReliefListFrame);
                     GReliefListFrame      = 0.0;
@@ -22311,12 +27192,16 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                 static int            Starts[MaxPolys], Counts[MaxPolys];
                 static bool           Shared[MaxPoints];
                 static bool           Made[MaxPoints];       // the edge was made by the cut to the widened view
+                static INT            OutlineRec[MaxPoints]; // the edge's outline record in the rounding, -1 none
                 static bool           EdgeHeld[MaxPoints];
                 static INT            NodeOf[MaxPolys];      // the node whose own polygon it is, INDEX_NONE for a piece
+                static INT            NodeWas[MaxPolys];     // the node the engine handed it over for
+                static bool           StillOf[MaxPolys];     // drawn where the level has it: not rounded by the spherifier
                 INT   NumPolys = 0, NumPts = 0;
                 UBOOL bFits    = 1;
-                // How far outside the view the polygons are cut: the relief's whole height, and a unit to spare.
-                const FLOAT Margin = Depth + 1.0f;
+                // How far outside the view the polygons are cut: the relief's whole height, and a unit to spare - and
+                // where the spherifier rounds them, as far again as it moves anything.
+                const FLOAT Margin = Depth + 1.0f + (bRounded ? (FLOAT)GSphere->Cap : 0.0f);
                 for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
                 {
                     const INT Num = Poly->NumPts;
@@ -22349,19 +27234,24 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         GReliefNodeOff  = 0.0f;
                         GReliefNodeTold = FrameCounter;
                     }
+                    // Each edge's outline record in the rounding (ReliefOutlineRecs): where the spherifier rounds the
+                    // polygon, the relief's outline goes along the sides its pieces are drawn with.
+                    ReliefOutlineRecs(Frame, Poly, bRounded, Got, &OutlineRec[NumPts]);
                     // In a mirror's view, only its part beyond the mirror's plane - and then it is the node's own
                     // polygon no longer: its edges are not the ones the level's record tells of.
                     bool bCut = false;
                     if (Got >= 3 && bMirrorRelief)
                     {
-                        Got = ReliefCutAlongMirror(Frame, Poly, &Pts[NumPts], &Made[NumPts], Got, MaxPoints - NumPts);
+                        Got = ReliefCutAlongMirror(Frame, Poly, &Pts[NumPts], &Made[NumPts], &OutlineRec[NumPts], Got,
+                                                   MaxPoints - NumPts);
                         // Nothing of it lies beyond the mirror: it has no patch in this view.
                         if (Got < 0)
                             continue;
                         for (INT i = 0; i < Got; i++)
                             bCut = bCut || Made[NumPts + i];
                     }
-                    NodeOf[NumPolys] = (Got >= 3 && !bCut) ? Poly->iNode : INDEX_NONE;
+                    NodeOf[NumPolys]  = (Got >= 3 && !bCut) ? Poly->iNode : INDEX_NONE;
+                    NodeWas[NumPolys] = Poly->iNode;
                     if (Got >= 3)
                         GReliefWhole++;
                     else
@@ -22369,13 +27259,16 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         GReliefPieces++;
                         for (INT i = 0; i < Num; i++)
                         {
-                            Pts[NumPts + i]  = ToVec(Poly->Pts[i]->Point);
-                            Made[NumPts + i] = false;
+                            Pts[NumPts + i]        = ToVec(Poly->Pts[i]->Point);
+                            Made[NumPts + i]       = false;
+                            OutlineRec[NumPts + i] = -1;
                         }
                         Got = Num;
                     }
-                    Starts[NumPolys] = NumPts;
-                    Counts[NumPolys] = Got;
+                    Starts[NumPolys]  = NumPts;
+                    Counts[NumPolys]  = Got;
+                    StillOf[NumPolys] = !(Poly->User != (void*)&GRingTag && SphereTris(Frame, Poly) &&
+                                          SphereOwnSurface(&Surface, Frame->Level->Model, Poly->iNode));
                     NumPolys++;
                     NumPts += Got;
                 }
@@ -22586,6 +27479,22 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                                      T.Texture ? T.Texture->Scale : 0.0f, T.Texture ? T.Texture->USize : 0,
                                      T.Texture ? T.Texture->VSize : 0, T.Texture ? ReliefRepeatU(T.Texture) : 0.0f,
                                      T.UScale * (FLOAT)T.USize);
+                            // Whose outline goes along the pieces' sides (ReliefOutlineRecs), and of the rest, which
+                            // nodes are drawn as the engine's pieces and which have no record.
+                            FString Pieces, NoRec;
+                            INT     WithRec = 0;
+                            for (INT q = 0; q < NumPolys; q++)
+                            {
+                                if (OutlineRec[Starts[q]] >= 0)
+                                    WithRec++;
+                                else if (NodeOf[q] == INDEX_NONE)
+                                    Pieces += FString::Printf(TEXT(" %i"), NodeWas[q]);
+                                else
+                                    NoRec += FString::Printf(TEXT(" %i"), NodeWas[q]);
+                            }
+                            RDX_LOGF("relief why:   outlines on the pieces' sides: %i of %i polygons; the engine's pieces "
+                                     "of nodes:%s; nodes with no record:%s", WithRec, NumPolys,
+                                     Pieces.Len() ? *Pieces : TEXT(" -"), NoRec.Len() ? *NoRec : TEXT(" -"));
                         }
                     }
                     for (INT q = 0; bWhyNow && q < NumPolys; q++)
@@ -22728,13 +27637,19 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                     }
                     else
                         Held = -1;
-                    if (Held > 0)
+                    // The spherifier's rows go in the same block - one is made for them even with no held edges.
+                    FLOAT Sphere[FSolidPass::SPHERE_FLOATS];
+                    if (bRounded)
+                        SphereRowsOf(Frame, (LightSrv >= 0 && InvU != 0.0f) ? LInvU / InvU : 0.0f,
+                                     (LightSrv >= 0 && InvV != 0.0f) ? LInvV / InvV : 0.0f, RoundNodes, RoundNodeCount,
+                                     Sphere);
+                    if (Held > 0 || bRounded)
                     {
-                        TessBlock = Backend.SetReliefHeld(Ends, Held);
-                        GReliefBlocks += TessBlock ? 1 : 0;
+                        TessBlock = Backend.SetReliefHeld(Ends, Max(Held, 0), bRounded ? Sphere : nullptr);
+                        GReliefBlocks += (TessBlock && Held > 0) ? 1 : 0;
                         GReliefMostHeld = Max(GReliefMostHeld, Held);
                     }
-                    else if (Held < 0)
+                    if (Held < 0)
                         GReliefOverfull++;
                     GReliefSecHeld += appSeconds() - HeldT0;
                     const UBOOL bNoSmooth = (Surface.PolyFlags & PF_NoSmooth) ? 1 : 0;
@@ -22753,8 +27668,13 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         // The polygon's corners, in view space - a relief run's vertices carry the place itself, not
                         // its projection - with the same coordinates the flat surface gets below, and each one's
                         // distance to the nearest held edge (the shader's rim band). Around them, from the middle, one
-                        // patch per edge of the polygon.
+                        // patch per edge of the polygon. On a polygon of a rounded surface that the spherifier left
+                        // where it was, the direction to lift along is ReliefStillScale long: DSRelief then leaves its
+                        // patches where they are, as its flat surface below is drawn - the field there is its rounded
+                        // neighbours'.
+                        const FLOAT DirScale = (bRounded && StillOf[p]) ? ReliefStillScale : 1.0f;
                         FSolidVertex Corner[MAX_POLY_POINTS];
+                        FLOAT        EdgeA[MAX_POLY_POINTS];
                         FSolidVertex Mid;
                         appMemzero(&Mid, sizeof(Mid));
                         for (INT i = 0; i < Num; i++)
@@ -22771,11 +27691,12 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                             V.R     = Gain;
                             V.G     = Gain;
                             V.B     = Gain;
-                            V.A     = 1.0f;
+                            V.A     = -1.0f;
                             V.PX    = RimAt[S + i];
-                            V.PY    = DirAt[S + i].X;
-                            V.PN    = DirAt[S + i].Y;
-                            V.PD    = DirAt[S + i].Z;
+                            V.PY    = DirAt[S + i].X * DirScale;
+                            V.PN    = DirAt[S + i].Y * DirScale;
+                            V.PD    = DirAt[S + i].Z * DirScale;
+                            EdgeA[i] = ReliefEdgeA(OutlineRec[S + i]);
                             Mid.X += V.X;   Mid.Y += V.Y;   Mid.Depth += V.Depth;
                             Mid.U += V.U;   Mid.V += V.V;   Mid.LU    += V.LU;    Mid.LV += V.LV;
                         }
@@ -22785,7 +27706,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         Mid.R   = Gain;
                         Mid.G   = Gain;
                         Mid.B   = Gain;
-                        Mid.A   = 1.0f;
+                        Mid.A   = -1.0f;
                         Mid.PX = RimMid[p];
                         {
                             FVector MidDir(0.0f, 0.0f, 0.0f);
@@ -22793,13 +27714,13 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                                 MidDir += DirAt[S + i];
                             const FLOAT Len = MidDir.Size();
                             MidDir = (Len > 1e-4f) ? MidDir / Len : FVector(Normal.X, Normal.Y, Normal.Z);
-                            Mid.PY = MidDir.X;
-                            Mid.PN = MidDir.Y;
-                            Mid.PD = MidDir.Z;
+                            Mid.PY = MidDir.X * DirScale;
+                            Mid.PN = MidDir.Y * DirScale;
+                            Mid.PD = MidDir.Z * DirScale;
                         }
                         // Most polygons need no halving at all, and are written straight out.
-                        const INT Whole = ReliefEmitWholeFan(Backend, Mid, Corner, Num, Frame->Proj.Z, Edge, Depth, Srv,
-                                                             LightSrv, SurfaceMode, bNoSmooth, ViewN, ViewD);
+                        const INT Whole = ReliefEmitWholeFan(Backend, Mid, Corner, EdgeA, Num, Frame->Proj.Z, Edge,
+                                                             Depth, Srv, LightSrv, SurfaceMode, bNoSmooth, ViewN, ViewD);
                         if (Whole >= 0)
                         {
                             bRoom = Whole ? 1 : 0;
@@ -22811,6 +27732,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                             Fan.V[0] = Mid;
                             Fan.V[1] = Corner[i];
                             Fan.V[2] = Corner[(i + 1) % Num];
+                            Fan.V[1].A = Fan.V[2].A = EdgeA[i];
                             for (INT j = 0; j < 3; j++)
                                 Fan.Dist[j] = ReliefCornerDistance(Fan.V[j]);
                             Fan.bInside = 0;
@@ -22839,14 +27761,14 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                 GReliefSeconds  += appSeconds() - TessT0;
             }
             // The flat surface: under the patches it is drawn plain; without them, with the POM - and for the lamps,
-            // the surface's frame: its normal towards the eye (from its polygons, as the patches take it) and the
-            // texture's directions along it.
+            // and for a wet floor's relief normal (SolidPass.hlsl's WetTiltOf), the surface's frame: its normal towards
+            // the eye (from its polygons, as the patches take it) and the texture's directions along it.
             if (bTessDrawn)
                 Backend.ClearPomRun();
             else
             {
                 Backend.SetPomRun(Table, Depth, (FLOAT)Flags, InvW, InvH);
-                if (bLamps)
+                if (bLamps || WetKind != RdxMath::Wet_None)
                 {
                     enum { MaxPolys = 64, MaxPoints = 64 * MAX_POLY_POINTS };
                     static RdxMath::FVec3 Pts[MaxPoints];
@@ -23053,21 +27975,32 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
         }
     }
-    // The levels' glass (Reflections=RT, with the rays running): the pane keeps the level's own drawing, and what it
-    // gives back goes over it as a layer of its own (BLEND_GlassMirror). The world's view only, while the world is
-    // drawn: the layer reads that view's copy of the picture.
-    FLOAT GlassConsts[FSolidPass::WATER_CONSTANTS];
-    UBOOL bGlassMirror = 0;
-    if (Backend.IsRtMirrorRunning() && !bWaterRun && !bFallRun && !bFieldVolume &&
+    // The levels' glass: the pane keeps the level's own drawing, and what it gives back goes over it as a layer of its
+    // own (BLEND_GlassMirror) - from rays (Reflections=RT, with the rays running), or where no rays run from the probe
+    // gathered from the picture (Reflections=Medium and High; ProbeRunConstants), or at Low the far image alone, with no
+    // probe (GlassProbeAlone 2). The world's view only, while the world is drawn: the layer reads that view's copies.
+    // The wet floors (SecondRevisionWetSurfaces.txt): the world view's surfaces of a listed texture, counted.
+    if (WetListed != RdxMath::Wet_None)
+        GNode.WetSurfaces++;
+    FLOAT       GlassConsts[FSolidPass::WATER_CONSTANTS];
+    UBOOL       bGlassMirror = 0;
+    const UBOOL bRtGlass     = Backend.IsRtMirrorRunning();
+    const UBOOL bProbeGlass  = !bRtGlass && Backend.IsProbeMirrorRunning();
+    const UBOOL bFarGlass    = !bRtGlass && !bProbeGlass && RdxMath::ReflectionsGlassFar(Backend.GetReflections());
+    if ((bRtGlass || bProbeGlass || bFarGlass) && !bWaterRun && !bFallRun && !bFieldVolume &&
         IsWorldView(Frame, FrameCounter) && !GHud.bSwitched && Backend.CanGlassMirror() &&
         RdxMath::IsGlassSurface((unsigned int)Surface.PolyFlags, IsGlassTexture(Surface.Texture->Texture) != 0))
     {
         FLOAT GlassPlane[4];
         bGlassMirror = GlassRunConstants(Frame, Facet, GlassConsts, GlassPlane);
+        if (bGlassMirror && bProbeGlass)
+            bGlassMirror = ProbeRunConstants(Backend, Frame, Facet, GlassConsts);
+        if (bGlassMirror && bFarGlass)
+            GlassConsts[19] = 2.0f;
         GNode.GlassPanes += bGlassMirror ? 1 : 0;
         // The pane's number in the mirrors' map, and the lamp's strength towards it, for the flashlight's light off
-        // the pane and the lamp's own image in it (the layer's constants 2 and 3).
-        if (bGlassMirror)
+        // the pane and the lamp's own image in it (the layer's constants 2 and 3) - which rays alone give.
+        if (bGlassMirror && bRtGlass)
         {
             FLOAT Lamp = 0.0f;
             GlassConsts[2] = (FLOAT)Backend.NoteGlassPane(GlassPlane, Lamp);
@@ -23100,17 +28033,85 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     GSludgeMirrorPolys = 0;
     GSludgeMirrorUsed  = 0;
 
-    for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+    // A piece of a water's surface drawn as the water's largest piece lays the texture on (RdxWaterLeadOf): what that
+    // mapping puts at a place of the level, less what this surface's own does, in texels - added to the coordinates
+    // below, in every view, so the texture and the waves read at them go on unbroken over the pieces' seams. The light
+    // map stays the surface's own.
+    UBOOL   bLeadMap = 0;
+    FVector LeadU(0.0f, 0.0f, 0.0f), LeadV(0.0f, 0.0f, 0.0f);
+    FLOAT   LeadCU = 0.0f, LeadCV = 0.0f;
+    if (Facet.Polys && Frame->Level && Frame->Level->Model)
+    {
+        UModel* const M    = Frame->Level->Model;
+        const INT     Node = Facet.Polys->iNode;
+        const INT     Own  = (Node >= 0 && Node < M->Nodes.Num()) ? M->Nodes(Node).iSurf : -1;
+        const INT     Lead = (Own >= 0) ? RdxWaterLeadOf(M, Own) : -1;
+        if (Lead >= 0)
+        {
+            const FBspSurf& S = M->Surfs(Own);
+            const FBspSurf& L = M->Surfs(Lead);
+            LeadU    = M->Vectors(L.vTextureU) - M->Vectors(S.vTextureU);
+            LeadV    = M->Vectors(L.vTextureV) - M->Vectors(S.vTextureV);
+            LeadCU   = (FLOAT)L.PanU - (M->Points(L.pBase) | M->Vectors(L.vTextureU)) - (FLOAT)S.PanU +
+                       (M->Points(S.pBase) | M->Vectors(S.vTextureU));
+            LeadCV   = (FLOAT)L.PanV - (M->Points(L.pBase) | M->Vectors(L.vTextureV)) - (FLOAT)S.PanV +
+                       (M->Points(S.pBase) | M->Vectors(S.vTextureV));
+            bLeadMap = 1;
+        }
+    }
+
+    // A measurement only: the spherifier's pieces tinted by their node (SphereTintSay).
+    static const UBOOL bSphereTint = FreshMarker(L"SecondRevision-sphere-tint.txt");
+    if (bSphereTint && GSphereTintFrame != FrameCounter)
+    {
+        if ((FrameCounter % 300) == 0 && GSphereTintCount > 0)
+            SphereTintSay(Frame);
+        GSphereTintFrame = FrameCounter;
+        GSphereTintCount = 0;
+    }
+
+    // The engine's polygons, or the spherifier's pieces in their place where the level was rounded (FPolyWalk). And the
+    // lift over a raised relief its pieces got, asked once for the engine's polygon they are of (below).
+    FPolyWalk         Walk;
+    Walk.InView(Frame, FrameCounter, IsWorldView(Frame, FrameCounter));
+    const FWalkPiece& Piece   = Walk.Piece;
+    const FSavedPoly* LiftOf  = nullptr;
+    FLOAT             LiftWas = 0.0f;
+    // The relief's axes in the level's space, for the pieces' turns (TurnedPomFrameOf): the surface's own, made at the
+    // first piece that turns.
+    FVector (&PomWorld)[3] = GWalkPomWorld;
+    UBOOL   bPomWorld      = 0;
+    for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
     {
         const INT Num = Poly->NumPts;
         if (Num < 3 || Num > MAX_POLY_POINTS)
             continue;
+        if (Walk.IsMade())
+        {
+            SphereTimer.bRounded = 1;
+            GSpherePieces += 1.0;
+        }
+        if (bSphereTint && Walk.IsMade() && IsWorldView(Frame, FrameCounter))
+        {
+            GSphereTintEye = Frame->Coords.Origin;
+            UBOOL bKnown = 0;
+            for (INT k = 0; k < GSphereTintCount && !bKnown; k++)
+                bKnown = GSphereTintNodes[k] == Poly->iNode;
+            if (!bKnown && GSphereTintCount < 256)
+                GSphereTintNodes[GSphereTintCount++] = Poly->iNode;
+        }
         if (Poly->Pts[0] && Poly->Pts[1] && Poly->Pts[2])
             NoteWinding(Frame, 0, Poly->Pts[0]->ScreenX, Poly->Pts[0]->ScreenY,
                         Poly->Pts[1]->ScreenX, Poly->Pts[1]->ScreenY,
                         Poly->Pts[2]->ScreenX, Poly->Pts[2]->ScreenY);
 
         UBOOL bValid = 1;
+        // A piece's relief axes, turned as far as the surface turned there (TurnedPomFrameOf): the turn is the piece's own,
+        // the same at each of its corners, so they are turned once for it - and again only for a corner whose turn is
+        // another.
+        RdxMath::FPomFrame Turned    = {};
+        FLOAT              TurnedFor = 0.0f;
+        UBOOL              bTurned   = 0;
         for (INT i = 0; i < Num; i++)
         {
             const FTransform* P = Poly->Pts[i];
@@ -23121,22 +28122,38 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
 
             const RdxMath::FVec3 Pt = ToVec(P->Point);
+            // A piece of the spherifier's has its texture and its light map read where it was, moved along its plane
+            // (FSpherePiece::Was).
+            const RdxMath::FVec3 Lit = Walk.IsMade() ? ToVec(Piece.Was[i]) : Pt;
+            const RdxMath::FVec3 Tex = Lit;
             Verts[i].X     = P->ScreenX + OffX;
             Verts[i].Y     = P->ScreenY + OffY;
             // Under the relief's patches, a 4096th further back: the patches come down exactly onto the wall where they
-            // are held, and there the patch has to win.
-            Verts[i].Depth = RdxMath::DepthFromViewZ(P->Point.Z) * (bTessDrawn ? (1.0f - 1.0f / 4096.0f) : 1.0f);
+            // are held, and there the patch has to win. A piece of the spherifier's further still: its flat face may stand
+            // in front of the arc the patches follow (SphereUnderPatches).
+            // A measurement only: the marker SecondRevision-sphere-under.txt gives that distance in hundredths instead.
+            static const INT  UnderAsked = MarkerNumber(L"SecondRevision-sphere-under.txt", -1, -1);
+            const FLOAT       Under      = (bTessDrawn && Walk.IsMade())
+                                               ? ((UnderAsked >= 0) ? (FLOAT)UnderAsked * 0.01f : SphereUnderPatches)
+                                               : 0.0f;
+            Verts[i].Depth = RdxMath::DepthFromViewZ(P->Point.Z + Under) * (bTessDrawn ? (1.0f - 1.0f / 4096.0f) : 1.0f);
 
             // The mapping axes are not unit vectors: their length carries the texture
             // scale (measured, docs/spec-04 section 2.1), so this projection already
             // yields texels. The texture's own UScale/VScale are 1.0 here and play no
             // part - which is NOT true of the light map.
-            Verts[i].U = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, T.Pan.X) * InvU - PomTileU;
-            Verts[i].V = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, T.Pan.Y) * InvV - PomTileV;
+            Verts[i].U = RdxMath::SurfaceCoord(MapX, MapOrigin, Tex, T.Pan.X) * InvU - PomTileU;
+            Verts[i].V = RdxMath::SurfaceCoord(MapY, MapOrigin, Tex, T.Pan.Y) * InvV - PomTileV;
+            if (bLeadMap)
+            {
+                const FVector W = FVector(Tex.X, Tex.Y, Tex.Z).TransformPointBy(Frame->Uncoords);
+                Verts[i].U += ((W | LeadU) + LeadCU) * InvU;
+                Verts[i].V += ((W | LeadV) + LeadCV) * InvV;
+            }
 
             // Same projection, the light map's own pan and scale.
-            Verts[i].LU = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, LPanU) * LInvU;
-            Verts[i].LV = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, LPanV) * LInvV;
+            Verts[i].LU = RdxMath::SurfaceCoord(MapX, MapOrigin, Lit, LPanU) * LInvU;
+            Verts[i].LV = RdxMath::SurfaceCoord(MapY, MapOrigin, Lit, LPanV) * LInvV;
             // The sea's ring (EndlessWater) lies past its light map: it takes the map's nearest lit texel.
             if (Poly->User == (void*)&GRingTag)
             {
@@ -23151,21 +28168,60 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             Verts[i].G = Gain;
             Verts[i].B = Gain;
             Verts[i].A = 1.0f;
+            if (bSphereTint && Walk.IsMade())
+            {
+                static INT       TintOnly[8];
+                static const INT TintOnlyCount = MarkerNumbers(L"SecondRevision-sphere-tint.txt", TintOnly, 8);
+                INT              HueAt         = ((Poly->iNode % 8) + 8) % 8;
+                if (TintOnlyCount > 0)
+                {
+                    HueAt = -1;
+                    for (INT k = 0; k < TintOnlyCount && HueAt < 0; k++)
+                        HueAt = (TintOnly[k] == Poly->iNode) ? k : -1;
+                }
+                if (HueAt >= 0)
+                {
+                    const FLOAT* const Hue = SphereTintHue[HueAt];
+                    Verts[i].R *= Hue[0];
+                    Verts[i].G *= Hue[1];
+                    Verts[i].B *= Hue[2];
+                }
+            }
 
+            // A piece of the spherifier's: the relief's axes turned with the surface at the corner.
             if (PomEntry >= 0 && !bTessDrawn)
-                RdxMath::PomVertex(PomFrame, Pt, Verts[i].PX, Verts[i].PY, Verts[i].PN, Verts[i].PD);
+            {
+                if (Walk.IsPiece() && (!bTurned || Piece.Turn[i] != TurnedFor))
+                {
+                    if (!bPomWorld)
+                    {
+                        PomWorld[0] = FVector(PomFrame.T.X, PomFrame.T.Y, PomFrame.T.Z).TransformVectorBy(Frame->Uncoords);
+                        PomWorld[1] = FVector(PomFrame.B.X, PomFrame.B.Y, PomFrame.B.Z).TransformVectorBy(Frame->Uncoords);
+                        PomWorld[2] = FVector(PomFrame.N.X, PomFrame.N.Y, PomFrame.N.Z).TransformVectorBy(Frame->Uncoords);
+                        bPomWorld   = 1;
+                    }
+                    const UBOOL bTrig = Piece.bTrig && Piece.Turn[i] == Piece.TrigFor;
+                    Turned    = TurnedPomFrameOf(PomFrame, Frame, PomWorld, Piece.Turn[i], bTrig ? Piece.Trig : nullptr);
+                    TurnedFor = Piece.Turn[i];
+                    bTurned   = 1;
+                }
+                RdxMath::PomVertex(Walk.IsPiece() ? Turned : PomFrame, Pt, Verts[i].PX, Verts[i].PY, Verts[i].PN,
+                                   Verts[i].PD);
+            }
         }
 
         // What the crosshair is on. Only the main view (a sub-view is a mirror or a security screen, and its middle
         // is not where the player is aiming), and only the nearest such surface.
         if (bValid && Frame && !Frame->Parent && Frame->X > 0 && Frame->Y > 0)
         {
-            FLOAT Xs[MAX_POLY_POINTS], Ys[MAX_POLY_POINTS], Near = 0.0f;
+            FLOAT   Xs[MAX_POLY_POINTS], Ys[MAX_POLY_POINTS], Near = 0.0f;
+            FVector Middle(0.0f, 0.0f, 0.0f);
             for (INT i = 0; i < Num; i++)
             {
                 Xs[i] = Verts[i].X;
                 Ys[i] = Verts[i].Y;
                 Near += Poly->Pts[i]->Point.Z;
+                Middle += Poly->Pts[i]->Point;
             }
             Near /= (FLOAT)Num;
             if (Near > 0.0f && (GPomPickDepth <= 0.0f || Near < GPomPickDepth) &&
@@ -23173,6 +28229,8 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             {
                 GPomPickDepth = Near;
                 GPomPickNode  = Poly->iNode;
+                GPomPickAt    = (Middle / (FLOAT)Num).TransformPointBy(Frame->Uncoords);
+                GLookLevel    = Frame->Level;
                 // The package and the texture's own name, which is what the list file calls it and what fits the
                 // readout's line; the group in the middle is neither.
                 {
@@ -23266,11 +28324,25 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
         // of blood, a scorch mark - is brought forward over its relief (ReliefDecalLift). It is then no cover of the
         // relief: drawn as what is laid over a surface, the actors' kind, which the covers leave out
         // (FSolidPass::DrawReliefCovers) - pressed down under it the relief would be a flat patch in the sheet's shape.
+        // A piece of the spherifier's asks by the engine's own polygon, which lies on the plane the relief was raised
+        // from: its own corners went with the wall - once a polygon, however many pieces it has.
         UBOOL bLifted = 0;
         if (bValid && (SurfaceMode == BLEND_Modulated || SurfaceMode == BLEND_Translucent) &&
             ReliefDecalCandidate(Surface.PolyFlags))
         {
-            const FLOAT Lift = ReliefDecalLift(Frame, FrameCounter, Poly->Pts, Num);
+            FLOAT Lift = 0.0f;
+            if (!Walk.IsMade())
+                Lift = ReliefDecalLift(Frame, FrameCounter, Poly->Pts, Num);
+            else if (LiftOf == Walk.EnginePoly())
+                Lift = LiftWas;
+            else
+            {
+                const FSavedPoly* const E = Walk.EnginePoly();
+                Lift    = (E && E->NumPts >= 3 && E->NumPts <= MAX_POLY_POINTS)
+                              ? ReliefDecalLift(Frame, FrameCounter, E->Pts, E->NumPts) : 0.0f;
+                LiftOf  = E;
+                LiftWas = Lift;
+            }
             if (Lift > 0.0f)
             {
                 for (INT i = 0; i < Num; i++)
@@ -23279,6 +28351,11 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
         }
         if (bFieldVolume)
+            continue;
+        // A measurement only (SecondRevision-relief-no-under.txt): the flat surface under the relief's patches left
+        // out, so what the patches themselves cover can be seen.
+        static const UBOOL bNoUnder = FreshMarker(L"SecondRevision-relief-no-under.txt");
+        if (bNoUnder && bTessDrawn)
             continue;
         if (bValid)
         {
@@ -23370,6 +28447,19 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
         Backend.ClearReliefRun();
     }
 
+    // The spherifier's bulges beside this surface's polygons: of the polygons turned away from the eye, what the
+    // rounding brings round towards it (SphereBackBulges).
+    if (GSphere->bOn && SurfaceMode == BLEND_Opaque && !bWaterRun && !bFallRun && !bFieldVolume && !bGlassMirror &&
+        !bMirrorImage && Facet.Polys && Frame->Level && Frame->Level->Model &&
+        (IsWorldView(Frame, FrameCounter) || IsLevelMirrorView(Frame)) && !GHud.bSwitched)
+    {
+        const FLOAT  LEdge[4] = { LMinU, LMinV, LMaxU, LMaxV };
+        const DOUBLE B0       = appSeconds();
+        SphereBackBulges(Backend, Frame, Facet, T.Pan, LightSrv, MapX, MapY, MapOrigin, LPanU, LPanV, LInvU, LInvV, LEdge,
+                         OffX, OffY, FrameCounter);
+        GSphereBackSec += appSeconds() - B0;
+    }
+
     // The detail pass, after all of the surface's own polygons so each pass stays one run.
     // Same positions and depths, so it lands exactly on them (GREATER_EQUAL passes equal).
     // Not over the relief's patches: drawn flat it would lie behind them, and show only in their hollows.
@@ -23395,7 +28485,8 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     }
     if (DetSrv >= 0 && !bTessDrawn)
     {
-        for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+        // The same pieces as the surface's own drawing above, where the spherifier moved its nodes.
+        for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
         {
             const INT Num = Poly->NumPts;
             if (Num < 3 || Num > MAX_POLY_POINTS)
@@ -23410,12 +28501,13 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                     bValid = 0;
                     break;
                 }
-                const RdxMath::FVec3 Pt = ToVec(P->Point);
+                const RdxMath::FVec3 Pt  = ToVec(P->Point);
+                const RdxMath::FVec3 Tex = Walk.IsMade() ? ToVec(Piece.Was[i]) : Pt;
                 Verts[i].X     = P->ScreenX + OffX;
                 Verts[i].Y     = P->ScreenY + OffY;
                 Verts[i].Depth = RdxMath::DepthFromViewZ(P->Point.Z);
-                Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, DPanU) * DInvU;
-                Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, DPanV) * DInvV;
+                Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Tex, DPanU) * DInvU;
+                Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Tex, DPanV) * DInvV;
                 Verts[i].LU    = 0.0f;
                 Verts[i].LV    = 0.0f;
                 Verts[i].R     = 1.0f;
@@ -23451,7 +28543,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             {
                 // Over the sludge's lifted patches (BLEND_SludgeFog): the surface's own vertices once more - the texture's
                 // coordinate is what lifts them, so it stays - with the fog map's coordinates in the light map's place.
-                for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
                 {
                     const INT Num = Poly->NumPts;
                     if (Num < 3 || Num > MAX_POLY_POINTS)
@@ -23465,14 +28557,16 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                             bValid = 0;
                             break;
                         }
-                        const RdxMath::FVec3 Pt = ToVec(P->Point);
+                        const RdxMath::FVec3 Pt  = ToVec(P->Point);
+                        const RdxMath::FVec3 Lit = Walk.IsMade() ? ToVec(Piece.Was[i]) : Pt;
+                        const RdxMath::FVec3 Tex = Lit;
                         Verts[i].X     = P->ScreenX + OffX;
                         Verts[i].Y     = P->ScreenY + OffY;
                         Verts[i].Depth = RdxMath::DepthFromViewZ(P->Point.Z);
-                        Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, T.Pan.X) * InvU;
-                        Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, T.Pan.Y) * InvV;
-                        Verts[i].LU    = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, FPanU) * FInvU;
-                        Verts[i].LV    = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, FPanV) * FInvV;
+                        Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Tex, T.Pan.X) * InvU;
+                        Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Tex, T.Pan.Y) * InvV;
+                        Verts[i].LU    = RdxMath::SurfaceCoord(MapX, MapOrigin, Lit, FPanU) * FInvU;
+                        Verts[i].LV    = RdxMath::SurfaceCoord(MapY, MapOrigin, Lit, FPanV) * FInvV;
                         Verts[i].R     = 1.0f;
                         Verts[i].G     = 1.0f;
                         Verts[i].B     = 1.0f;
@@ -23502,7 +28596,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
             else if (!bTessDrawn)
             {
-                for (const FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
                 {
                     const INT Num = Poly->NumPts;
                     if (Num < 3 || Num > MAX_POLY_POINTS)
@@ -23516,12 +28610,12 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                             bValid = 0;
                             break;
                         }
-                        const RdxMath::FVec3 Pt = ToVec(P->Point);
+                        const RdxMath::FVec3 Lit = Walk.IsMade() ? ToVec(Piece.Was[i]) : ToVec(P->Point);
                         Verts[i].X     = P->ScreenX + OffX;
                         Verts[i].Y     = P->ScreenY + OffY;
                         Verts[i].Depth = RdxMath::DepthFromViewZ(P->Point.Z);
-                        Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Pt, FPanU) * FInvU;
-                        Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Pt, FPanV) * FInvV;
+                        Verts[i].U     = RdxMath::SurfaceCoord(MapX, MapOrigin, Lit, FPanU) * FInvU;
+                        Verts[i].V     = RdxMath::SurfaceCoord(MapY, MapOrigin, Lit, FPanV) * FInvV;
                         Verts[i].LU    = 0.0f;
                         Verts[i].LV    = 0.0f;
                         Verts[i].R     = 1.0f;
@@ -23880,16 +28974,29 @@ static void NoteMaskedTranslucent(const FTextureInfo& Info, DWORD PolyFlags)
 // engine gave its own plant's polygons the frame before. A model that cannot be read keeps the game's own drawing.
 
 enum { TreeVariantsPerKind = 4, TreeKinds = RdxTree::Kind_Count, TreePictureRoom = 64 };
+// The height in units below which a plant is grown the own way, not EZ-Tree's (ReadLevelTrees' Small).
+enum { TreeEzLeastUnits = 128 };
 
 enum { TreeTrunkRoom = 24, TreeMarkRoom = 8 };
 struct FTreeVariant
 {
     FLOAT Height, Radius;           // the size it was grown at
     INT   BarkStart, BarkCount;     // its indices in the level's buffer
+    INT   FarStart[2], FarCount[2]; // and its bark far off: only its wood from two twigs' radius on, then from four
+    FLOAT Twig;                     // its twigs' radius, as grown (RdxTree::FShape)
     INT   LeafStart, LeafCount;     // its leaves, in the level's leaves (instances of the blade, GTreeLeafVb)
     FLOAT Trunk[TreeTrunkRoom][4];  // its trunk, in its own space (RdxTree::TrunkOf): where the bullets' marks go
     INT   TrunkCount;               // none for a bush
     UBOOL bCards;                   // grown by EZ-Tree: its leaves are cards of the cards' sheet (GTreeCardInfo)
+    UBOOL bCarved;                  // grown the own way: its thick wood carved into its own relief (RdxTree::Build),
+                                    // so the photographed bark's relief is not laid over it
+    UBOOL bRose;                    // a shrub rose (RdxTree::RoseLeaves): its blades as wide as long
+    UBOOL bYellow;                  // a yellow one: its flowers' heads in the yellow petals' sheet (GTreeYellowInfo)
+    UBOOL bStem;                    // grown stem by stem (RdxTree::StemPlant): its leaves and petals in their own sheet
+                                    // (GTreeStemInfo), as wide as long, its wood a green stem's skin (GTreeSkinInfo)
+    INT   PetalCount;               // its flowers' petals, the first of its leaves (RdxTree::PetalsOf): a far plant draws
+                                    // all of them at their own size, and thins only the leaves after them
+    INT   FlowerStart, FlowerCount; // its flowers' heads (RdxTree::FlowerHeadsOf), drawn as the bark in the leaves' sheet
     // Its shape for the shadows (RdxTree::ShadowWood, ShadowLeaves) in GTreeShadowCorners, GTreeShadowIndex and
     // GTreeShadowLeaves: kept on this side, laid again in the wind every frame (PreparePlantShape).
     INT   ShadowWoodStart, ShadowWoodCount, ShadowIndexStart, ShadowIndexCount, ShadowLeafStart, ShadowLeafCount;
@@ -23955,6 +29062,7 @@ struct FLevelPlantShape
     INT     Why;
     UBOOL   bMade, bRt, bMasked;
     INT     LeafSlot;
+    INT     TreesLevel;     // the trees' level it was laid at (PlantShadowLeaves)
     FVector Centre;
     FLOAT   Radius;
     DWORD   Colour;
@@ -23986,22 +29094,35 @@ static INT                      GTreeCellsY       = 0;
 static FLOAT                    GTreeCellX0       = 0.0f;
 static FLOAT                    GTreeCellY0       = 0.0f;
 static INT                      GTreeDrawn = 0, GTreeFrames = 0, GTreeLastFrame = -1;
+static INT                      GTreeFarDrawn[2] = { 0, 0 };   // of them with only their thicker wood (DrawTreeInstance)
 
 // How many level units of the trunk the bark picture's height covers, along it.
 static const FLOAT TreeBarkWorld = 64.0f;
 // A plant's block (TreeShader.h): the view, the clock, the wind, its place and size, its light, its four lamps.
-enum { TreeBlockRows = 15 };
+enum { TreeBlockRows = 16 };
+// A far plant's leaves past its share are not left out at once but drawn growing, a band of them a quarter as many as
+// the share keeps: as the eye nears, each comes from nothing to its whole size over a quarter of the way its share
+// grows by, and a far plant draws a quarter more of its few leaves for it (DrawTreeInstance).
+static const FLOAT TreeLeafBand = 0.25f;
 // How far the wind moves a plant, against TreeGen.h's full wind: the level's gusts are a third of it at most.
 static const FLOAT TreeWindGain  = 3.0f;
 
 // The bark's and the leaves' pictures (TreeGen.h, drawn by code), as the texture cache takes the engine's: an info with
 // its whole chain of levels, under numbers of the renderer's own. The leaves' levels keep the share of their texels
 // that stands (alpha over a half) the largest level has - averaged plainly, a far crown would thin out to nothing.
-static FTextureInfo GTreeBarkInfo, GTreeLeafInfo, GTreeMarkInfo, GTreeCardInfo;
+static FTextureInfo GTreeBarkInfo, GTreeLeafInfo, GTreeMarkInfo, GTreeCardInfo, GTreeYellowInfo, GTreeStemInfo;
+static FTextureInfo GTreeSkinInfo;
 static FMipmapBase  GTreeBarkMips[MAX_MIPS], GTreeLeafMips[MAX_MIPS], GTreeMarkMips[MAX_MIPS], GTreeCardMips[MAX_MIPS];
+static FMipmapBase  GTreeYellowMips[MAX_MIPS], GTreeStemMips[MAX_MIPS], GTreeSkinMips[MAX_MIPS];
 static BYTE*        GTreeCardTexels = nullptr;
 static INT          GTreeCardsRead  = 0;       // 1 read, -1 not there or not readable, 0 not tried
 static BYTE*        GTreeTexels = nullptr;
+// The bark's relief where the level's is drawn (Geometry): the photographed bark's own height map - ambientCG's Bark001
+// displacement map, scripts/make_bark.py - laid out for the relief's maps (FPomLibrary::MakeOwnBlob), and how deep its
+// grooves go, in the level's units (about three centimetres).
+static BYTE*        GTreeBarkHeight      = nullptr;
+static INT          GTreeBarkHeightBytes = 0;
+static const FLOAT  TreeBarkRelief       = 1.5f;
 
 static INT MakeTreeChain(BYTE* Top, INT W, INT H, UBOOL bCoverage, FMipmapBase* Mips, BYTE*& Room)
 {
@@ -24100,26 +29221,15 @@ static void MakeTreeInfo(FTextureInfo& Info, FMipmapBase* Mips, INT Levels, INT 
 }
 
 // Once a run of the game: the two pictures and their chains.
-// A picture packed beside the renderer's DLL (scripts/make_leaf_cards.py, scripts/make_bark.py): eight letters of its
-// own, its width and height, then its RGBA texels packed with deflate. Read whole into a buffer with room for its mip
-// levels after it; null where it is not there or not whole.
+// A picture packed in SecondRevision\Assets (AssetPath; scripts/make_leaf_cards.py, scripts/make_bark.py): eight
+// letters of its own, its width and height, then its RGBA texels packed with deflate. Read whole into a buffer with
+// room for its mip levels after it; null where it is not there or not whole.
 static BYTE* ReadPackedPicture(const WCHAR* Name, const char* Magic, INT W, INT H)
 {
-    HMODULE Self = nullptr;
-    WCHAR   Path[MAX_PATH];
-    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                              (LPCWSTR)&ReadPackedPicture, &Self))
+    WCHAR Path[MAX_PATH + 64];
+    AssetPath(Path, MAX_PATH + 64, Name);
+    if (!Path[0])
         return nullptr;
-    const DWORD N = ::GetModuleFileNameW(Self, Path, MAX_PATH);
-    if (N == 0 || N >= MAX_PATH)
-        return nullptr;
-    WCHAR* Cut = Path + N;
-    while (Cut > Path && Cut[-1] != L'\\' && Cut[-1] != L'/')
-        Cut--;
-    *Cut = 0;
-    if (::lstrlenW(Path) + ::lstrlenW(Name) + 1 >= MAX_PATH)
-        return nullptr;
-    ::lstrcatW(Path, Name);
     HANDLE F = ::CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (F == INVALID_HANDLE_VALUE)
         return nullptr;
@@ -24153,7 +29263,8 @@ static UBOOL MakeTreeCards()
     GTreeCardTexels = ReadPackedPicture(L"SecondRevision-leafcards.bin", "RDXLEAF1", 4096, 1024);
     if (!GTreeCardTexels)
     {
-        RDX_LOG("trees: SecondRevision-leafcards.bin is not beside the renderer, or not whole - the trees grow the own way");
+        RDX_LOG("trees: SecondRevision-leafcards.bin is not in SecondRevision\\Assets, or not whole - the trees "
+                "grow the own way");
         return 0;
     }
     BYTE*     Room   = GTreeCardTexels + 4096 * 1024 * 4;
@@ -24168,9 +29279,12 @@ static UBOOL MakeTreePictures()
 {
     if (GTreeTexels)
         return 1;
-    const INT BarkW = 256, BarkH = 512, LeafW = 2048, LeafH = 1024, MarkS = 64;
+    const INT BarkW = 256, BarkH = 512, LeafW = 4096, LeafH = 1024, MarkS = 64, YellowW = 512, YellowH = 512;
+    const INT StemW = 2048, StemH = 512, SkinW = 64, SkinH = 256;
     // Each chain a third more than its largest level.
-    const INT Bytes = (BarkW * BarkH * 4) * 4 / 3 + (LeafW * LeafH * 4) * 4 / 3 + (MarkS * MarkS * 4) * 4 / 3 + 8192;
+    const INT Bytes = (BarkW * BarkH * 4) * 4 / 3 + (LeafW * LeafH * 4) * 4 / 3 + (MarkS * MarkS * 4) * 4 / 3 +
+                      (YellowW * YellowH * 4) * 4 / 3 + (StemW * StemH * 4) * 4 / 3 + (SkinW * SkinH * 4) * 4 / 3 +
+                      8192;
     GTreeTexels = (BYTE*)appMalloc(Bytes, TEXT("RdxTreePictures"));
     if (!GTreeTexels)
         return 0;
@@ -24185,18 +29299,46 @@ static UBOOL MakeTreePictures()
     Room += MarkS * MarkS * 4;
     RdxTree::DrawBulletMark(Mark, MarkS);
     const INT MarkLevels = MakeTreeChain(Mark, MarkS, MarkS, 0, GTreeMarkMips, Room);
+    // A yellow shrub rose's petals: two pictures, at half the leaves' sheet's size - a flower's head is small on screen.
+    BYTE* const Yellow = Room;
+    Room += YellowW * YellowH * 4;
+    RdxTree::DrawRoseYellowPetals(Yellow, YellowW, YellowH);
+    const INT YellowLevels = MakeTreeChain(Yellow, YellowW, YellowH, 1, GTreeYellowMips, Room);
+    // The plants grown stem by stem: their leaves' and petals' sheet, eight pictures at half the leaves' sheet's size,
+    // and their green stems' skin.
+    BYTE* const Stem = Room;
+    Room += StemW * StemH * 4;
+    RdxTree::DrawStemSheet(Stem, StemW, StemH);
+    const INT StemLevels = MakeTreeChain(Stem, StemW, StemH, 1, GTreeStemMips, Room);
+    BYTE* const Skin = Room;
+    Room += SkinW * SkinH * 4;
+    RdxTree::DrawStemSkin(Skin, SkinW, SkinH);
+    const INT SkinLevels = MakeTreeChain(Skin, SkinW, SkinH, 0, GTreeSkinMips, Room);
     MakeTreeInfo(GTreeBarkInfo, GTreeBarkMips, BarkLevels, BarkW, BarkH, 0xF7EE5BA4C0000001ull);
-    // The bark photographed (ambientCG's Bark001, scripts/make_bark.py) where it is beside the renderer - the drawn one
-    // where it is not.
+    // The bark photographed (ambientCG's Bark001, scripts/make_bark.py) where it is in SecondRevision\Assets - the
+    // drawn one where it is not.
     if (BYTE* const Photo = ReadPackedPicture(L"SecondRevision-bark.bin", "RDXBARK1", 512, 1024))
     {
         BYTE*     PhotoRoom   = Photo + 512 * 1024 * 4;
         const INT PhotoLevels = MakeTreeChain(Photo, 512, 1024, 0, GTreeBarkMips, PhotoRoom);
         MakeTreeInfo(GTreeBarkInfo, GTreeBarkMips, PhotoLevels, 512, 1024, 0xF7EE5BA4C0000007ull);
         RDX_LOGF("trees: the bark photographed read, 512x1024, %i levels", PhotoLevels);
+        // Its height map beside it, where it is: the red of a picture of the same size, a byte a texel - packed down
+        // in place, each texel's red read before it is written over.
+        if (BYTE* const Heights = ReadPackedPicture(L"SecondRevision-barkheight.bin", "RDXBHGT1", 512, 1024))
+        {
+            for (INT i = 0; i < 512 * 1024; i++)
+                Heights[i] = Heights[i * 4];
+            GTreeBarkHeight = FBackend::PomOwnBlob(Heights, 512, 1024, GTreeBarkHeightBytes);
+            appFree(Heights);
+            RDX_LOGF("trees: the bark's height map read%s", GTreeBarkHeight ? TEXT("") : TEXT(" - no memory to lay it out"));
+        }
     }
     MakeTreeInfo(GTreeLeafInfo, GTreeLeafMips, LeafLevels, LeafW, LeafH, 0xF7EE5BA4C0000005ull);
     MakeTreeInfo(GTreeMarkInfo, GTreeMarkMips, MarkLevels, MarkS, MarkS, 0xF7EE5BA4C0000004ull);
+    MakeTreeInfo(GTreeYellowInfo, GTreeYellowMips, YellowLevels, YellowW, YellowH, 0xF7EE5BA4C0000008ull);
+    MakeTreeInfo(GTreeStemInfo, GTreeStemMips, StemLevels, StemW, StemH, 0xF7EE5BA4C0000009ull);
+    MakeTreeInfo(GTreeSkinInfo, GTreeSkinMips, SkinLevels, SkinW, SkinH, 0xF7EE5BA4C000000Aull);
     return 1;
 }
 
@@ -24699,8 +29841,10 @@ static void ForgetLevelPlantShapes()
         GLevelPlantShapes[i].bMade = 0;
 }
 
+static void ForgetPlantTable();
 static void ForgetLevelTrees()
 {
+    ForgetPlantTable();
     if (GTreeSheetOf)
         appFree(GTreeSheetOf);
     GTreeSheetOf    = nullptr;
@@ -24745,6 +29889,31 @@ static void ForgetLevelTrees()
     appMemzero(&GTreeLeafIb, sizeof(GTreeLeafIb));
 }
 
+// GrownPlantOf's table: the grown plants' actors by their address - open addressing, each slot an instance's index,
+// the first of an actor's - made again whenever the plants are (GPlantTableOf, Count, Grown). It is asked of every
+// caster and every moving body of a frame, most of them no plant, each of which went through every instance.
+static INT*                 GPlantTable      = nullptr;
+static INT                  GPlantTableSize  = 0;
+static const FTreeInstance* GPlantTableOf    = nullptr;
+static INT                  GPlantTableCount = -1;
+static INT                  GPlantTableGrown = -1;
+
+static void ForgetPlantTable()
+{
+    if (GPlantTable)
+        appFree(GPlantTable);
+    GPlantTable      = nullptr;
+    GPlantTableSize  = 0;
+    GPlantTableOf    = nullptr;
+    GPlantTableCount = -1;
+    GPlantTableGrown = -1;
+}
+
+static inline INT PlantSlotOf(const AActor* A, INT Size)
+{
+    return (INT)(((DWORD)(SIZE_T)A >> 3) * 2654435761u >> 8) & (Size - 1);
+}
+
 // The grown plant an actor is: its index in GTreeInstances, or -1 - none grown, another level's, or no plant. The
 // instances' actors are compared, never followed.
 static INT GrownPlantOf(const AActor* A)
@@ -24755,17 +29924,56 @@ static INT GrownPlantOf(const AActor* A)
     static INT Last = 0;
     if (Last < GTreeCount && GTreeInstances[Last].Actor == A)
         return Last;
-    for (INT i = 0; i < GTreeCount; i++)
-        if (GTreeInstances[i].Actor == A)
+    if (GPlantTableOf != GTreeInstances || GPlantTableCount != GTreeCount || GPlantTableGrown != GTreesGrown)
+    {
+        ForgetPlantTable();
+        INT Size = 64;
+        while (Size < GTreeCount * 2)
+            Size *= 2;
+        GPlantTable = (INT*)appMalloc(Size * sizeof(INT), TEXT("RdxPlantTable"));
+        if (GPlantTable)
         {
-            Last = i;
-            return i;
+            GPlantTableSize = Size;
+            for (INT s = 0; s < Size; s++)
+                GPlantTable[s] = -1;
+            for (INT i = 0; i < GTreeCount; i++)
+            {
+                const AActor* const Of = GTreeInstances[i].Actor;
+                if (!Of)
+                    continue;
+                INT s = PlantSlotOf(Of, Size);
+                while (GPlantTable[s] >= 0 && GTreeInstances[GPlantTable[s]].Actor != Of)
+                    s = (s + 1) & (Size - 1);
+                if (GPlantTable[s] < 0)
+                    GPlantTable[s] = i;
+            }
+            GPlantTableOf    = GTreeInstances;
+            GPlantTableCount = GTreeCount;
+            GPlantTableGrown = GTreesGrown;
+        }
+    }
+    if (!GPlantTable)
+    {
+        for (INT i = 0; i < GTreeCount; i++)
+            if (GTreeInstances[i].Actor == A)
+            {
+                Last = i;
+                return i;
+            }
+        return -1;
+    }
+    for (INT s = PlantSlotOf(A, GPlantTableSize); GPlantTable[s] >= 0; s = (s + 1) & (GPlantTableSize - 1))
+        if (GTreeInstances[GPlantTable[s]].Actor == A)
+        {
+            Last = GPlantTable[s];
+            return Last;
         }
     return -1;
 }
 
 // A caster's plant for the shapes' cache (MakeShapeKey): the grown plant its actor is (-1: none), the level's growth
-// it is of, and its wind's time - none where no wind moves it: its shape then stays as it is, and is kept.
+// it is of with the trees' level it is laid at (its shadow's leaves, PlantShadowLeaves), and its wind's time - none
+// where no wind moves it: its shape then stays as it is, and is kept.
 static INT PlantShapeKey(const AActor* A, INT& Growth, FLOAT& Time)
 {
     Growth = 0;
@@ -24773,7 +29981,7 @@ static INT PlantShapeKey(const AActor* A, INT& Growth, FLOAT& Time)
     const INT Plant = GrownPlantOf(A);
     if (Plant < 0)
         return -1;
-    Growth = GTreesGrown;
+    Growth = GTreesGrown * RdxMath::Trees_Count + GRunTrees;
     if (GTreeInstances[Plant].bOutdoors && GRunWind)
         Time = A->Level ? A->Level->TimeSeconds : 0.0f;
     return Plant;
@@ -24797,12 +30005,17 @@ static void PlantWindOf(ULevel* XLevel, RdxMath::FWind& W, FLOAT& Time)
     W.Gust *= Strength * TreeWindGain;
 }
 
-// The mask the grown plants' leaves cast by: the leaves' sheet - EZ-Tree's cards' or the own leaves' - squeezed to
-// the maps' mask, each of its texels the share of the sheet's texels under it that are opaque. Its slot, or -2.
-static INT PlantLeafMask(FBackend& Backend, UBOOL bCards)
+// A variant's leaves' sheet: EZ-Tree's cards', the stem plants', or the own leaves'.
+static FMipmapBase* PlantLeafSheet(const FTreeVariant& V)
 {
-    const FMipmapBase& Mip = bCards ? GTreeCardMips[0] : GTreeLeafMips[0];
-    void* const        Key = bCards ? (void*)&GTreeCardMips[0] : (void*)&GTreeLeafMips[0];
+    return V.bCards ? GTreeCardMips : (V.bStem ? GTreeStemMips : GTreeLeafMips);
+}
+// The mask the grown plants' leaves cast by: the variant's leaves' sheet (PlantLeafSheet) squeezed to the maps' mask,
+// each of its texels the share of the sheet's texels under it that are opaque. Its slot, or -2.
+static INT PlantLeafMask(FBackend& Backend, const FTreeVariant& V)
+{
+    const FMipmapBase& Mip = PlantLeafSheet(V)[0];
+    void* const        Key = (void*)&PlantLeafSheet(V)[0];
     const INT Known = Backend.FindShadowMask(Key);
     if (Known != -1)
         return Known;
@@ -24825,21 +30038,15 @@ static INT PlantLeafMask(FBackend& Backend, UBOOL bCards)
             Coverage[y * Size + x] = (BYTE)(Opaque * 255 / (Sx * Sy));
         }
     const INT Slot = Backend.AddShadowMask(Key, Coverage);
-    RDX_LOGF("trees: the %s sheet's mask for the plants' shadows - slot %i", bCards ? TEXT("cards'") : TEXT("leaves'"),
-             Slot);
+    RDX_LOGF("trees: the %s sheet's mask for the plants' shadows - slot %i",
+             V.bCards ? TEXT("cards'") : (V.bStem ? TEXT("stem plants'") : TEXT("leaves'")), Slot);
     return Slot;
 }
 
-// A grown plant as a caster (PrepareCasterShape): its variant's shape for the shadows where the plant stands, swayed by
-// the wind as its drawing is (TreeShader.h's Swayed: the push at its foot, each part's chain of sways summed - its
-// leaves' own flutter left out) - or, bStill, as it stands with no wind. Three corners a face into GShadowFrameVerts, their places
-// on the leaves' sheet into GPlantPlaceU and V, whether each face is a leaf's into GPlantFaceLeaf. The leaves cast by
-// the sheet's mask; without one, the wood alone.
-static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT Plant, FCasterShape& S, INT& Why,
-                               UBOOL bStill)
+// A grown plant's shape before its faces are laid (PreparePlantShape): none of a model's, its leaves' mask slot LeafSlot
+// (PlantLeafMask; -2 none).
+static void StartPlantShape(AActor* A, INT Plant, INT LeafSlot, FCasterShape& S)
 {
-    const FTreeInstance& T = GTreeInstances[Plant];
-    const FTreeVariant&  V = GTreeVariants[T.Variant];
     S.Mesh       = A ? A->Mesh : nullptr;
     S.Lod        = nullptr;
     S.Mover      = nullptr;
@@ -24852,59 +30059,103 @@ static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT
     for (INT k = 0; k < SHAPE_MASK_KEYS; k++)
         S.MaskSlot[k] = -2;
     S.Plant         = Plant;
-    S.PlantLeafSlot = (V.ShadowLeafCount > 0 && GTreeShadowLeaves) ? PlantLeafMask(Backend, V.bCards) : -2;
-    FLOAT          Time = 0.0f;
-    RdxMath::FWind W;
-    PlantWindOf(XLevel, W, Time);
-    FLOAT PushX = 0.0f, PushY = 0.0f;
+    S.PlantLeafSlot = LeafSlot;
+}
+
+// What a grown plant's faces are laid by (FPlantSway): the wind's push where it stands - none, bStill - and its beats'
+// turns now.
+static void PlantSwayOf(ULevel* XLevel, const FTreeInstance& T, UBOOL bStill, FPlantSway& Sw)
+{
+    FLOAT Time = 0.0f;
+    PlantWindOf(XLevel, Sw.W, Time);
+    Sw.PushX = 0.0f;
+    Sw.PushY = 0.0f;
     if (T.bOutdoors && !bStill)
-        RdxMath::WindAt(W, T.X, T.Y, Time, PushX, PushY);
-    const FLOAT Push2 = PushX * PushX + PushY * PushY;
-    const UBOOL bWind = (Push2 > 0.0f) ? 1 : 0;
-    const FLOAT Len   = appSqrt(Push2);
-    const FLOAT Own   = 6.2831853f * T.Beat;
+        RdxMath::WindAt(Sw.W, T.X, T.Y, Time, Sw.PushX, Sw.PushY);
+    Sw.Push2 = Sw.PushX * Sw.PushX + Sw.PushY * Sw.PushY;
+    Sw.bWind = (Sw.Push2 > 0.0f) ? 1 : 0;
+    Sw.Len   = appSqrt(Sw.Push2);
+    const FLOAT Own = 6.2831853f * T.Beat;
     const FLOAT A1 = Time * 1.7f + Own, A2 = Time * 4.3f + 2.0f * Own, A3 = Time * 2.3f + 3.0f * Own;
-    const FLOAT Sin1 = appSin(A1), Cos1 = appCos(A1), Sin2 = appSin(A2), Cos2 = appCos(A2);
-    const FLOAT Sin3 = appSin(A3), Cos3 = appCos(A3);
-    const FLOAT C = appCos(T.Turn), Sn = appSin(T.Turn);
-    // A point of the plant's own space at rest into the world; the wind's push on a part of a bend and a beat.
-    const auto Place = [&](FLOAT X, FLOAT Y, FLOAT Z)
+    Sw.Sin1 = appSin(A1);
+    Sw.Cos1 = appCos(A1);
+    Sw.Sin2 = appSin(A2);
+    Sw.Cos2 = appCos(A2);
+    Sw.Sin3 = appSin(A3);
+    Sw.Cos3 = appCos(A3);
+    Sw.C    = appCos(T.Turn);
+    Sw.Sn   = appSin(T.Turn);
+}
+
+// A grown plant's leaves in its shadow at the trees' level: all of its shadow's at High; at Medium and Low as much fewer
+// as a far plant's drawing keeps of its leaves at the least against High's (RdxMath::TreeLeastShareOf) - the first of
+// them, an even share of the crown, not grown to cover as much: the shadow thinner, and fewer masked leaves for the
+// rays to go through. A shrub rose's petals (Whole of them, before its leaves) all kept. The plant drawn is the same.
+static INT PlantShadowLeaves(INT Count, INT Whole)
+{
+    if (Count <= 0 || GRunTrees == RdxMath::Trees_High || GRunTrees == RdxMath::Trees_Off)
+        return Count;
+    const FLOAT Share = RdxMath::TreeLeastShareOf(GRunTrees) / RdxMath::TreeLeastShareOf(RdxMath::Trees_High);
+    return Min(Count, Whole + Max(1, (INT)((FLOAT)(Count - Whole) * Share + 0.5f)));
+}
+
+// A grown plant's faces, three corners each, into F - each corner's place, its place on the leaves' sheet, whether each
+// face is a leaf's - swayed as Swing says, and S's count of them, its middle, reach and colour (StartPlantShape began it);
+// false, Why 1, where it has none. Its own numbers alone: on any thread with the game thread's float control words,
+// the same bytes.
+static UBOOL PlantFacesOf(const FPlantSway& Swing, const FPlantFaces& F, FCasterShape& S, INT& Why)
+{
+    const FTreeInstance&  T     = GTreeInstances[S.Plant];
+    const FTreeVariant&   V     = GTreeVariants[T.Variant];
+    const RdxMath::FWind& W     = Swing.W;
+    const FLOAT           PushX = Swing.PushX, PushY = Swing.PushY, Push2 = Swing.Push2, Len = Swing.Len;
+    const UBOOL           bWind = Swing.bWind;
+    const FLOAT           Sin1 = Swing.Sin1, Cos1 = Swing.Cos1, Sin2 = Swing.Sin2, Cos2 = Swing.Cos2;
+    const FLOAT           Sin3 = Swing.Sin3, Cos3 = Swing.Cos3, C = Swing.C, Sn = Swing.Sn;
+    // A point of the plant's own space at rest into the world, with the wind's push on a part of a bend and a beat - in
+    // plain FLOATs: the engine's FVector is made and added through calls into Core.dll, and its sum of two FLOATs, on
+    // the x87, is the FLOAT sum to the bit.
+    const auto Placed = [&](FLOAT X, FLOAT Y, FLOAT Z, const RdxTree::FSway& Sw, FVector& Out)
     {
         const FLOAT Lx = X * T.Across, Ly = Y * T.Across;
-        return FVector(T.X + C * Lx - Sn * Ly, T.Y + Sn * Lx + C * Ly, T.Z + Z * T.Up);
-    };
-    const auto Push = [&](const RdxTree::FSway& Sw)
-    {
+        Out.X = T.X + C * Lx - Sn * Ly;
+        Out.Y = T.Y + Sn * Lx + C * Ly;
+        Out.Z = T.Z + Z * T.Up;
         if (!bWind)
-            return FVector(0.0f, 0.0f, 0.0f);
+        {
+            Out.X += 0.0f;
+            Out.Y += 0.0f;
+            Out.Z += 0.0f;
+            return;
+        }
         const FLOAT Sway = Sw.S0 + 0.35f * (Sin1 * Sw.C1 + Cos1 * Sw.S1) + 0.15f * (Sin2 * Sw.C2 + Cos2 * Sw.S2);
         const FLOAT Side = 0.25f * (Sin3 * Sw.C3 + Cos3 * Sw.S3) * Len;
-        return FVector((PushX * Sway - W.DirY * Side) * T.Up, (PushY * Sway + W.DirX * Side) * T.Up,
-                       -0.15f * Push2 * Sw.S0 * T.Up);
+        Out.X += (PushX * Sway - W.DirY * Side) * T.Up;
+        Out.Y += (PushY * Sway + W.DirX * Side) * T.Up;
+        Out.Z += -0.15f * Push2 * Sw.S0 * T.Up;
     };
-    enum { FacesMost = (65536 + 16) / 3 - 2 };
     INT  Faces = 0;
     FBox Box(0);
     // The wood: its rings' corners swayed, then its faces by them.
-    static FVector Ring[RdxTree::ShadowWoodMost * 6];
+    FVector* const Ring = F.Ring;
     const RdxTree::FShadowCorner* const Wc = GTreeShadowCorners ? GTreeShadowCorners + V.ShadowWoodStart : nullptr;
     const unsigned int* const           Wi = GTreeShadowIndex ? GTreeShadowIndex + V.ShadowIndexStart : nullptr;
-    const INT Corners = (Wc && Wi) ? Min(V.ShadowWoodCount, (INT)(RdxTree::ShadowWoodMost * 6)) : 0;
+    const INT Corners = (Wc && Wi) ? Min(V.ShadowWoodCount, (INT)RdxTree::ShadowCornersMost) : 0;
     for (INT c = 0; c < Corners; c++)
-        Ring[c] = Place(Wc[c].X, Wc[c].Y, Wc[c].Z) + Push(Wc[c].Sway);
-    for (INT i = 0; Corners > 0 && i + 2 < V.ShadowIndexCount && Faces < FacesMost; i += 3)
+        Placed(Wc[c].X, Wc[c].Y, Wc[c].Z, Wc[c].Sway, Ring[c]);
+    for (INT i = 0; Corners > 0 && i + 2 < V.ShadowIndexCount && Faces < PlantFacesMost; i += 3)
     {
         if (Wi[i] >= (unsigned int)Corners || Wi[i + 1] >= (unsigned int)Corners || Wi[i + 2] >= (unsigned int)Corners)
             continue;
         for (INT k = 0; k < 3; k++)
         {
             const INT v = Faces * 3 + k;
-            GShadowFrameVerts[v] = Ring[Wi[i + k]];
-            GPlantPlaceU[v]      = 0.0f;
-            GPlantPlaceV[v]      = 0.0f;
-            BoxAdd(Box, GShadowFrameVerts[v]);
+            F.Verts[v]  = Ring[Wi[i + k]];
+            F.PlaceU[v] = 0.0f;
+            F.PlaceV[v] = 0.0f;
+            BoxAdd(Box, F.Verts[v]);
         }
-        GPlantFaceLeaf[Faces++] = 0;
+        F.FaceLeaf[Faces++] = 0;
     }
     // The leaves: each one's foot swayed with its twig, its blade turned and sized with the plant - two faces.
     if (S.PlantLeafSlot > 0)
@@ -24912,27 +30163,31 @@ static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT
         const RdxTree::FShadowLeaf* const Lf    = GTreeShadowLeaves + V.ShadowLeafStart;
         const FLOAT                       Scale = 0.5f * (T.Across + T.Up);
         static const INT                  Tri[6] = { 0, 1, 2, 2, 1, 3 };
-        for (INT l = 0; l < V.ShadowLeafCount && Faces + 2 <= FacesMost; l++)
+        FVector&                          Foot   = F.Corner[0];
+        FVector* const                    Q      = F.Corner + 1;
+        const INT                         Leaves = PlantShadowLeaves(V.ShadowLeafCount, Min(V.PetalCount, V.ShadowLeafCount));
+        for (INT l = 0; l < Leaves && Faces + 2 <= PlantFacesMost; l++)
         {
-            const RdxTree::FShadowLeaf& L    = Lf[l];
-            const FVector               Foot = Place(L.X, L.Y, L.Z) + Push(L.Sway);
-            FVector Q[4];
+            const RdxTree::FShadowLeaf& L = Lf[l];
+            Placed(L.X, L.Y, L.Z, L.Sway, Foot);
             for (INT k = 0; k < 4; k++)
             {
                 const FLOAT Ox = L.Corner[k][0] * Scale, Oy = L.Corner[k][1] * Scale;
-                Q[k] = Foot + FVector(C * Ox - Sn * Oy, Sn * Ox + C * Oy, L.Corner[k][2] * Scale);
+                Q[k].X = Foot.X + (C * Ox - Sn * Oy);
+                Q[k].Y = Foot.Y + (Sn * Ox + C * Oy);
+                Q[k].Z = Foot.Z + L.Corner[k][2] * Scale;
             }
             for (INT f = 0; f < 2; f++)
             {
                 for (INT k = 0; k < 3; k++)
                 {
                     const INT v = Faces * 3 + k, q = Tri[f * 3 + k];
-                    GShadowFrameVerts[v] = Q[q];
-                    GPlantPlaceU[v]      = L.U[q];
-                    GPlantPlaceV[v]      = L.V[q];
+                    F.Verts[v]  = Q[q];
+                    F.PlaceU[v] = L.U[q];
+                    F.PlaceV[v] = L.V[q];
                     BoxAdd(Box, Q[q]);
                 }
-                GPlantFaceLeaf[Faces++] = 1;
+                F.FaceLeaf[Faces++] = 1;
             }
         }
     }
@@ -24948,6 +30203,310 @@ static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT
     S.Colour = RdxMath::PackRtAlbedo(RdxMath::RtAlbedoByte(62), RdxMath::RtAlbedoByte(74), RdxMath::RtAlbedoByte(40),
                                      false);
     return 1;
+}
+
+// A grown plant as a caster (PrepareCasterShape): its variant's shape for the shadows where the plant stands, swayed by
+// the wind as its drawing is (TreeShader.h's Swayed: the push at its foot, each part's chain of sways summed - its
+// leaves' own flutter left out) - or, bStill, as it stands with no wind. Three corners a face into GPlantFacesHere's
+// arrays: GShadowFrameVerts, their places on the leaves' sheet into GPlantPlaceU and V, whether each face is a leaf's
+// into GPlantFaceLeaf. The leaves cast by the sheet's mask; without one, the wood alone.
+static UBOOL PreparePlantShape(FBackend& Backend, ULevel* XLevel, AActor* A, INT Plant, FCasterShape& S, INT& Why,
+                               UBOOL bStill)
+{
+    const FTreeInstance& T = GTreeInstances[Plant];
+    const FTreeVariant&  V = GTreeVariants[T.Variant];
+    StartPlantShape(A, Plant, (V.ShadowLeafCount > 0 && GTreeShadowLeaves) ? PlantLeafMask(Backend, V) : -2, S);
+    FPlantSway Sw;
+    PlantSwayOf(XLevel, T, bStill, Sw);
+    return PlantFacesOf(Sw, GPlantFacesHere, S, Why);
+}
+
+// The plants laid ahead (FPlantJob): of the shadow frame's casters, the grown plants whose shapes AddShadowMapCaster
+// will lay anew this frame - as the shapes' cache says before the loop - laid on the helpers' threads, the farthest
+// first, while the game's thread goes through the casters in turn; it takes each where its turn comes, laying it
+// itself if no helper has (TakePlantJob). What the engine works out for a plant - its sines, the wind - is worked out
+// on the game's thread before (PlantSwayOf), the rest is PlantFacesOf and WritePlantShape on the same numbers with the
+// game thread's float control words: the bytes are those laid in turn.
+enum { PlantHelpersMost = 6 };
+struct FPlantHelper
+{
+    FVector* Verts;         // Room vertices each, as GPlantFacesHere's arrays
+    FLOAT*   PlaceU;
+    FLOAT*   PlaceV;
+    BYTE*    FaceLeaf;
+    WORD*    Oct;
+    FVector* Ring;          // RdxTree::ShadowCornersMost
+    FVector  Corner[5];
+    INT      Room;
+};
+static FPlantJob*    GPlantJobs       = nullptr;
+static INT           GPlantJobRoom    = 0;
+static INT           GPlantJobCount   = 0;
+static INT           GPlantJobNext    = 0;       // the first the loop has not come to
+static INT           GPlantJobMost    = 0;       // the most faces of one
+static UBOOL         GPlantJobsOpen   = 0;       // the helpers may be at them
+static INT           GPlantHelpers    = -1;      // -1: not asked yet
+static PTP_WORK      GPlantPool       = nullptr;
+static FPlantHelper  GPlantHelperOf[PlantHelpersMost];
+static volatile LONG GPlantHelperNext = 0;
+static UINT          GPlantCsr        = 0;       // the game thread's SSE control word, and its x87 one
+static WORD          GPlantX87        = 0;
+
+// A job's plant laid with arrays F: its faces, and its vertices as WriteCasterShape writes them.
+static void LayPlantJob(FPlantJob& J, const FPlantFaces& F)
+{
+    J.bShaped = PlantFacesOf(J.Sw, F, J.S, J.Why);
+    J.bMasked = J.bShaped ? WritePlantShape(J.S, F, J.bRt, J.Data, J.Data + J.S.Faces * 9) : 0;
+}
+
+static VOID CALLBACK PlantWorker(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK)
+{
+    const LONG Mine = ::InterlockedIncrement(&GPlantHelperNext) - 1;
+    if (Mine < 0 || Mine >= GPlantHelpers)
+        return;
+    FPlantHelper&     H = GPlantHelperOf[Mine];
+    const FPlantFaces F = { H.Verts, H.PlaceU, H.PlaceV, H.FaceLeaf, H.Oct, H.Ring, H.Corner };
+    const UINT        Csr = _mm_getcsr();
+    WORD              X87 = 0, Want = GPlantX87;
+    __asm fnstcw X87
+    __asm fldcw Want
+    _mm_setcsr(GPlantCsr);
+    for (INT j = GPlantJobCount - 1; j >= 0; j--)
+    {
+        FPlantJob& J = GPlantJobs[j];
+        if (J.Most * 3 > H.Room || ::InterlockedCompareExchange(&J.State, 1, 0) != 0)
+            continue;
+        LayPlantJob(J, F);
+        ::InterlockedExchange(&J.State, 2);
+    }
+    _mm_setcsr(Csr);
+    __asm fldcw X87
+}
+
+// Whether AddShadowMapCaster will lay a caster's shape anew this frame, as the shapes' cache stands - read only:
+// FindShapeEntry would take a place for it. Its verdict, in its order.
+static UBOOL ShapeLaidAnew(AActor* A, FLOAT Dist, INT EngineFrame)
+{
+    if (!GShapeCacheOn || !GShapes)
+        return 1;
+    const FShapeEntry* E     = nullptr;
+    const INT          Start = ShapeCacheStart(A, GShapeCacheSize);
+    for (INT p = 0; p < SHAPE_CACHE_PROBE && !E; p++)
+        if (GShapes[(Start + p) % GShapeCacheSize].Key.Actor == A)
+            E = &GShapes[(Start + p) % GShapeCacheSize];
+    if (!E)
+        return 1;
+    FShapeKey Key;
+    MakeShapeKey(A, Key);
+    const UBOOL bHas  = E->bHasData && !(GShapeRtNow && !E->bRt);
+    const UBOOL bSame = Key.AnimFrame >= 0.0f && SameShapeKey(E->Key, Key);
+    if (bSame && bHas)
+        return 0;
+    const INT Stride = GShapeStrideOn ? ShapeStride(Dist) : 1;
+    if (!bSame && Stride > 1 && bHas && E->Tris > 0 && EngineFrame - E->MadeFrame < Stride &&
+        SameShapeButMotion(E->Key, Key))
+        return 0;
+    return 1;
+}
+
+static void OpenPlantJobs()
+{
+    GPlantJobCount = 0;
+    GPlantJobNext  = 0;
+    GPlantJobMost  = 0;
+    GPlantJobsOpen = 0;
+}
+
+// A caster the loop will come to: laid ahead if it is a grown plant whose shape will be laid anew.
+static void AddPlantJob(FBackend& Backend, AActor* A, FLOAT Dist, INT EngineFrame)
+{
+    if (GShapeMotionOnlyNow || GPlantHelpers == 0)
+        return;
+    const INT Plant = GrownPlantOf(A);
+    if (Plant < 0 || !ShapeLaidAnew(A, Dist, EngineFrame))
+        return;
+    const FTreeInstance& T = GTreeInstances[Plant];
+    const FTreeVariant&  V = GTreeVariants[T.Variant];
+    INT LeafSlot = -2;
+    if (V.ShadowLeafCount > 0 && GTreeShadowLeaves)
+    {
+        // Its leaves' mask only as it is made already: one made here would take its slot before the casters ahead.
+        LeafSlot = Backend.FindShadowMask((void*)&PlantLeafSheet(V)[0]);
+        if (LeafSlot == -1)
+            return;
+    }
+    const INT Wood = (GTreeShadowCorners && GTreeShadowIndex) ? V.ShadowIndexCount / 3 : 0;
+    const INT Most = Min((INT)PlantFacesMost, Wood + ((LeafSlot > 0) ? 2 * V.ShadowLeafCount : 0));
+    if (Most <= 0)
+        return;
+    if (GPlantJobCount == GPlantJobRoom)
+    {
+        const INT        Room  = Max(GPlantJobRoom * 2, 16);
+        FPlantJob* const Grown = (FPlantJob*)appRealloc(GPlantJobs, Room * sizeof(FPlantJob), TEXT("RdxPlantJobs"));
+        if (!Grown)
+            return;
+        appMemzero(Grown + GPlantJobRoom, (Room - GPlantJobRoom) * sizeof(FPlantJob));
+        GPlantJobs    = Grown;
+        GPlantJobRoom = Room;
+    }
+    FPlantJob& J = GPlantJobs[GPlantJobCount];
+    if (J.Room < Most * 18)
+    {
+        FLOAT* const Grown = (FLOAT*)appRealloc(J.Data, Most * 18 * sizeof(FLOAT), TEXT("RdxPlantJobs"));
+        if (!Grown)
+            return;
+        J.Data = Grown;
+        J.Room = Most * 18;
+    }
+    J.A       = A;
+    J.Most    = Most;
+    J.bRt     = GShapeRtNow && !GShapeMotionOnlyNow;
+    J.bShaped = 0;
+    J.Why     = 0;
+    J.bMasked = 0;
+    J.State   = 0;
+    StartPlantShape(A, Plant, LeafSlot, J.S);
+    PlantSwayOf(A->XLevel, T, 0, J.Sw);
+    GPlantJobMost = Max(GPlantJobMost, Most);
+    GPlantJobCount++;
+}
+
+// The plants laid ahead go to the helpers, with the game thread's float control words.
+static void StartPlantJobs()
+{
+    if (GPlantJobCount <= 0)
+        return;
+    if (GPlantHelpers < 0)
+    {
+        SYSTEM_INFO Si;
+        ::GetSystemInfo(&Si);
+        // One processor is left alone, as for the spots' level triangles.
+        GPlantHelpers = Clamp((INT)Si.dwNumberOfProcessors - 2, 0, (INT)PlantHelpersMost);
+        if (GPlantHelpers > 0)
+            GPlantPool = ::CreateThreadpoolWork(PlantWorker, nullptr, nullptr);
+        if (!GPlantPool)
+            GPlantHelpers = 0;
+        RdxLog(TEXT("shadows: the grown plants' shapes laid ahead on %i threads"), GPlantHelpers);
+    }
+    INT Helpers = Min(GPlantHelpers, GPlantJobCount);
+    for (INT k = 0; k < Helpers; k++)
+    {
+        FPlantHelper& H    = GPlantHelperOf[k];
+        const INT     Want = GPlantJobMost * 3;
+        if (!H.Ring)
+            H.Ring = (FVector*)appMalloc(RdxTree::ShadowCornersMost * sizeof(FVector), TEXT("RdxPlantHelpers"));
+        if (H.Ring && H.Room < Want)
+        {
+            FVector* const Verts    = (FVector*)appRealloc(H.Verts, Want * sizeof(FVector), TEXT("RdxPlantHelpers"));
+            H.Verts                 = Verts ? Verts : H.Verts;
+            FLOAT* const   PlaceU   = (FLOAT*)appRealloc(H.PlaceU, Want * sizeof(FLOAT), TEXT("RdxPlantHelpers"));
+            H.PlaceU                = PlaceU ? PlaceU : H.PlaceU;
+            FLOAT* const   PlaceV   = (FLOAT*)appRealloc(H.PlaceV, Want * sizeof(FLOAT), TEXT("RdxPlantHelpers"));
+            H.PlaceV                = PlaceV ? PlaceV : H.PlaceV;
+            BYTE* const    FaceLeaf = (BYTE*)appRealloc(H.FaceLeaf, Want / 3 + 1, TEXT("RdxPlantHelpers"));
+            H.FaceLeaf              = FaceLeaf ? FaceLeaf : H.FaceLeaf;
+            WORD* const    Oct      = (WORD*)appRealloc(H.Oct, Want * sizeof(WORD), TEXT("RdxPlantHelpers"));
+            H.Oct                   = Oct ? Oct : H.Oct;
+            if (Verts && PlaceU && PlaceV && FaceLeaf && Oct)
+                H.Room = Want;
+        }
+        if (!H.Ring || H.Room < Want)
+        {
+            // Short of memory: the helpers before it, or none - the game's thread lays the rest in turn.
+            Helpers = k;
+            break;
+        }
+    }
+    if (Helpers <= 0)
+        return;
+    GPlantCsr = _mm_getcsr();
+    WORD X87  = 0;
+    __asm fnstcw X87
+    GPlantX87        = X87;
+    GPlantHelperNext = 0;
+    GPlantJobsOpen   = 1;
+    for (INT k = 0; k < Helpers; k++)
+        ::SubmitThreadpoolWork(GPlantPool);
+}
+
+// The plant laid ahead for A, waited for while a helper lays it, laid here if none has taken it - or null, none was.
+static FPlantJob* TakePlantJob(AActor* A)
+{
+    if (!GPlantJobsOpen)
+        return nullptr;
+    for (INT j = GPlantJobNext; j < GPlantJobCount; j++)
+    {
+        FPlantJob& J = GPlantJobs[j];
+        if (J.A != A)
+            continue;
+        GPlantJobNext = j + 1;
+        if (::InterlockedCompareExchange(&J.State, 1, 0) == 0)
+        {
+            LayPlantJob(J, GPlantFacesHere);
+            ::InterlockedExchange(&J.State, 2);
+        }
+        else
+            WaitJobDone(J.State);
+        return &J;
+    }
+    return nullptr;
+}
+
+// After the caster loop: every plant taken is laid, so a helper not started yet has nothing left to do - it is called
+// off - and one still laying a plant nobody took, the cache having said otherwise in the end, is waited for. And the
+// rooms of the jobs this frame did not ask for go: a frame with many plants to lay anew, the first after a load,
+// would hold as many.
+static void ClosePlantJobs()
+{
+    if (GPlantJobsOpen)
+    {
+        GPlantJobsOpen = 0;
+        ::WaitForThreadpoolWorkCallbacks(GPlantPool, TRUE);
+    }
+    for (INT j = GPlantJobCount; j < GPlantJobRoom; j++)
+        if (GPlantJobs[j].Data)
+        {
+            appFree(GPlantJobs[j].Data);
+            GPlantJobs[j].Data = nullptr;
+            GPlantJobs[j].Room = 0;
+        }
+}
+
+// The plants laid ahead, for good (the renderer's Exit): the helpers' work and every room it held.
+static void ForgetPlantJobs()
+{
+    if (GPlantPool)
+    {
+        ::WaitForThreadpoolWorkCallbacks(GPlantPool, TRUE);
+        ::CloseThreadpoolWork(GPlantPool);
+        GPlantPool = nullptr;
+    }
+    GPlantHelpers  = -1;
+    GPlantJobsOpen = 0;
+    for (INT j = 0; j < GPlantJobRoom; j++)
+        if (GPlantJobs[j].Data)
+            appFree(GPlantJobs[j].Data);
+    if (GPlantJobs)
+        appFree(GPlantJobs);
+    GPlantJobs     = nullptr;
+    GPlantJobRoom  = 0;
+    GPlantJobCount = 0;
+    GPlantJobNext  = 0;
+    for (INT k = 0; k < PlantHelpersMost; k++)
+    {
+        FPlantHelper& H = GPlantHelperOf[k];
+        void* const   Held[6] = { H.Verts, H.PlaceU, H.PlaceV, H.FaceLeaf, H.Oct, H.Ring };
+        for (INT i = 0; i < 6; i++)
+            if (Held[i])
+                appFree(Held[i]);
+        H.Verts    = nullptr;
+        H.PlaceU   = nullptr;
+        H.PlaceV   = nullptr;
+        H.FaceLeaf = nullptr;
+        H.Oct      = nullptr;
+        H.Ring     = nullptr;
+        H.Room     = 0;
+    }
 }
 
 // A mirror shows what is near it, and a level holds a hundred such plants: the nearest few within a short reach of the
@@ -25028,8 +30587,8 @@ static INT AddLevelPlantCaster(FBackend& Backend, ULevel* Level, INT Plant, FLOA
     }
     FLevelPlantShape&   K = GLevelPlantShapes[Plant];
     const FTreeVariant& V = GTreeVariants[GTreeInstances[Plant].Variant];
-    const INT LeafSlot = (V.ShadowLeafCount > 0 && GTreeShadowLeaves) ? PlantLeafMask(Backend, V.bCards) : -2;
-    if (!K.bMade || K.bRt != GShapeRtNow || K.LeafSlot != LeafSlot)
+    const INT LeafSlot = (V.ShadowLeafCount > 0 && GTreeShadowLeaves) ? PlantLeafMask(Backend, V) : -2;
+    if (!K.bMade || K.bRt != GShapeRtNow || K.LeafSlot != LeafSlot || K.TreesLevel != GRunTrees)
     {
         FCasterShape S;
         const UBOOL  bShaped = PreparePlantShape(Backend, Level, nullptr, Plant, S, Why, 1);
@@ -25041,11 +30600,12 @@ static INT AddLevelPlantCaster(FBackend& Backend, ULevel* Level, INT Plant, FLOA
             K.Data = (bShaped && S.Faces > 0) ? (FLOAT*)appMalloc(S.Faces * 18 * sizeof(FLOAT), TEXT("RdxLevelPlantShapes"))
                                               : nullptr;
         }
-        K.bMade    = 1;
-        K.bRt      = GShapeRtNow;
-        K.LeafSlot = LeafSlot;
-        K.Tris     = 0;
-        K.Why      = bShaped ? (K.Data ? 0 : 3) : Why;
+        K.bMade      = 1;
+        K.bRt        = GShapeRtNow;
+        K.LeafSlot   = LeafSlot;
+        K.TreesLevel = GRunTrees;
+        K.Tris       = 0;
+        K.Why        = bShaped ? (K.Data ? 0 : 3) : Why;
         if (!bShaped || !K.Data)
         {
             Why = K.Why;
@@ -25325,21 +30885,33 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
             };
             // The plants: each group's part its own first sheet is in, in the group's place in the list; the other
             // parts after all of them - so every plant no parting touched keeps its number, and with it its seed (its
-            // variant, its turn). A part the list has no room for keeps its sheets as the game draws them.
-            for (INT i = 0; i < Listed; i++)
+            // variant, its turn). A part the list has no room for keeps its sheets as the game draws them. The kinds
+            // grown since the others the same way after them, each in turn - the yellow roses (Kind_RoseYellow), then
+            // the plants grown stem by stem (RdxTree::IsStemPlant) -, so that no plant's number moved when they came: a
+            // group's sheets are all of one kind.
+            for (INT Late = 0; Late < 3; Late++)
             {
-                const INT f = List[i];
-                if (Root(f) != f || Count >= ActorPlants + SheetTreeMax)
-                    continue;
-                SurfOf[PartOf(f)] = Grow(f);
-            }
-            for (INT i = 0; i < Listed; i++)
-            {
-                const INT f = List[i];
-                if (PartOf(f) != f || SurfOf[f] >= 0 || SurfOf[PartOf(Root(f))] < 0 || Count >= ActorPlants + SheetTreeMax)
-                    continue;
-                SurfOf[f] = Grow(f);
-                Parted++;
+                auto IsLate = [&](INT f)
+                {
+                    const INT Kind = LevelPlantPictureKind(M->Surfs(f).Texture);
+                    return (Kind == RdxTree::Kind_RoseYellow) ? 1 : (RdxTree::IsStemPlant((RdxTree::EKind)Kind) ? 2 : 0);
+                };
+                for (INT i = 0; i < Listed; i++)
+                {
+                    const INT f = List[i];
+                    if (Root(f) != f || IsLate(f) != Late || Count >= ActorPlants + SheetTreeMax)
+                        continue;
+                    SurfOf[PartOf(f)] = Grow(f);
+                }
+                for (INT i = 0; i < Listed; i++)
+                {
+                    const INT f = List[i];
+                    if (PartOf(f) != f || IsLate(f) != Late || SurfOf[f] >= 0 || SurfOf[PartOf(Root(f))] < 0 ||
+                        Count >= ActorPlants + SheetTreeMax)
+                        continue;
+                    SurfOf[f] = Grow(f);
+                    Parted++;
+                }
             }
             for (INT i = 0; i < Listed; i++)
                 SurfOf[List[i]] = SurfOf[PartOf(List[i])];
@@ -25441,6 +31013,16 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
     RdxTree::TList<unsigned int>           SIndex;
     RdxTree::TList<RdxTree::FShadowLeaf>   SLeaves;
     INT First[TreeKinds], Variants[TreeKinds];
+    // Each kind's plants smaller than TreeEzLeast: EZ-Tree's shapes drawn that small are twisted ribbons rather than
+    // boughs, so they are grown the own way - a kind all of whose plants are so has no EZ-Tree variant at all. Another
+    // bound for a run from the marker SecondRevision-tree-ez-least.txt, a measurement.
+    const FLOAT TreeEzLeast = (FLOAT)MarkerNumber(L"SecondRevision-tree-ez-least.txt", TreeEzLeastUnits, TreeEzLeastUnits);
+    INT Small[TreeKinds];
+    for (INT k = 0; k < TreeKinds; k++)
+        Small[k] = 0;
+    for (INT i = 0; i < Count; i++)
+        if (Found[i].Top - Found[i].Bottom < TreeEzLeast)
+            Small[Found[i].Kind]++;
     UBOOL bFailed = 0;
     for (INT k = 0; k < TreeKinds; k++)
     {
@@ -25472,9 +31054,13 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
         // The crown a little wider than the model's.
         RdxTree::FShape S = RdxTree::ShapeOf((RdxTree::EKind)k, Tall, Max(Widest * 1.1f, 8.0f));
         const UBOOL bBush = RdxTree::IsBush((RdxTree::EKind)k);
-        // A tree's trunk shows below its crown, some sixth of its height at least.
-        S.CrownBase = bBush ? Clamp(0.1f * (FLOAT)Base, 0.0f, 0.3f) : Clamp(0.1f * (FLOAT)Base, 0.15f, 0.5f);
-        S.Widest    = Clamp((0.1f * ((FLOAT)At + 0.5f) - S.CrownBase) / Max(1.0f - S.CrownBase, 0.1f), 0.25f, 0.75f);
+        // A tree's trunk shows below its crown, some sixth of its height at least. A shrub rose keeps its own shape:
+        // the flowers' sheets it stands in for tell nothing of it.
+        if (!RdxTree::IsRose((RdxTree::EKind)k))
+        {
+            S.CrownBase = bBush ? Clamp(0.1f * (FLOAT)Base, 0.0f, 0.3f) : Clamp(0.1f * (FLOAT)Base, 0.15f, 0.5f);
+            S.Widest    = Clamp((0.1f * ((FLOAT)At + 0.5f) - S.CrownBase) / Max(1.0f - S.CrownBase, 0.1f), 0.25f, 0.75f);
+        }
         // A tree's trunk as thick as a park tree's of its height (RdxTree::TrunkFoot), narrowing a little up to the
         // crown; not the model's, which measured several times that.
         for (INT b = 0; b < 10; b++)
@@ -25484,17 +31070,16 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
                  k, F.A ? F.A->GetName() : TEXT("the level's foliage sheets"), Tall, 2.0f * Widest, At, Base,
                  2.0f * S.Bark[0], 2.0f * F.Bark[0]);
         // The box hedge laid in EZ-Tree's cards, where their sheet is there (RdxTree::SkinLeaves).
-        S.Cards = (S.Box > 0.0f && (GRunTrees == 1 || GRunTrees == TreesMixed) && MakeTreeCards()) ? true : false;
+        S.Cards = (S.Box > 0.0f && MakeTreeCards()) ? true : false;
         const INT Want = Min(ByKind[k], (INT)TreeVariantsPerKind);
         for (INT v = 0; v < Want && !bFailed; v++)
         {
             RdxTree::FPlant Plant;
             RdxTree::FMesh  Mesh;
             const unsigned int Seed = (unsigned int)Hash ^ (unsigned int)(k * 7919 + v * 104729);
-            // EZ-Tree's way (Trees3D's first way on), where its cards' sheet is there; the own way otherwise.
-            // Mixed: every other variant of a kind EZ-Tree's way - a level's plants of a kind take their variants
-            // in turn, so about half of them stand each way.
-            const UBOOL bEzWay = (GRunTrees == 1 || (GRunTrees == TreesMixed && (v % 2) == 0)) ? 1 : 0;
+            // Every other variant of a kind EZ-Tree's way, where its cards' sheet is there, the rest the own way - a
+            // level's plants of a kind take their variants in turn, so about half of them stand each way.
+            const UBOOL bEzWay = ((v % 2) == 0 && Small[k] < ByKind[k]) ? 1 : 0;
             const UBOOL bEz    = (bEzWay && RdxTree::EzGrows((RdxTree::EKind)k) && MakeTreeCards()) ? 1 : 0;
             if (bEz ? !RdxTree::GrowEz(S, Seed, Plant, Mesh, TreeBarkWorld)
                     : (!RdxTree::Grow(S, Seed, Plant, Grid) || !RdxTree::Build(Plant, Mesh, TreeBarkWorld)))
@@ -25506,6 +31091,10 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
             V.Height     = S.Height;
             V.Radius     = S.Radius;
             V.bCards     = (bEz || S.Cards) ? 1 : 0;
+            V.bCarved    = bEz ? 0 : 1;
+            V.bRose      = RdxTree::IsRose((RdxTree::EKind)k) ? 1 : 0;
+            V.bYellow    = (k == RdxTree::Kind_RoseYellow) ? 1 : 0;
+            V.bStem      = RdxTree::IsStemPlant((RdxTree::EKind)k) ? 1 : 0;
             V.TrunkCount = bBush ? 0 : RdxTree::TrunkOf(Plant, V.Trunk, TreeTrunkRoom);
             const unsigned int Base0 = (unsigned int)Verts.Num;
             for (INT i = 0; i < Mesh.Bark.Num; i++)
@@ -25514,8 +31103,46 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
             V.BarkCount = Mesh.BarkIndex.Num;
             for (INT i = 0; i < Mesh.BarkIndex.Num; i++)
                 bFailed |= !Index.Add(Mesh.BarkIndex[i] + Base0);
+            // Its bark far off, at the lower levels (RdxMath::TreeThinPixelsOf): only its wood from two twigs' radius
+            // on, then from four - plain, the own way's grown again from the same plant, EZ-Tree's from the same seed.
+            // Where one would be no less than the whole, the whole stands for it.
+            V.Twig = S.Twig;
+            for (INT f = 0; f < 2 && !bFailed; f++)
+            {
+                V.FarStart[f] = V.BarkStart;
+                V.FarCount[f] = V.BarkCount;
+                RdxTree::FPlant Again;
+                RdxTree::FMesh  Far;
+                const FLOAT     Least = S.Twig * (f ? 4.0f : 2.0f);
+                const UBOOL     bMade = bEz ? RdxTree::GrowEz(S, Seed, Again, Far, TreeBarkWorld, Least)
+                                            : RdxTree::Build(Plant, Far, TreeBarkWorld, true, Least);
+                if (!bMade || Far.BarkIndex.Num >= V.BarkCount)
+                    continue;
+                const unsigned int Base1 = (unsigned int)Verts.Num;
+                for (INT i = 0; i < Far.Bark.Num; i++)
+                    bFailed |= !Verts.Add(Far.Bark[i]);
+                V.FarStart[f] = Index.Num;
+                V.FarCount[f] = Far.BarkIndex.Num;
+                for (INT i = 0; i < Far.BarkIndex.Num; i++)
+                    bFailed |= !Index.Add(Far.BarkIndex[i] + Base1);
+            }
+            // Its flowers' heads, whole at any distance: drawn as the bark is, in the leaves' sheet's petals - a
+            // yellow rose's in the yellow petals' sheet, whose two cells are the leaves' sheet's last two.
+            const unsigned int Base2 = (unsigned int)Verts.Num;
+            for (INT i = 0; i < Mesh.Petal.Num; i++)
+            {
+                RdxTree::FVertex P = Mesh.Petal[i];
+                if (V.bYellow)
+                    P.U = P.U * 4.0f - 3.0f;
+                bFailed |= !Verts.Add(P);
+            }
+            V.FlowerStart = Index.Num;
+            V.FlowerCount = Mesh.PetalIndex.Num;
+            for (INT i = 0; i < Mesh.PetalIndex.Num; i++)
+                bFailed |= !Index.Add(Mesh.PetalIndex[i] + Base2);
             V.LeafStart = Leaves.Num;
             V.LeafCount = Mesh.Leaf.Num;
+            V.PetalCount = RdxTree::PetalsOf(Mesh);
             for (INT i = 0; i < Mesh.Leaf.Num; i++)
                 bFailed |= !Leaves.Add(Mesh.Leaf[i]);
             // Its shape for the shadows (RdxTree::ShadowWood, ShadowLeaves).
@@ -25524,7 +31151,9 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
             V.ShadowLeafStart  = SLeaves.Num;
             bFailed |= (S.Box > 0.0f) ? !RdxTree::ShadowBox(Mesh, SWood, SIndex)
                                       : (!RdxTree::ShadowWood(Plant, SWood, SIndex) ||
-                                         !RdxTree::ShadowLeaves(Mesh, V.bCards ? 1.0f : 0.5f, SLeaves));
+                                         !RdxTree::ShadowFlowers(Plant, SWood, SIndex, (unsigned int)V.ShadowWoodStart) ||
+                                         !RdxTree::ShadowLeaves(Mesh, (V.bCards || V.bRose || V.bStem) ? 1.0f : 0.5f,
+                                                                SLeaves));
             V.ShadowWoodCount  = SWood.Num - V.ShadowWoodStart;
             V.ShadowIndexCount = SIndex.Num - V.ShadowIndexStart;
             V.ShadowLeafCount  = SLeaves.Num - V.ShadowLeafStart;
@@ -25596,7 +31225,35 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
                 PlantOf[i - ActorPlants] = GTreeCount;
             const unsigned int Own = RdxTree::Hash((unsigned int)i * 2654435761u ^ (unsigned int)Hash);
             FTreeInstance&     T   = GTreeInstances[GTreeCount++];
-            T.Variant   = First[F.Kind] + (INT)(Own % (unsigned int)Variants[F.Kind]);
+            INT                Pick = (INT)(Own % (unsigned int)Variants[F.Kind]);
+            // A small plant one of its kind's variants grown the own way, where the kind has any (Small).
+            if (F.Top - F.Bottom < TreeEzLeast)
+            {
+                INT OwnWays = 0;
+                for (INT v = 0; v < Variants[F.Kind]; v++)
+                    OwnWays += GTreeVariants[First[F.Kind] + v].bCarved ? 1 : 0;
+                INT Nth = OwnWays ? (INT)(Own % (unsigned int)OwnWays) : -1;
+                for (INT v = 0; v < Variants[F.Kind] && Nth >= 0; v++)
+                    if (GTreeVariants[First[F.Kind] + v].bCarved && Nth-- == 0)
+                        Pick = v;
+            }
+            T.Variant   = First[F.Kind] + Pick;
+            // A measurement (the marker SecondRevision-tree-near.txt): the plants near the player as the level came,
+            // each with its height and the way it was grown.
+            static const UBOOL bSayNear = FreshMarker(L"SecondRevision-tree-near.txt");
+            if (bSayNear)
+                for (INT p = 0; p < Level->Actors.Num(); p++)
+                {
+                    const AActor* const P = Level->Actors(p);
+                    if (!P || !P->IsA(APlayerPawn::StaticClass()))
+                        continue;
+                    const FLOAT D = (FVector(F.X, F.Y, F.Bottom) - P->Location).Size();
+                    if (D < 1500.0f)
+                        RDX_LOGF("trees (marker): kind %i, %.0f units tall, grown %s, %.0f from the player", F.Kind,
+                                 F.Top - F.Bottom, GTreeVariants[T.Variant].bCarved ? TEXT("the own way")
+                                                                                    : TEXT("by EZ-Tree"), D);
+                    break;
+                }
             T.Actor     = F.A;
             const FTreeVariant& V = GTreeVariants[T.Variant];
             FLOAT Widest = 0.0f;
@@ -25620,6 +31277,10 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
                            ((F.Kind == RdxTree::Kind_Bush1) ? 0.0f : (FLOAT)((Own >> 8) & 1023u) * (2.0f * PI / 1024.0f));
             T.Up         = (F.Top - F.Bottom) / Max(V.Height, 1.0f);
             T.Across     = Max(Widest, 8.0f) / Max(V.Radius, 1.0f);
+            // A bed's rose or flower stretched up no more than across: its variant grown to the level's tallest
+            // bed, a narrow pot's would stand drawn out - a smaller plant there, its shape kept.
+            if (RdxTree::IsRose((RdxTree::EKind)F.Kind) || RdxTree::IsStemPlant((RdxTree::EKind)F.Kind))
+                T.Up = Min(T.Up, T.Across);
             T.Reach      = Max(Widest, 8.0f) * 1.15f + 8.0f;
             T.Top        = F.Top + 8.0f;
             T.Zone        = F.A ? F.A->Region.Zone
@@ -25800,6 +31461,45 @@ static void ReadLevelTrees(FBackend& Backend, ULevel* Level)
     RDX_LOGF("trees: the models' trunks stand %.1f units off their actors' middles on average, %.1f at most",
              GTreeCount ? OffSum / (FLOAT)GTreeCount : 0.0f, OffMost);
     appFree(Found);
+    GTreesRead++;
+}
+
+// The rain's cover under the level's plants (docs/terv-nedves-feluletek.md 8.4): a crown keeps part of the rain off the
+// wet floor under it - CrownCover of it at the trunk, less and less out to the crown's reach, none past it -, on a
+// floor about the height of the plant's foot (not a street far under a tree on a terrace).
+static const FLOAT CrownCover = 0.5f;
+static void CoverUnderCrowns(BYTE* Open, const FLOAT* Top, INT W, INT H, FLOAT X0, FLOAT Y0, FLOAT Cell)
+{
+    if (!Open || !Top || !GTreeInstances)
+        return;
+    INT Crowns = 0, Cells = 0;
+    for (INT t = 0; t < GTreeCount; t++)
+    {
+        const FTreeInstance& T = GTreeInstances[t];
+        const FLOAT          R = T.Reach;
+        if (R < Cell)
+            continue;
+        const INT CX0 = Max(0, (INT)((T.X - R - X0) / Cell)), CX1 = Min(W - 1, (INT)((T.X + R - X0) / Cell));
+        const INT CY0 = Max(0, (INT)((T.Y - R - Y0) / Cell)), CY1 = Min(H - 1, (INT)((T.Y + R - Y0) / Cell));
+        UBOOL bAny = 0;
+        for (INT cy = CY0; cy <= CY1; cy++)
+            for (INT cx = CX0; cx <= CX1; cx++)
+            {
+                const FLOAT DX = X0 + ((FLOAT)cx + 0.5f) * Cell - T.X, DY = Y0 + ((FLOAT)cy + 0.5f) * Cell - T.Y;
+                const FLOAT D2 = DX * DX + DY * DY;
+                const INT   At = cy * W + cx;
+                if (D2 >= R * R || Top[At] < T.Z - 128.0f || Top[At] > T.Z + 32.0f)
+                    continue;
+                const FLOAT Keep = CrownCover * (1.0f - D2 / (R * R));
+                Open[At] = (BYTE)((FLOAT)Open[At] * (1.0f - Keep) + 0.5f);
+                Cells++;
+                bAny = 1;
+            }
+        Crowns += bAny ? 1 : 0;
+    }
+    if (GTreeCount > 0)
+        RDX_LOGF("wet floors: the rain's cover under %i of the level's %i plants' crowns, %i cells", Crowns, GTreeCount,
+                 Cells);
 }
 
 // The level's plants read, for the frame's level - once a level, or again with the plants' meshes made again.
@@ -26505,9 +32205,12 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
     FTreeInstance& T = GTreeInstances[i];
     if (T.DrawnFrame == EngineFrame && T.DrawnView == (const void*)Frame)
         return 1;
-    const INT BarkSrv = Backend.PrepareTexture(GTreeBarkInfo, 0, 1);
-    const INT LeafSrv = GTreeVariants[T.Variant].bCards ? Backend.PrepareTexture(GTreeCardInfo, PF_Masked, 1)
-                                                        : Backend.PrepareTexture(GTreeLeafInfo, PF_Masked, 1);
+    const FTreeVariant& Vs      = GTreeVariants[T.Variant];
+    const INT           BarkSrv = Vs.bStem ? Backend.PrepareTexture(GTreeSkinInfo, 0, 1)
+                                           : Backend.PrepareTexture(GTreeBarkInfo, 0, 1);
+    const INT           LeafSrv = Vs.bCards ? Backend.PrepareTexture(GTreeCardInfo, PF_Masked, 1)
+                                            : (Vs.bStem ? Backend.PrepareTexture(GTreeStemInfo, PF_Masked, 1)
+                                                        : Backend.PrepareTexture(GTreeLeafInfo, PF_Masked, 1));
     // A block for the bark and one for the leaves: the same but for how a face takes a lamp's light.
     D3D12_GPU_VIRTUAL_ADDRESS Address[2] = { 0, 0 };
     FLOAT* const Blocks[2] = { (BarkSrv >= 0 && LeafSrv >= 0) ? Backend.GrassBlock(TreeBlockRows, Address[0]) : nullptr,
@@ -26540,13 +32243,22 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
     const FVector* const Axes[3] = { &Cs.XAxis, &Cs.YAxis, &Cs.ZAxis };
     // A far plant draws a share of its leaves - their order is shuffled, so any first share is the whole crown
     // thinned - each larger by as much as the share is less of the whole, so the crown covers as much: the whole of
-    // them within ten crowns' reach, a share falling as the square of the way beyond.
+    // them within the level's crowns' reach (RdxMath::TreeFullReachOf, High's twenty), a share falling as the square
+    // of the way beyond, to the level's least (TreeLeastShareOf). A shrub rose's petals, before its leaves, all of them
+    // at their own size: its flowers whole. The leaves past the share are not left out at once: a band of them after
+    // it - a quarter as many as it keeps, TreeLeafBand - drawn growing, the furthest in the order the smallest, so a
+    // leaf comes as the eye nears, from nothing to its whole size, instead of appearing (the shader's GLeaves).
     const FTreeVariant& Vr    = GTreeVariants[T.Variant];
     const FLOAT         Far   = (FVector(T.X, T.Y, T.Z + 0.5f * (T.Top - T.Z)) - Cs.Origin).Size();
-    const FLOAT         Near  = 10.0f * Max(T.Reach, 32.0f);
-    const FLOAT         Share = (Far > Near) ? Max((Near / Far) * (Near / Far), 0.12f) : 1.0f;
-    const INT           Drawn = Max((INT)appCeil(Share * (FLOAT)Vr.LeafCount), Min(Vr.LeafCount, 1));
-    const FLOAT         Grow  = appSqrt((FLOAT)Vr.LeafCount / (FLOAT)Max(Drawn, 1));
+    const FLOAT         Near  = RdxMath::TreeFullReachOf(GRunTrees) * Max(T.Reach, 32.0f);
+    const FLOAT         Share = (Far > Near) ? Max((Near / Far) * (Near / Far), RdxMath::TreeLeastShareOf(GRunTrees))
+                                             : 1.0f;
+    const INT           Whole = Vr.PetalCount;
+    const INT           Rest  = Vr.LeafCount - Whole;
+    const FLOAT         Keep  = Share * (FLOAT)Rest;
+    const FLOAT         Band  = Max(TreeLeafBand * Keep, 1.0f);
+    const INT           Drawn = Whole + Max(Min((INT)appCeil(Keep + Band), Rest), Min(Rest, 1));
+    const FLOAT         Grow  = appSqrt((FLOAT)Rest / Max(Keep, 1.0f));
     for (INT b = 0; b < 2; b++)
     {
         FLOAT* const B = Blocks[b];
@@ -26575,11 +32287,11 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
         B[27] = T.Turn;
         B[28] = T.Across;
         B[29] = T.Up;
-        B[30] = 1.0f;
+        B[30] = (b == 1 && Whole == 0) ? Grow : 1.0f;
         B[31] = (b == 1) ? Grow : 1.0f;
         B[32] = F.Before;
         B[33] = F.Strength;
-        B[34] = (b == 1 && Vr.bCards) ? 1.0f : 0.0f;
+        B[34] = (b == 1 && (Vr.bCards || Vr.bRose || Vr.bStem)) ? 1.0f : 0.0f;
         B[35] = (FLOAT)b;
         for (INT w = 0; w < RdxMath::RtCubeWays; w++)
         {
@@ -26587,12 +32299,57 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
             B[36 + 4 * w + 1] = T.Cube[3 * w + 1];
             B[36 + 4 * w + 2] = T.Cube[3 * w + 2];
             B[36 + 4 * w + 3] = 0.0f;
+        // The leaves' growing band (the shader's GLeaves): where in the order a leaf's size has come to nothing, and
+        // over how many leaves before that it grows to its whole.
+        B[60] = (FLOAT)Whole + Keep + Band;
+        B[61] = Band;
+        B[62] = B[63] = 0.0f;
         }
     }
     // The motion vectors' pass lays the world view's plants again (FSolidPass::DrawPlantMotion) - only while the wind
     // blows: with none a plant stands still, and the camera's vector is its own.
     const UBOOL bMoves = IsWorldView(Frame, EngineFrame) && F.Strength > 0.0f;
-    Backend.AddTreeDraw(GTreeVb, GTreeIb, Vr.BarkStart, Vr.BarkCount, Address[0], BarkSrv, bMoves);
+    // Far enough at the lower levels, only its thicker wood (RdxMath::TreeThinPixelsOf): from two twigs' radius on where
+    // the wood left out - four twigs across at the most - comes to fewer pixels across than the level's, from four
+    // where that wood does. A far bark of no wood at all - a bush's thin stems - draws none.
+    const FLOAT ThinPx = RdxMath::TreeThinPixelsOf(GRunTrees);
+    const FLOAT Thin   = 4.0f * Vr.Twig * Max(T.Across, 0.01f) * Frame->Proj.Z;
+    const INT   Lod    = (ThinPx <= 0.0f) ? 0 : (2.0f * Thin < ThinPx * Far) ? 2 : (Thin < ThinPx * Far) ? 1 : 0;
+    // The bark's relief, where the level's is drawn: its height map ready on the card, for the bark's run alone - on
+    // a smooth bark only: a carved one has its relief in its own shape, and the map pushed along its carved faces'
+    // turned normals would fray it.
+    UBOOL bBarkRelief = 0;
+    if (!Vr.bCarved && !Vr.bStem && ReliefRuns() && GTreeBarkHeight)
+    {
+        const INT Entry = Backend.PomOwn("secondrevision.bark", GTreeBarkHeight, GTreeBarkHeightBytes, 512, 1024,
+                                         TreeBarkRelief);
+        if (Entry >= 0 && Backend.PreparePom(Entry) && Backend.GetPomTable(Entry) >= 0)
+        {
+            FLOAT InvW = 0.0f, InvH = 0.0f;
+            Backend.GetPomSize(Entry, InvW, InvH);
+            // Geometry=DisplacementMapping where the card cuts patches: the bark itself pushed in by the map (its
+            // shading the map's too); otherwise the POM, its axes worked out by the pixel shader.
+            const UBOOL bReal = GRunGeometry == RdxMath::Geometry_Tess && Backend.CanTessellate();
+            Backend.SetPomRun(Backend.GetPomTable(Entry), TreeBarkRelief,
+                              (FLOAT)(bReal ? RdxMath::PomFlag_Tess : (RdxMath::PomFlag_On | RdxMath::PomFlag_Rates)),
+                              InvW, InvH);
+            bBarkRelief = 1;
+        }
+    }
+    Backend.AddTreeDraw(GTreeVb, GTreeIb, Lod ? Vr.FarStart[Lod - 1] : Vr.BarkStart,
+                        Lod ? Vr.FarCount[Lod - 1] : Vr.BarkCount, Address[0], BarkSrv, bMoves);
+    if (bBarkRelief)
+        Backend.ClearPomRun();
+    // Its flowers' heads, whole at any distance, as the bark is drawn but in the leaves' sheet's petals (a yellow
+    // rose's in its own sheet).
+    if (Vr.FlowerCount > 0)
+    {
+        const INT PetalSrv = Vr.bYellow ? Backend.PrepareTexture(GTreeYellowInfo, PF_Masked, 1) : LeafSrv;
+        if (PetalSrv >= 0)
+            Backend.AddTreeDraw(GTreeVb, GTreeIb, Vr.FlowerStart, Vr.FlowerCount, Address[0], PetalSrv, bMoves);
+    }
+    if (Lod)
+        GTreeFarDrawn[Lod - 1]++;
     // A far plant - drawing a share of its leaves - draws them flat (RdxTree::LeafFlat); and an EZ-Tree card is flat.
     const UBOOL bFlat = (Share < 1.0f || Vr.bCards) ? 1 : 0;
     Backend.AddLeafDraw(GTreeLeafVb, GTreeLeafIb, bFlat ? RdxTree::LeafFlat : 0,
@@ -26611,9 +32368,11 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
         GTreeLastFrame = EngineFrame;
         if (++GTreeFrames >= 600)
         {
-            RDX_LOGF("trees: %.1f plants drawn a frame over the last %i frames", (FLOAT)GTreeDrawn / GTreeFrames,
-                     GTreeFrames);
+            RDX_LOGF("trees: %.1f plants drawn a frame over the last %i frames - %.1f of them with only their wood from "
+                     "two twigs' radius on, %.1f from four", (FLOAT)GTreeDrawn / GTreeFrames, GTreeFrames,
+                     (FLOAT)GTreeFarDrawn[0] / GTreeFrames, (FLOAT)GTreeFarDrawn[1] / GTreeFrames);
             GTreeDrawn = GTreeFrames = 0;
+            GTreeFarDrawn[0] = GTreeFarDrawn[1] = 0;
         }
     }
     GTreeDrawn++;
@@ -26770,16 +32529,1914 @@ static FLOAT ReliefSpriteLift(const FSceneNode* Frame, INT FrameNumber, const FV
     return Lift;
 }
 
+// The models rounded (Spherifier; MeshRound.h, SolidPass.hlsl's DSMesh): a mesh's opaque triangle goes to the card as a
+// patch, cut where it is big enough on the screen and bowed out by its model's own shape - each edge by the vector
+// RdxMeshRound::FShape gives it, the same from both of its faces. For that a triangle must be known by its model and
+// face, and the engine says neither. It draws a model's triangles from one array of samples, a vertex a sample in the
+// model's own order: so a triangle's three samples lie as far apart as its face's vertices are numbered, which few of a
+// model's faces share (FModel::Signature). The model is that of an actor near the triangle in the view; the face, one
+// of its faces so numbered; and the array then begins where it must for that face. A guess is taken only where the
+// engine's own normals in the array agree with the ones the model's faces give in the places read there - a wrong one
+// reads other vertices' places, or what lies past the array. The draw's next triangles are known by their samples'
+// addresses alone, as long as they stand within the model's reach and are faces of it: another draw of the same model
+// in the same memory is read as it stands, its places being read where it keeps them. The places are read where the
+// engine keeps them, while it draws the model - never copied, and nothing is asked of the engine. A triangle not known
+// so is drawn flat, as before.
+//
+// The numbers: how much of the curve (the whole of it puts the middle of a regular polygon's side on its circle); how far, in
+// the engine's pixels, a cut piece of an edge may stand off its curve; a model whose reach on the screen is smaller
+// than MeshMinPixels is drawn flat (its curve would not show), as is the rest of a draw past MeshMostTries tries to know
+// it that came to nothing (RoundMissOf: a model the engine draws far off in a thinner shape of fewer vertices is never
+// known - its tries are its own, so that no other draw is left without any, square in one frame and round in the next
+// as the order the engine draws in turns); how many of a model's vertices the engine's normals are held against, how
+// far one may turn from the faces' and still agree, and how many guesses one triangle may take.
+static const FLOAT MeshShape     = 1.0f;
+static const FLOAT MeshSag       = 0.25f;
+static const FLOAT MeshMinPixels = 40.0f;
+static const INT   MeshMostTries = 16;
+static const INT   MeshChecks    = 8;
+static const FLOAT MeshCheckCos  = 0.8f;
+static const INT   MeshMostGuesses = 32;
+
+enum
+{
+    ROUND_MODELS = 512,   // models known since the level came
+    ROUND_ACTORS = 4096   // the level's actors that are drawn as a model
+};
+
+// A model, once a level: its faces (FModel), and its shape (FShape) once a draw of it was known.
+struct FRoundModel
+{
+    const UMesh*          Mesh;      // compared only
+    RdxMeshRound::FModel* Model;     // null: its faces make none
+    RdxMeshRound::FShape* Shape;     // null until a draw of it was known, or where its faces made no shape
+    BYTE*                 Round;     // a face: drawn rounded, by its material
+    UBOOL                 bShaped;   // the shape was tried
+    UBOOL                 bCurved;   // some edge of it bows: a model all of flat parts is drawn as it always was
+    // Each edge of its shape: its number among the frame's edges (FSolidPass::MeshEdgeRoom), the shape's pose stamp it
+    // was written for, how far its bends reach together and the least of its rooms (RoundEdgeRef).
+    INT*                  EdgeNo;
+    INT*                  EdgeStamp;
+    FLOAT*                EdgeSize;
+    FLOAT*                EdgeRoom;
+    // Each flat polygon of it (by its lowest face): its outline's record among the frame's edges plus one, 0 none, and
+    // the pose stamp it was written for (RoundPolyRef).
+    INT*                  PolyNo;
+    INT*                  PolyStamp;
+};
+static FRoundModel GRoundModels[ROUND_MODELS];
+static INT         GRoundModelCount = 0;
+
+// The frame's models: the level's actors drawn as one, each with its reach about its place (RoundReachOf) and that
+// place in the view the list was last placed in (RoundPlaceActors).
+struct FRoundActor
+{
+    AActor* Actor;
+    FLOAT   Reach;
+    FVector View;
+};
+static FRoundActor       GRoundActors[ROUND_ACTORS];
+static INT               GRoundActorCount = 0, GRoundActorsFrame = -1, GRoundPlacedFrameNo = -1;
+static const FSceneNode* GRoundPlacedFrame = nullptr;
+// Of them, the ones the view at hand may show big enough to round (RoundPlaceActors): far ones, drawn by the engine in
+// a thinner shape of fewer vertices besides, are never looked for.
+static INT GRoundWorth[ROUND_ACTORS];
+static INT GRoundWorthCount = 0;
+// The triangle that came to no model last: a triangle after it with a corner of its - the same sample, at the same
+// place - is of the same draw, and is not looked for again.
+static const FTransTexture* GRoundFailPts[3] = { nullptr, nullptr, nullptr };
+static FVector              GRoundFailAt[3];
+static INT                  GRoundFailFrameNo = -1;
+static INT                  GRoundFailDraw    = -1;   // its draw among the frame's not known (RoundMissOf)
+// The draws not known this frame, each told by its samples: a triangle with a corner that is one of such a draw's -
+// the same sample, at the same place - is of it (RoundMissOf). Past MeshMostTries tries of it that came to nothing, its
+// triangles are drawn flat unasked: a draw that is never known costs a few tries, and takes none from any other.
+struct FRoundMissed
+{
+    const FTransTexture* Sample;   // compared only
+    FLOAT                X, Y, Z;  // its place when it was noted
+    INT                  FrameNo;
+    INT                  Draw;     // its draw's number in GRoundMissTries
+};
+enum { ROUND_MISSED = 8192, ROUND_MISSED_PROBES = 8, ROUND_MISS_DRAWS = 4096 };
+static FRoundMissed GRoundMissed[ROUND_MISSED];
+static INT          GRoundMissTries[ROUND_MISS_DRAWS];
+static INT          GRoundMissCount = 0, GRoundMissFrame = -1;
+
+// The draw among this frame's not known that a corner of the triangle is a sample of, or -1.
+static INT RoundMissOf(FTransTexture* const* Pts, INT FrameNo)
+{
+    if (GRoundMissFrame != FrameNo)
+        return -1;
+    for (INT k = 0; k < 3; k++)
+    {
+        const FTransTexture* const S    = Pts[k];
+        const SIZE_T               Hash = ((SIZE_T)S >> 4) * 2654435761u;
+        for (INT p = 0; p < ROUND_MISSED_PROBES; p++)
+        {
+            const FRoundMissed& E = GRoundMissed[(Hash + (SIZE_T)p) % ROUND_MISSED];
+            if (E.FrameNo != FrameNo)
+                break;
+            if (E.Sample == S && E.X == S->Point.X && E.Y == S->Point.Y && E.Z == S->Point.Z)
+                return E.Draw;
+        }
+    }
+    return -1;
+}
+
+// The triangle's corners noted as samples of the frame's not-known draw Draw; a corner past the table's room is not.
+static void RoundMissAdd(FTransTexture* const* Pts, INT FrameNo, INT Draw)
+{
+    for (INT k = 0; k < 3; k++)
+    {
+        const FTransTexture* const S    = Pts[k];
+        const SIZE_T               Hash = ((SIZE_T)S >> 4) * 2654435761u;
+        for (INT p = 0; p < ROUND_MISSED_PROBES; p++)
+        {
+            FRoundMissed& E = GRoundMissed[(Hash + (SIZE_T)p) % ROUND_MISSED];
+            if (E.FrameNo != FrameNo)
+            {
+                E.Sample  = S;
+                E.X       = S->Point.X;
+                E.Y       = S->Point.Y;
+                E.Z       = S->Point.Z;
+                E.FrameNo = FrameNo;
+                E.Draw    = Draw;
+                break;
+            }
+            if (E.Sample == S && E.X == S->Point.X && E.Y == S->Point.Y && E.Z == S->Point.Z)
+                break;
+        }
+    }
+}
+
+// A new not-known draw of the frame, its tries none yet; -1 where there is no room for one.
+static INT RoundMissNew(INT FrameNo)
+{
+    if (GRoundMissFrame != FrameNo)
+    {
+        GRoundMissFrame = FrameNo;
+        GRoundMissCount = 0;
+    }
+    if (GRoundMissCount >= ROUND_MISS_DRAWS)
+        return -1;
+    GRoundMissTries[GRoundMissCount] = 0;
+    return GRoundMissCount++;
+}
+
+// The draw the triangles now come from: whose model, where the engine's samples of it lie, where its actor stands in
+// the view and how far the model reaches from there, the projection it is drawn in.
+struct FRoundDraw
+{
+    const FSceneNode* Frame;     // compared only
+    INT               FrameNo;
+    FRoundModel*      Model;
+    size_t            Base;      // the address of the engine's sample of the model's vertex 0
+    INT               Stride;
+    INT               Verts;
+    FVector           View;
+    FLOAT             Reach;
+    FLOAT             Bound;     // how far from View every vertex of a whole pose lies (RoundPoseSane)
+    FLOAT             Focal, CentreX, CentreY;
+    UBOOL             bLive;
+    UBOOL             bFlat;     // known, but drawn flat: too small, all flat, or off the projection
+};
+static FRoundDraw GRoundDraw = {};
+// The live draw's samples' places when it was known (RoundFindDraw), its vertices' count of them (GRoundSnapOk: taken).
+static FVector* GRoundSnap     = nullptr;
+static INT      GRoundSnapRoom = 0;
+static UBOOL    GRoundSnapOk   = 0;
+// Memory found readable this frame (RoundReadable): each stretch is asked of Windows once a frame - a frame's arrays
+// of samples lie in a few stretches, and none is given back while the frame is drawn. And memory found not readable:
+// a wrong guess at a draw's array asks about the same few stretches again and again.
+struct FRoundRange
+{
+    size_t From, To;
+};
+static FRoundRange GRoundRanges[16], GRoundBad[16];
+static INT         GRoundRangeCount = 0, GRoundBadCount = 0, GRoundRangesFrame = -1;
+static INT        GRoundStamp = 0, GRoundTries = 0, GRoundTriesFrame = -1;
+// The spherifier's angle and number the models' shapes were made by: a new one from the menu, and they are all made
+// again - the angle says which edges are soft, the number how far a bend may reach along a long edge.
+static INT        GRoundShapesAngle = -1, GRoundShapesCap = -1;
+// What became of the opaque mesh triangles since the log's last line.
+static INT    GRoundFits = 0, GRoundInsane = 0;
+static INT    GRoundDone = 0, GRoundDraws = 0, GRoundFlatModel = 0, GRoundNoActor = 0,
+              GRoundNoFace = 0, GRoundGuessesBad = 0, GRoundNotFace = 0, GRoundOffProjection = 0, GRoundGaveUp = 0,
+              GRoundSameFailed = 0, GRoundGuesses = 0, GRoundSaid = -1;
+static DOUBLE GRoundSeconds = 0.0, GRoundFindSeconds = 0.0, GRoundTriSeconds = 0.0;
+// One triangle in this many has its time taken (DrawGouraudPolygon's model rounding).
+static const INT RoundTimeSample = 16;
+// A measurement (the marker SecondRevision-round-trace.txt): every frame, what became of its mesh polygons by the model
+// standing nearest them - the nearest for its size whose reach takes them in - and why the first draws of the frame
+// that were not known were not: for a model drawn rounded in one frame and flat in the next to be told from the log.
+enum ERoundTraceHow
+{
+    RTH_ROUND, RTH_CUT, RTH_HELD, RTH_NOACTOR, RTH_NOFACE, RTH_SAMEFAIL, RTH_GAVEUP, RTH_NOTFACE, RTH_OFFPROJ,
+    RTH_DRAWFLAT, RTH_CUTMISSED, RTH_FLAT, RTH_HOWS
+};
+struct FRoundTraceRow
+{
+    const AActor* Actor;   // compared only
+    TCHAR         Name[48];
+    FLOAT         Dist;
+    INT           Count[RTH_HOWS];
+};
+enum { ROUND_TRACE_ROWS = 48, ROUND_TRACE_DETAILS = 4 };
+static UBOOL          GRoundTrace = 0;
+static FRoundTraceRow GRoundTraceRows[ROUND_TRACE_ROWS];
+static INT            GRoundTraceRowCount = 0, GRoundTraceFrame = -1, GRoundTraceDetails = 0;
+static INT            GRoundTraceHeldRound = 0, GRoundTraceHeldFlat = 0;
+
+// The farthest corner of a mesh's box from its origin, in the mesh's own units (RoundReachOf) - kept by mesh: the reach
+// is asked of every model of the level every frame, and a level's models share a few hundred meshes. Open addressing,
+// emptied with the models (ForgetRoundModels): another mesh may come at a freed one's address.
+struct FRoundMeshFar
+{
+    const UMesh* Mesh;
+    FLOAT        Far;
+};
+enum { ROUND_MESH_FAR = 2048, ROUND_MESH_PROBES = 8 };
+static FRoundMeshFar GRoundMeshFar[ROUND_MESH_FAR];
+
+static void ForgetRoundModels()
+{
+    for (INT i = 0; i < GRoundModelCount; i++)
+    {
+        FRoundModel& R = GRoundModels[i];
+        delete R.Shape;
+        delete R.Model;
+        if (R.Round)
+            appFree(R.Round);
+        if (R.EdgeNo)
+            appFree(R.EdgeNo);
+        if (R.EdgeStamp)
+            appFree(R.EdgeStamp);
+        if (R.EdgeSize)
+            appFree(R.EdgeSize);
+        if (R.EdgeRoom)
+            appFree(R.EdgeRoom);
+        if (R.PolyNo)
+            appFree(R.PolyNo);
+        if (R.PolyStamp)
+            appFree(R.PolyStamp);
+    }
+    GRoundModelCount  = 0;
+    appMemzero(GRoundMeshFar, sizeof(GRoundMeshFar));
+    GRoundActorCount  = 0;
+    GRoundActorsFrame = -1;
+    GRoundPlacedFrame = nullptr;
+    GRoundDraw.bLive  = 0;
+    GRoundRangeCount  = 0;
+    GRoundBadCount    = 0;
+    GRoundRangesFrame = -1;
+}
+
+// The model of mesh M: its faces as the engine draws them, by their vertices - made the first time it is asked for.
+static FRoundModel* RoundModelOf(UMesh* M)
+{
+    for (INT i = 0; i < GRoundModelCount; i++)
+        if (GRoundModels[i].Mesh == M)
+            return &GRoundModels[i];
+    if (GRoundModelCount >= ROUND_MODELS)
+        return nullptr;
+    FRoundModel& R = GRoundModels[GRoundModelCount++];
+    R.Mesh      = M;
+    R.Model     = nullptr;
+    R.Shape     = nullptr;
+    R.Round     = nullptr;
+    R.bShaped   = 0;
+    R.bCurved   = 0;
+    R.EdgeNo    = nullptr;
+    R.EdgeStamp = nullptr;
+    R.EdgeSize  = nullptr;
+    R.EdgeRoom  = nullptr;
+    R.PolyNo    = nullptr;
+    R.PolyStamp = nullptr;
+    ULodMesh* const L     = Cast<ULodMesh>(M);
+    const INT       Faces = L ? L->Faces.Num() : M->Tris.Num();
+    const INT       Verts = L ? L->ModelVerts : M->FrameVerts;
+    if (Faces <= 0 || Faces > 65536 || Verts <= 0 || Verts > 65536)
+        return &R;
+    INT* const Corners = (INT*)appMalloc(sizeof(INT) * Faces * 3, TEXT("RdxRoundCorners"));
+    R.Round            = (BYTE*)appMalloc(Faces, TEXT("RdxRoundFaces"));
+    if (Corners && R.Round)
+    {
+        // Every face that is drawn is rounded - a mask (a plant's leaves), glass (the cooler) as well as a solid one.
+        const DWORD Unround = PF_Invisible;
+        UBOOL       bOk     = 1;
+        for (INT f = 0; f < Faces && bOk; f++)
+        {
+            DWORD Flags = 0;
+            for (INT k = 0; k < 3; k++)
+            {
+                INT v = -1;
+                if (L)
+                {
+                    const FMeshFace& F = L->Faces(f);
+                    if (F.iWedge[k] < L->Wedges.Num())
+                        v = L->Wedges(F.iWedge[k]).iVertex;
+                    Flags = (F.MaterialIndex < L->Materials.Num()) ? L->Materials(F.MaterialIndex).PolyFlags : PF_Invisible;
+                }
+                else
+                {
+                    const FMeshTri& T = M->Tris(f);
+                    v                 = T.iVertex[k];
+                    Flags             = T.PolyFlags;
+                }
+                bOk                = bOk && v >= 0 && v < Verts;
+                Corners[f * 3 + k] = v;
+            }
+            R.Round[f] = (Flags & Unround) ? 0 : 1;
+        }
+        RdxMeshRound::FModel* const Model = bOk ? new RdxMeshRound::FModel : nullptr;
+        if (Model && Model->Make(Corners, Faces, Verts))
+            R.Model = Model;
+        else
+            delete Model;
+    }
+    if (Corners)
+        appFree(Corners);
+    return &R;
+}
+
+// How far a model may reach from its actor's place: the farthest corner of the model's own box from the origin it is
+// drawn about, as far as it is scaled - at least a little, and a fair way where the box was never made.
+static FLOAT RoundMeshFar(const UMesh* M)
+{
+    const FBox& B   = M->BoundingBox;
+    FLOAT       Far = 0.0f;
+    for (INT c = 0; c < 8; c++)
+    {
+        const FVector Corner((c & 1) ? B.Max.X : B.Min.X, (c & 2) ? B.Max.Y : B.Min.Y, (c & 4) ? B.Max.Z : B.Min.Z);
+        Far = Max(Far, (Corner - M->Origin).Size());
+    }
+    return Far;
+}
+
+static FLOAT RoundReachOf(const AActor* A)
+{
+    const UMesh* const M     = A->Mesh;
+    const FLOAT        Scale = Max(Abs(M->Scale.X), Max(Abs(M->Scale.Y), Abs(M->Scale.Z))) * Abs(A->DrawScale);
+    const FBox&        B     = M->BoundingBox;
+    if (!B.IsValid)
+        return Max(A->CollisionRadius, A->CollisionHeight) * 1.5f + 16.0f;
+    const SIZE_T Hash = ((SIZE_T)M >> 4) * 2654435761u;
+    for (INT k = 0; k < ROUND_MESH_PROBES; k++)
+    {
+        FRoundMeshFar& E = GRoundMeshFar[(Hash + (SIZE_T)k) % ROUND_MESH_FAR];
+        if (!E.Mesh)
+        {
+            E.Far  = RoundMeshFar(M);
+            E.Mesh = M;
+        }
+        if (E.Mesh == M)
+            return Max(E.Far * Scale, 16.0f);
+    }
+    return Max(RoundMeshFar(M) * Scale, 16.0f);
+}
+
+// The frame's models, listed once a frame.
+static void RoundListActors(const FSceneNode* Frame, INT FrameNo)
+{
+    if (GRoundActorsFrame == FrameNo)
+        return;
+    GRoundActorsFrame   = FrameNo;
+    GRoundActorCount    = 0;
+    GRoundPlacedFrame   = nullptr;
+    GRoundPlacedFrameNo = -1;
+    ULevel* const Level = Frame->Level;
+    if (!Level)
+        return;
+    for (INT i = 0; i < Level->Actors.Num() && GRoundActorCount < ROUND_ACTORS; i++)
+    {
+        AActor* const A = Level->Actors(i);
+        if (!A || A->bDeleteMe || A->DrawType != DT_Mesh || !A->Mesh)
+            continue;
+        GRoundActors[GRoundActorCount].Actor = A;
+        GRoundActors[GRoundActorCount].Reach = RoundReachOf(A);
+        GRoundActorCount++;
+    }
+}
+
+// Whether a model at View (Frame's view) of that reach may stand big enough on the screen to be rounded (MeshMinPixels):
+// in front of the eye, inside the view's sides.
+static UBOOL RoundWorthAt(const FSceneNode* Frame, const FVector& View, FLOAT Reach)
+{
+    if (View.Z < -Reach)
+        return 0;
+    const FLOAT Z     = Max(View.Z, 1.0f);
+    const FLOAT Focal = Max(Frame->Proj.Z, 1.0f);
+    if (Abs(View.X) - Reach > Z * Frame->FX2 / Focal || Abs(View.Y) - Reach > Z * Frame->FY2 / Focal)
+        return 0;
+    return View.Z <= Reach || Reach * Focal / View.Z >= MeshMinPixels;
+}
+
+// The listed models' places in Frame's view, and the ones worth looking for there, once a view and frame.
+static void RoundPlaceActors(const FSceneNode* Frame, INT FrameNo)
+{
+    if (GRoundPlacedFrame == Frame && GRoundPlacedFrameNo == FrameNo)
+        return;
+    GRoundPlacedFrame   = Frame;
+    GRoundPlacedFrameNo = FrameNo;
+    GRoundWorthCount    = 0;
+    for (INT i = 0; i < GRoundActorCount; i++)
+    {
+        FRoundActor& R = GRoundActors[i];
+        R.View         = R.Actor->Location.TransformPointBy(Frame->Coords);
+        if (RoundWorthAt(Frame, R.View, R.Reach))
+            GRoundWorth[GRoundWorthCount++] = i;
+    }
+}
+
+// Whether [From, From + Bytes) can be read: committed, readable memory all through (VirtualQuery) - what the engine's
+// array of samples is, where a guess about it is right.
+static UBOOL RoundReadable(size_t From, size_t Bytes, INT FrameNo)
+{
+    const size_t End = From + Bytes;
+    if (End < From || From == 0)
+        return 0;
+    if (GRoundRangesFrame != FrameNo)
+    {
+        GRoundRangesFrame = FrameNo;
+        GRoundRangeCount  = 0;
+        GRoundBadCount    = 0;
+    }
+    for (INT i = 0; i < GRoundRangeCount; i++)
+        if (From >= GRoundRanges[i].From && End <= GRoundRanges[i].To)
+            return 1;
+    // A stretch that reaches into memory found not readable: not readable, whatever else it takes in.
+    for (INT i = 0; i < GRoundBadCount && i < 16; i++)
+        if (From < GRoundBad[i].To && End > GRoundBad[i].From)
+            return 0;
+    const DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY;
+    size_t At = From, RunFrom = 0;
+    while (At < End)
+    {
+        MEMORY_BASIC_INFORMATION Info;
+        if (!::VirtualQuery((LPCVOID)At, &Info, sizeof(Info)))
+            return 0;
+        if (Info.State != MEM_COMMIT || (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(Info.Protect & Readable))
+        {
+            GRoundBad[GRoundBadCount++ % 16] = { (size_t)Info.BaseAddress, (size_t)Info.BaseAddress + Info.RegionSize };
+            return 0;
+        }
+        if (At == From)
+            RunFrom = (size_t)Info.BaseAddress;
+        At = (size_t)Info.BaseAddress + Info.RegionSize;
+    }
+    GRoundRanges[(GRoundRangeCount < 16) ? GRoundRangeCount++ : (INT)(From >> 12) % 16] = { RunFrom, At };
+    return 1;
+}
+
+// Whether the engine's samples of model R lie from Base on, a Stride apart: at MeshChecks of its vertices spread over
+// it, the engine's own normal against the one R's faces give in the places read there - too many off, or a place that
+// is no number, and it is not. False as soon as it cannot be any more.
+static UBOOL RoundSamplesAgree(const RdxMeshRound::FModel& M, size_t Base, INT Stride)
+{
+    RdxMeshRound::FPose P;
+    P.Base       = (const char*)Base;
+    P.Stride     = Stride;
+    INT Checked  = 0, Off = 0;
+    const INT MostOff = MeshChecks / 4;
+    for (INT k = 0; k < MeshChecks; k++)
+    {
+        const INT              v = (INT)(((QWORD)(2 * k + 1) * (QWORD)M.Verts) / (QWORD)(2 * MeshChecks));
+        const FTransTexture&   S = *(const FTransTexture*)(Base + (size_t)v * (size_t)Stride);
+        const RdxMeshRound::FV Q = P.At(v);
+        if (!(Abs(Q.X) < 1e7f && Abs(Q.Y) < 1e7f && Abs(Q.Z) < 1e7f))
+            return 0;
+        const FVector E(S.Normal.X, S.Normal.Y, S.Normal.Z);
+        const FLOAT   L = E.Size();
+        if (!(L > 0.5f && L < 2.0f) || M.VertStart[v] == M.VertStart[v + 1])
+            continue;
+        const RdxMeshRound::FV N = M.PlainNormal(P, v);
+        if (RdxMeshRound::Dot(N, N) == 0.0f)
+            continue;
+        Checked++;
+        if (Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) < MeshCheckCos * L && ++Off > MostOff)
+            return 0;
+    }
+    return Checked >= MeshChecks / 2;
+}
+
+// Which model a draw's first triangle is of, and where its samples lie: into GRoundDraw. False: not known.
+static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, INT FrameNo)
+{
+    RoundListActors(Frame, FrameNo);
+    RoundPlaceActors(Frame, FrameNo);
+    const FVector& P0 = Pts[0]->Point;
+    // The models whose reach takes in the corner, the nearest for their size first - a few. The viewer's own things
+    // (the weapon in hand) are placed just before they are drawn: their places are taken anew.
+    enum { NEAREST = 4 };
+    AActor*        Near[NEAREST];
+    FLOAT          NearOff[NEAREST];
+    static FVector NearView[NEAREST];   // made once (an FVector array is made through calls into Core.dll)
+    FLOAT          NearReach[NEAREST];
+    INT            NearCount = 0;
+    auto           Consider  = [&](AActor* A, const FVector& View, FLOAT Reach)
+    {
+        // Farther than the reach along one axis, and so farther in all: turned away before the distance is asked of the
+        // engine's library, as it would be turned away below.
+        const FLOAT Lim = Reach * 1.25f + 16.0f;
+        if (Abs(View.X - P0.X) > Lim || Abs(View.Y - P0.Y) > Lim || Abs(View.Z - P0.Z) > Lim)
+            return;
+        const FLOAT Dist = (View - P0).Size();
+        if (!(Dist <= Reach * 1.25f + 16.0f))
+            return;
+        const FLOAT Off = Dist / (Reach + 16.0f);
+        INT         At  = NearCount;
+        while (At > 0 && NearOff[At - 1] > Off)
+            At--;
+        if (At >= NEAREST)
+            return;
+        for (INT k = Min(NearCount, NEAREST - 1); k > At; k--)
+        {
+            Near[k]      = Near[k - 1];
+            NearOff[k]   = NearOff[k - 1];
+            NearView[k]  = NearView[k - 1];
+            NearReach[k] = NearReach[k - 1];
+        }
+        Near[At]      = A;
+        NearOff[At]   = Off;
+        NearView[At]  = View;
+        NearReach[At] = Reach;
+        NearCount     = Min(NearCount + 1, (INT)NEAREST);
+    };
+    APlayerPawn* const Viewer = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
+    for (INT w = 0; w < GRoundWorthCount; w++)
+    {
+        const FRoundActor& R = GRoundActors[GRoundWorth[w]];
+        if (!(Viewer && R.Actor->Owner == Viewer && R.Actor->IsA(AInventory::StaticClass())))
+            Consider(R.Actor, R.View, R.Reach);
+    }
+    if (Viewer)
+    {
+        INT Guard = 0;
+        for (AInventory* I = Viewer->Inventory; I && Guard < 256; I = I->Inventory, Guard++)
+            if (I->DrawType == DT_Mesh && I->Mesh && !I->bDeleteMe)
+            {
+                const FVector View  = I->Location.TransformPointBy(Frame->Coords);
+                const FLOAT   Reach = RoundReachOf(I);
+                if (RoundWorthAt(Frame, View, Reach))
+                    Consider(I, View, Reach);
+            }
+    }
+    if (NearCount == 0)
+    {
+        GRoundNoActor++;
+        return 0;
+    }
+    // The triangle's samples in rising order, and how many samples apart.
+    const INT Stride = (INT)sizeof(FTransTexture);
+    size_t    O[3]   = { (size_t)Pts[0], (size_t)Pts[1], (size_t)Pts[2] };
+    for (INT a = 0; a < 2; a++)
+        for (INT b = a + 1; b < 3; b++)
+            if (O[b] < O[a])
+            {
+                const size_t T = O[a];
+                O[a]           = O[b];
+                O[b]           = T;
+            }
+    if ((O[1] - O[0]) % (size_t)Stride || (O[2] - O[0]) % (size_t)Stride)
+    {
+        GRoundNoFace++;
+        return 0;
+    }
+    const INT D1 = (INT)((O[1] - O[0]) / (size_t)Stride), D2 = (INT)((O[2] - O[0]) / (size_t)Stride);
+    // The triangle's corners by address - in the order of the guessed face's vertices, rising.
+    const FTransTexture* const ByAddress[3] = { (const FTransTexture*)O[0], (const FTransTexture*)O[1],
+                                                (const FTransTexture*)O[2] };
+    // Whether the engine's normals at the triangle's corners agree with the ones model M's faces give at vertices
+    // S[0..2], in the array from Base - the cheapest way a wrong guess shows.
+    auto CornersAgree = [&](const RdxMeshRound::FModel& M, size_t Base, const int* S)
+    {
+        RdxMeshRound::FPose P;
+        P.Base   = (const char*)Base;
+        P.Stride = Stride;
+        for (INT k = 0; k < 3; k++)
+        {
+            const FVector E(ByAddress[k]->Normal.X, ByAddress[k]->Normal.Y, ByAddress[k]->Normal.Z);
+            const FLOAT   L = E.Size();
+            if (!(L > 0.5f && L < 2.0f))
+                continue;
+            const RdxMeshRound::FV N = M.PlainNormal(P, S[k]);
+            if (Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) < MeshCheckCos * L)
+                return 0;
+        }
+        return 1;
+    };
+    INT Guesses = 0;
+    // Each model's faces so numbered (-1: it has no faces to know), and its guesses that were off: memory that is not
+    // readable, the engine's normals at the triangle's corners, at the model's samples (the measurement, GRoundTrace).
+    INT NearSig[NEAREST] = {}, NearBad[NEAREST][3] = {};
+    for (INT n = 0; n < NearCount; n++)
+    {
+        FRoundModel* const R = RoundModelOf(Near[n]->Mesh);
+        NearSig[n]           = -1;
+        if (!R || !R->Model)
+            continue;
+        const RdxMeshRound::FModel& M     = *R->Model;
+        const int*                  Faces = nullptr;
+        const INT                   Count = R->Model->Signature(D1, D2, &Faces);
+        NearSig[n]                        = Count;
+        size_t      Tried[MeshMostGuesses];
+        INT         TriedCount = 0;
+        for (INT i = 0; i < Count && Guesses < MeshMostGuesses; i++)
+        {
+            int S[3];
+            RdxMeshRound::Sorted(M.Corner[Faces[i] * 3], M.Corner[Faces[i] * 3 + 1], M.Corner[Faces[i] * 3 + 2], S);
+            if (O[0] < (size_t)S[0] * (size_t)Stride)
+                continue;
+            const size_t Base  = O[0] - (size_t)S[0] * (size_t)Stride;
+            UBOOL        bSeen = 0;
+            for (INT t = 0; t < TriedCount && !bSeen; t++)
+                bSeen = Tried[t] == Base;
+            if (bSeen)
+                continue;
+            Tried[TriedCount++] = Base;
+            Guesses++;
+            GRoundGuesses++;
+            const UBOOL bRead    = RoundReadable(Base, (size_t)M.Verts * (size_t)Stride, FrameNo);
+            const UBOOL bCorners = bRead && CornersAgree(M, Base, S);
+            if (!bCorners || !RoundSamplesAgree(M, Base, Stride))
+            {
+                GRoundGuessesBad++;
+                NearBad[n][!bRead ? 0 : !bCorners ? 1 : 2]++;
+                continue;
+            }
+            FRoundDraw D = {};
+            D.Frame      = Frame;
+            D.FrameNo    = FrameNo;
+            D.Model      = R;
+            D.Base       = Base;
+            D.Stride     = Stride;
+            D.Verts      = M.Verts;
+            D.View       = NearView[n];
+            D.Reach      = NearReach[n] * 1.25f + 16.0f;
+            D.Bound      = NearReach[n] * 1.5f + 16.0f;
+            D.bLive      = 1;
+            GRoundDraw   = D;
+            // The draw's samples' places as they stand now: its later triangles are told from another draw's by them.
+            if (GRoundSnapRoom < D.Verts)
+            {
+                FVector* const More = (FVector*)appRealloc(GRoundSnap, sizeof(FVector) * D.Verts, TEXT("RdxRoundSnap"));
+                if (More)
+                {
+                    GRoundSnap     = More;
+                    GRoundSnapRoom = D.Verts;
+                }
+            }
+            GRoundSnapOk = GRoundSnapRoom >= D.Verts;
+            for (INT v = 0; v < D.Verts && GRoundSnapOk; v++)
+                GRoundSnap[v] = ((const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride))->Point;
+            return 1;
+        }
+    }
+    if (GRoundTrace && GRoundTraceDetails < ROUND_TRACE_DETAILS)
+    {
+        GRoundTraceDetails++;
+        RDX_LOGF("round trace: frame %i, a draw not known at (%.0f %.0f %.0f), its samples %i and %i apart, %i guesses",
+                 FrameNo, P0.X, P0.Y, P0.Z, D1, D2, Guesses);
+        for (INT n = 0; n < NearCount; n++)
+            RDX_LOGF("round trace:   %s (%.2f of its reach off): %i faces so numbered; guesses off: %i unreadable, %i "
+                     "at the corners, %i at the samples",
+                     Near[n]->GetName(), NearOff[n], NearSig[n], NearBad[n][0], NearBad[n][1], NearBad[n][2]);
+    }
+    GRoundNoFace++;
+    return 0;
+}
+
+// The model's vertex of the engine's sample S in draw D - by its address, while the array holds what it held when the
+// draw was known - or -1.
+static INT RoundVertexOf(const FRoundDraw& D, const FTransTexture* S)
+{
+    const size_t A = (size_t)S;
+    if (A < D.Base || ((A - D.Base) % (size_t)D.Stride) != 0)
+        return -1;
+    const size_t V = (A - D.Base) / (size_t)D.Stride;
+    return (V < (size_t)D.Verts) ? (INT)V : -1;
+}
+
+// Whether a triangle's corners stand within the draw's model's reach: one beyond it is of another draw.
+static UBOOL RoundDrawHolds(const FRoundDraw& D, FTransTexture* const* Pts)
+{
+    for (INT k = 0; k < 3; k++)
+        if ((Pts[k]->Point - D.View).SizeSquared() > D.Reach * D.Reach)
+            return 0;
+    return 1;
+}
+
+// Whether every vertex of the draw's model stands where its actor reaches: within half as far again as the model's own
+// box reaches from its origin, at its scale (the box holds every frame of its animation). The engine draws a far
+// model - the intro's logos too, a man across a room - with fewer vertices than it has, and what lies past those in its
+// array is whatever was there, often another draw's samples of the same model, true to its faces yet in other places:
+// one such place in the shape, and its fans and bends are made of nonsense (the EIDOS logo's shards, a man ten times
+// his size). Such a draw is drawn flat and makes no shape.
+static UBOOL RoundPoseSane(const FRoundDraw& D)
+{
+    const FLOAT Most = D.Bound * D.Bound;
+    for (INT v = 0; v < D.Verts; v++)
+    {
+        const FVector Off = ((const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride))->Point - D.View;
+        if (!(Off.SizeSquared() <= Most))
+            return 0;
+    }
+    return 1;
+}
+
+// The draw's projection, from its first triangle: the frame's own where the corners stand on it to within a pixel, else
+// (the first person's weapon has a field of view of its own) one made from the corner furthest off the middle, in 64ths
+// of a pixel so that the draw's triangles share it. False: none holds.
+static UBOOL RoundProjection(const FSceneNode* Frame, FTransTexture* const* Pts, FLOAT OffX, FLOAT OffY, FRoundDraw& D)
+{
+    const FLOAT CX = Frame->FX15, CY = Frame->FY15;
+    auto Holds = [&](FLOAT Focal)
+    {
+        for (INT k = 0; k < 3; k++)
+        {
+            const FTransTexture& P = *Pts[k];
+            if (!(P.Point.Z > 1e-3f) || Abs(CX + P.Point.X * Focal / P.Point.Z - P.ScreenX) > 1.0f ||
+                Abs(CY + P.Point.Y * Focal / P.Point.Z - P.ScreenY) > 1.0f)
+                return 0;
+        }
+        return 1;
+    };
+    FLOAT Focal = Frame->Proj.Z;
+    if (!Holds(Focal))
+    {
+        INT   Far  = -1;
+        FLOAT Most = 0.0f;
+        for (INT k = 0; k < 3; k++)
+        {
+            const FVector& P = Pts[k]->Point;
+            if (!(P.Z > 1e-3f))
+                return 0;
+            const FLOAT Off = Max(Abs(P.X), Abs(P.Y)) / P.Z;
+            if (Off > Most)
+            {
+                Most = Off;
+                Far  = k;
+            }
+        }
+        if (Far < 0 || Most < 0.02f)
+            return 0;
+        const FTransTexture& P = *Pts[Far];
+        Focal = (Abs(P.Point.X) >= Abs(P.Point.Y)) ? (P.ScreenX - CX) * P.Point.Z / P.Point.X
+                                                   : (P.ScreenY - CY) * P.Point.Z / P.Point.Y;
+        Focal = appRound(Focal * 64.0f) / 64.0f;
+        if (!Holds(Focal))
+            return 0;
+    }
+    D.Focal   = Focal;
+    D.CentreX = CX + OffX;
+    D.CentreY = CY + OffY;
+    return 1;
+}
+
+// The traced frame's lines (GRoundTrace): its tries, and each model with what became of its polygons.
+static void RoundTraceSay()
+{
+    if (GRoundTraceFrame >= 0)
+    {
+        RDX_LOGF("round trace: frame %i - %i tries came to nothing (%i at most a draw); held pieces: %i rounded, %i flat",
+                 GRoundTraceFrame, GRoundTries, MeshMostTries, GRoundTraceHeldRound, GRoundTraceHeldFlat);
+        for (INT i = 0; i < GRoundTraceRowCount; i++)
+        {
+            const FRoundTraceRow& R = GRoundTraceRows[i];
+            const INT* const      C = R.Count;
+            RDX_LOGF("round trace:   %s at %.0f: round %i cut %i held %i | no actor %i, no face %i, same failed %i, gave "
+                     "up %i, not a face %i, off the projection %i, draw flat %i, cut missed %i, flat %i",
+                     R.Name, R.Dist, C[RTH_ROUND], C[RTH_CUT], C[RTH_HELD], C[RTH_NOACTOR], C[RTH_NOFACE],
+                     C[RTH_SAMEFAIL], C[RTH_GAVEUP], C[RTH_NOTFACE], C[RTH_OFFPROJ], C[RTH_DRAWFLAT],
+                     C[RTH_CUTMISSED], C[RTH_FLAT]);
+        }
+    }
+    GRoundTraceRowCount  = 0;
+    GRoundTraceDetails   = 0;
+    GRoundTraceHeldRound = 0;
+    GRoundTraceHeldFlat  = 0;
+}
+
+// What became of a mesh polygon with a corner at P, under the model standing nearest it (GRoundTrace).
+static void RoundTraceNote(const FSceneNode* Frame, INT FrameNo, const FVector& P, INT How)
+{
+    RoundListActors(Frame, FrameNo);
+    RoundPlaceActors(Frame, FrameNo);
+    const AActor* Best    = nullptr;
+    FLOAT         BestOff = 0.0f, Dist = 0.0f;
+    for (INT w = 0; w < GRoundWorthCount; w++)
+    {
+        const FRoundActor& R = GRoundActors[GRoundWorth[w]];
+        const FLOAT        D = (R.View - P).Size();
+        if (!(D <= R.Reach * 1.25f + 16.0f))
+            continue;
+        const FLOAT Off = D / (R.Reach + 16.0f);
+        if (!Best || Off < BestOff)
+        {
+            Best    = R.Actor;
+            BestOff = Off;
+            Dist    = R.View.Size();
+        }
+    }
+    INT i = 0;
+    while (i < GRoundTraceRowCount && GRoundTraceRows[i].Actor != Best)
+        i++;
+    if (i == GRoundTraceRowCount)
+    {
+        if (i >= ROUND_TRACE_ROWS)
+            return;
+        FRoundTraceRow& R = GRoundTraceRows[GRoundTraceRowCount++];
+        R.Actor           = Best;
+        R.Dist            = Dist;
+        appStrncpy(R.Name, Best ? Best->GetName() : TEXT("(no model near)"), 48);
+        appMemzero(R.Count, sizeof(R.Count));
+    }
+    GRoundTraceRows[i].Count[How]++;
+}
+
+// The frame's first mesh polygon: the tries counted afresh, and every model's shape made again under a new angle.
+static void RoundFrameStart(INT FrameNo)
+{
+    static const UBOOL bTrace = FreshMarker(L"SecondRevision-round-trace.txt");
+    GRoundTrace               = bTrace;
+    if (GRoundTriesFrame == FrameNo)
+        return;
+    if (GRoundTrace)
+    {
+        RoundTraceSay();
+        GRoundTraceFrame = FrameNo;
+    }
+    GRoundTriesFrame = FrameNo;
+    GRoundTries      = 0;
+    if (GRoundShapesAngle != GSpherifierAngle || GRoundShapesCap != SpherifierCap())
+    {
+        ForgetRoundModels();
+        GRoundShapesAngle = GSpherifierAngle;
+        GRoundShapesCap   = SpherifierCap();
+    }
+}
+
+// A mesh triangle as a patch of its model: its face of the draw's model into Face, and its corners, in the face's own
+// order, into Whole. False: drawn flat.
+static UBOOL RoundTriangle(const FSceneNode* Frame, FTransTexture* const* Pts, FLOAT OffX, FLOAT OffY, INT FrameNo,
+                           FTransTexture* Whole, INT& Face)
+{
+    FRoundDraw& D = GRoundDraw;
+    INT         J[3];
+    UBOOL       bSame = D.bLive && D.Frame == Frame && D.FrameNo == FrameNo;
+    for (INT k = 0; k < 3 && bSame; k++)
+        bSame = (J[k] = RoundVertexOf(D, Pts[k])) >= 0;
+    if (bSame && !RoundDrawHolds(D, Pts))
+        bSame = 0;
+    // A triangle whose corners' samples no longer hold what they held when the live draw was known is another draw's: the
+    // engine hands the next model's samples the memory the last one's had, and a model drawn just before near the eye
+    // reaches over it - one drawn flat would otherwise take the next model's triangles flat with it. The draw's own
+    // triangles, a far model's that the engine makes of fewer vertices among them, read what it wrote.
+    for (INT k = 0; k < 3 && bSame && GRoundSnapOk; k++)
+        bSame = Pts[k]->Point == GRoundSnap[J[k]];
+    if (!bSame)
+    {
+        D.bLive = 0;
+        if (GRoundFailFrameNo == FrameNo)
+            for (INT k = 0; k < 3; k++)
+                for (INT f = 0; f < 3; f++)
+                    if (Pts[k] == GRoundFailPts[f] && Pts[k]->Point == GRoundFailAt[f])
+                    {
+                        for (INT c = 0; c < 3; c++)
+                        {
+                            GRoundFailPts[c] = Pts[c];
+                            GRoundFailAt[c]  = Pts[c]->Point;
+                        }
+                        if (GRoundFailDraw >= 0)
+                            RoundMissAdd(Pts, FrameNo, GRoundFailDraw);
+                        GRoundSameFailed++;
+                        return 0;
+                    }
+        // The draw it is of among those not known this frame: past its tries, drawn flat unasked. Only the tries that came
+        // to nothing count: a frame with many models in view knows each of them, however many there are.
+        INT Miss = RoundMissOf(Pts, FrameNo);
+        if (Miss >= 0 && GRoundMissTries[Miss] >= MeshMostTries)
+        {
+            RoundMissAdd(Pts, FrameNo, Miss);
+            GRoundGaveUp++;
+            return 0;
+        }
+        const DOUBLE T0     = appSeconds();
+        const UBOOL  bFound = RoundFindDraw(Frame, Pts, FrameNo);
+        GRoundFindSeconds += appSeconds() - T0;
+        if (!bFound)
+        {
+            GRoundTries++;
+            if (Miss < 0)
+                Miss = RoundMissNew(FrameNo);
+            if (Miss >= 0)
+            {
+                GRoundMissTries[Miss]++;
+                RoundMissAdd(Pts, FrameNo, Miss);
+            }
+            GRoundFailDraw    = Miss;
+            GRoundFailFrameNo = FrameNo;
+            for (INT c = 0; c < 3; c++)
+            {
+                GRoundFailPts[c] = Pts[c];
+                GRoundFailAt[c]  = Pts[c]->Point;
+            }
+            return 0;
+        }
+        GRoundFailFrameNo = -1;
+        GRoundDraws++;
+        FRoundModel&              R = *D.Model;
+        const RdxMeshRound::FPose Here = { (const char*)D.Base, D.Stride };
+        const UBOOL bSane = RoundPoseSane(D);
+        if (!bSane)
+            GRoundInsane++;
+        if (!R.bShaped && bSane)
+        {
+            // A measurement (the marker SecondRevision-mesh-dump.txt): each model as it was first known - its faces,
+            // which are drawn rounded, its vertices' places and the engine's normals there - for the shape's rules to
+            // be looked at off line.
+            static const UBOOL bDump = FreshMarker(L"SecondRevision-mesh-dump.txt");
+            if (bDump)
+            {
+                static FILE* Bin = fopen("SecondRevision-mesh-round.bin", "wb");
+                if (Bin)
+                {
+                    const RdxMeshRound::FModel& M = *R.Model;
+                    const INT Head[3] = { 0x444E524D, M.Verts, M.Faces };
+                    fwrite(Head, sizeof(INT), 3, Bin);
+                    char Name[64];
+                    appMemzero(Name, sizeof(Name));
+                    const TCHAR* const MeshName = R.Mesh->GetName();
+                    for (INT i = 0; i < 63 && MeshName[i]; i++)
+                        Name[i] = (char)MeshName[i];
+                    fwrite(Name, 1, 64, Bin);
+                    fwrite(M.Corner.Data, sizeof(int), (size_t)M.Faces * 3, Bin);
+                    fwrite(R.Round, 1, (size_t)M.Faces, Bin);
+                    for (INT v = 0; v < M.Verts; v++)
+                    {
+                        const FTransTexture& S = *(const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride);
+                        const FLOAT          Q[6] = { S.Point.X, S.Point.Y, S.Point.Z, S.Normal.X, S.Normal.Y,
+                                                      S.Normal.Z };
+                        fwrite(Q, sizeof(FLOAT), 6, Bin);
+                    }
+                    fflush(Bin);
+                }
+            }
+            // The shape, once: from the first pose a draw of the model was known in.
+            R.bShaped                         = 1;
+            RdxMeshRound::FShape* const Shape = new RdxMeshRound::FShape;
+            const INT Most = R.Model->Faces * 3;
+            R.EdgeNo       = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeNo"));
+            R.EdgeStamp    = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeStamp"));
+            R.EdgeSize     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeSize"));
+            R.EdgeRoom     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeRoom"));
+            R.PolyNo       = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyNo"));
+            R.PolyStamp    = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyStamp"));
+            if (R.EdgeStamp)
+                for (INT e = 0; e < Most; e++)
+                    R.EdgeStamp[e] = -1;
+            if (R.PolyStamp)
+                for (INT f = 0; f < R.Model->Faces; f++)
+                    R.PolyStamp[f] = -1;
+            if (R.EdgeNo && R.EdgeStamp && R.EdgeSize && R.EdgeRoom && R.PolyNo && R.PolyStamp &&
+                Shape->Make(*R.Model, R.Round, Here, (FLOAT)(180 - GSpherifierAngle), (FLOAT)SpherifierCap()))
+            {
+                R.Shape = Shape;
+                Shape->Pose(Here, ++GRoundStamp);
+                R.bCurved = Shape->AnyBow();
+                if (R.bCurved)
+                    Shape->MakeRest();
+            }
+            else
+                delete Shape;
+        }
+        D.bFlat = !bSane || !R.Shape || !R.bCurved;
+        if (D.bFlat)
+            GRoundFlatModel += bSane;
+        else if (!RoundProjection(Frame, Pts, OffX, OffY, D))
+            D.bFlat = 1;
+        else
+        {
+            R.Shape->Pose(Here, ++GRoundStamp);
+            if (R.Shape->Fit())
+                GRoundFits++;
+        }
+        for (INT k = 0; k < 3; k++)
+            J[k] = RoundVertexOf(D, Pts[k]);
+    }
+    if (D.bFlat)
+        return 0;
+    // Each triangle on the draw's projection too: one that is not (clipped by the engine) is drawn flat.
+    for (INT k = 0; k < 3; k++)
+    {
+        const FTransTexture& P = *Pts[k];
+        if (!(P.Point.Z > 1e-3f) ||
+            Abs(D.CentreX - OffX + P.Point.X * D.Focal / P.Point.Z - P.ScreenX) > 1.0f ||
+            Abs(D.CentreY - OffY + P.Point.Y * D.Focal / P.Point.Z - P.ScreenY) > 1.0f)
+        {
+            GRoundOffProjection++;
+            return 0;
+        }
+    }
+    const RdxMeshRound::FModel& M = *D.Model->Model;
+    const INT                   F = M.FindFace(J[0], J[1], J[2]);
+    if (F < 0)
+    {
+        GRoundNotFace++;
+        D.bLive = 0;
+        return 0;
+    }
+    for (INT c = 0; c < 3; c++)
+    {
+        INT k = 0;
+        while (k < 2 && J[k] != M.Corner[F * 3 + c])
+            k++;
+        Whole[c] = *Pts[k];
+    }
+    Face = F;
+    return 1;
+}
+
+// Whether a mesh polygon has a corner on the view's edge, where the engine's cut puts the corners it makes (it cuts every
+// polygon to the frame before handing it over: docs/spec-03, section 2).
+static UBOOL RoundLooksCut(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts)
+{
+    for (INT k = 0; k < NumPts; k++)
+    {
+        const FTransTexture& P = *Pts[k];
+        if (P.ScreenX < 0.75f || P.ScreenY < 0.75f || P.ScreenX > Frame->FX - 0.25f || P.ScreenY > Frame->FY - 0.25f)
+            return 1;
+    }
+    return 0;
+}
+
+// A polygon the engine cut out of one of the live draw's triangles at the view's edge - its new corners are none of the
+// draw's samples: the whole triangle into Whole, to be drawn in the polygon's place (the card cuts it at the edge as it
+// cuts anything), and its face into Face. Drawn flat, the piece would stand off its rounded neighbours along all
+// its edges, a seam that moves with the view's edge. The triangle is the face of the draw's model whose plane holds
+// every corner of the polygon and whose inside has them all, the polygon's corners that are samples of the draw among
+// its own. Its texture coordinates, light and fog are carried back from the polygon's: the engine's cut mixes them from
+// the triangle's corners in straight shares, so one such mix must give every corner of the polygon its own. False: no
+// such face, or the polygon off the draw's projection.
+// The whole triangles found for a cut piece that could not be drawn in its place: a corner of theirs behind the camera,
+// or not where its projection puts it (RoundCutFace) - the piece drawn as the engine cut it.
+static INT GRoundCutUnseen = 0;
+static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, FLOAT OffX, FLOAT OffY,
+                          FTransTexture* Whole, INT& Face)
+{
+    FRoundDraw& D = GRoundDraw;
+    if (D.bFlat || !D.Model || !D.Model->Shape || !D.Model->Model || NumPts > MAX_POLY_POINTS)
+        return 0;
+    for (INT k = 0; k < NumPts; k++)
+    {
+        const FTransTexture& P = *Pts[k];
+        if (!(P.Point.Z > 1e-3f) || Abs(D.CentreX - OffX + P.Point.X * D.Focal / P.Point.Z - P.ScreenX) > 1.0f ||
+            Abs(D.CentreY - OffY + P.Point.Y * D.Focal / P.Point.Z - P.ScreenY) > 1.0f)
+        {
+            GRoundOffProjection++;
+            return 0;
+        }
+    }
+    const RdxMeshRound::FModel& M = *D.Model->Model;
+    INT                         J[MAX_POLY_POINTS];
+    INT                         Kept = -1;
+    for (INT k = 0; k < NumPts; k++)
+    {
+        J[k] = RoundVertexOf(D, Pts[k]);
+        if (J[k] >= 0 && Kept < 0)
+            Kept = J[k];
+    }
+    auto Sample = [&](INT v) -> const FTransTexture& {
+        return *(const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride);
+    };
+    // The faces at a corner the polygon kept - or, where it kept none, every face of the model.
+    const INT From = (Kept >= 0) ? M.VertStart[Kept] : 0;
+    const INT To   = (Kept >= 0) ? M.VertStart[Kept + 1] : M.Faces;
+    for (INT i = From; i < To; i++)
+    {
+        const INT F    = (Kept >= 0) ? M.VertFaces[i] : i;
+        const INT C[3] = { M.Corner[F * 3], M.Corner[F * 3 + 1], M.Corner[F * 3 + 2] };
+        UBOOL     bOk  = 1;
+        for (INT k = 0; k < NumPts && bOk; k++)
+            bOk = J[k] < 0 || J[k] == C[0] || J[k] == C[1] || J[k] == C[2];
+        if (!bOk)
+            continue;
+        const FVector P0  = Sample(C[0]).Point;
+        const FVector E1  = Sample(C[1]).Point - P0, E2 = Sample(C[2]).Point - P0;
+        const FLOAT   D00 = E1 | E1, D01 = E1 | E2, D11 = E2 | E2;
+        const FLOAT   Den = D00 * D11 - D01 * D01;
+        if (!(Den > 1e-8f * D00 * D11))
+            continue;
+        const FVector N   = E1 ^ E2;
+        const FLOAT   NL  = N.Size();
+        const FLOAT   Off = 1e-3f * appSqrt(Max(D00, D11)) + 1e-3f;
+        FLOAT         B[MAX_POLY_POINTS][3];
+        for (INT k = 0; k < NumPts && bOk; k++)
+        {
+            const FVector Q   = Pts[k]->Point - P0;
+            const FLOAT   D20 = Q | E1, D21 = Q | E2;
+            B[k][1]           = (D11 * D20 - D01 * D21) / Den;
+            B[k][2]           = (D00 * D21 - D01 * D20) / Den;
+            B[k][0]           = 1.0f - B[k][1] - B[k][2];
+            bOk = Abs((Q | N) / NL) <= Off && B[k][0] > -1e-2f && B[k][1] > -1e-2f && B[k][2] > -1e-2f;
+        }
+        if (!bOk)
+            continue;
+        // The corners' values: the least squares over the polygon's corners (its shares, G = B'B, inverted), then each
+        // of its corners held against the mix.
+        FLOAT G[3][3] = { { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
+        for (INT k = 0; k < NumPts; k++)
+            for (INT r = 0; r < 3; r++)
+                for (INT c = 0; c < 3; c++)
+                    G[r][c] += B[k][r] * B[k][c];
+        const FLOAT Det = G[0][0] * (G[1][1] * G[2][2] - G[1][2] * G[2][1]) -
+                          G[0][1] * (G[1][0] * G[2][2] - G[1][2] * G[2][0]) +
+                          G[0][2] * (G[1][0] * G[2][1] - G[1][1] * G[2][0]);
+        if (!(Abs(Det) > 1e-9f))
+            continue;
+        FLOAT Inv[3][3];
+        Inv[0][0] = (G[1][1] * G[2][2] - G[1][2] * G[2][1]) / Det;
+        Inv[0][1] = (G[0][2] * G[2][1] - G[0][1] * G[2][2]) / Det;
+        Inv[0][2] = (G[0][1] * G[1][2] - G[0][2] * G[1][1]) / Det;
+        Inv[1][0] = (G[1][2] * G[2][0] - G[1][0] * G[2][2]) / Det;
+        Inv[1][1] = (G[0][0] * G[2][2] - G[0][2] * G[2][0]) / Det;
+        Inv[1][2] = (G[0][2] * G[1][0] - G[0][0] * G[1][2]) / Det;
+        Inv[2][0] = (G[1][0] * G[2][1] - G[1][1] * G[2][0]) / Det;
+        Inv[2][1] = (G[0][1] * G[2][0] - G[0][0] * G[2][1]) / Det;
+        Inv[2][2] = (G[0][0] * G[1][1] - G[0][1] * G[1][0]) / Det;
+        enum { VALUES = 10 };
+        FLOAT Corner[3][VALUES];
+        for (INT n = 0; n < VALUES && bOk; n++)
+        {
+            FLOAT Value[MAX_POLY_POINTS], Most = 0.0f, Rhs[3] = { 0.0f, 0.0f, 0.0f };
+            for (INT k = 0; k < NumPts; k++)
+            {
+                const FTransTexture& P = *Pts[k];
+                Value[k] = (n == 0) ? P.U : (n == 1) ? P.V : (n < 6) ? (&P.Light.X)[n - 2] : (&P.Fog.X)[n - 6];
+                Most     = Max(Most, Abs(Value[k]));
+                for (INT r = 0; r < 3; r++)
+                    Rhs[r] += B[k][r] * Value[k];
+            }
+            for (INT r = 0; r < 3; r++)
+                Corner[r][n] = Inv[r][0] * Rhs[0] + Inv[r][1] * Rhs[1] + Inv[r][2] * Rhs[2];
+            const FLOAT Held = 5e-3f * (1.0f + Most);
+            for (INT k = 0; k < NumPts && bOk; k++)
+                bOk = Abs(B[k][0] * Corner[0][n] + B[k][1] * Corner[1][n] + B[k][2] * Corner[2][n] - Value[k]) <= Held;
+        }
+        if (!bOk)
+            continue;
+        // The whole triangle goes where the piece was by its corners as the engine projected them, so each must stand
+        // before the camera and where its projection puts it: a corner behind the camera - the engine cut the piece
+        // off at the near plane - flings the triangle across the screen. Then the piece is drawn as the engine cut it.
+        for (INT c = 0; c < 3 && bOk; c++)
+        {
+            const FTransTexture& S = Sample(C[c]);
+            bOk = S.Point.Z > 1e-3f && Abs(D.CentreX - OffX + S.Point.X * D.Focal / S.Point.Z - S.ScreenX) <= 1.0f &&
+                  Abs(D.CentreY - OffY + S.Point.Y * D.Focal / S.Point.Z - S.ScreenY) <= 1.0f;
+        }
+        if (!bOk)
+        {
+            GRoundCutUnseen++;
+            static INT Told = 0;
+            if (Told < 40)
+            {
+                Told++;
+                RDX_LOGF("models rounded: frame %i - the whole triangle of a piece cut at the view's edge has a corner "
+                         "behind the camera or off its projection (the corners' depths %.1f %.1f %.1f): the piece drawn as "
+                         "the engine cut it", D.FrameNo, Sample(C[0]).Point.Z, Sample(C[1]).Point.Z, Sample(C[2]).Point.Z);
+            }
+            return 0;
+        }
+        for (INT c = 0; c < 3; c++)
+        {
+            Whole[c]   = Sample(C[c]);
+            Whole[c].U = Corner[c][0];
+            Whole[c].V = Corner[c][1];
+            for (INT n = 0; n < 4; n++)
+            {
+                (&Whole[c].Light.X)[n] = Corner[c][2 + n];
+                (&Whole[c].Fog.X)[n]   = Corner[c][6 + n];
+            }
+        }
+        Face = F;
+        return 1;
+    }
+    return 0;
+}
+
+// The polygons the engine cut at the view's edge since the log's last line: drawn whole in their place, of no face of
+// the draw, and of a model not known yet (its first polygons cut) - held back (RoundHold), then drawn rounded once the
+// model was known (RoundRelease), or flat; and those that could not be held.
+static INT GRoundCut = 0, GRoundCutMissed = 0, GRoundCutUnknown = 0, GRoundHeldRound = 0, GRoundHeldFlat = 0;
+static INT GRoundHeldRefused = 0;
+
+// The counts a flat polygon's reason is told by, in the order of the measurement's (GRoundTrace) reasons.
+static void RoundTraceCounts(INT* C)
+{
+    C[0] = GRoundNoActor;
+    C[1] = GRoundNoFace;
+    C[2] = GRoundSameFailed;
+    C[3] = GRoundGaveUp;
+    C[4] = GRoundNotFace;
+    C[5] = GRoundOffProjection;
+    C[6] = GRoundCutMissed;
+}
+
+// A mesh polygon as a patch of its model: 1 - a triangle of the draw (RoundTriangle); 2 - a piece the engine cut out of
+// one, whose whole triangle is drawn in its place (RoundCutFace); 3 - a piece cut out of a model not known yet, to be
+// held back until its first whole triangle makes it known (RoundHold); 0 - drawn flat. Whole: the corners drawn, in the
+// order of Face, the draw's model's face they are. A cut piece leaves the draw known: the triangles after it are the
+// draw's still.
+static INT RoundPolygon(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, FLOAT OffX, FLOAT OffY,
+                        INT FrameNo, FTransTexture* Whole, INT& Face)
+{
+    RoundFrameStart(FrameNo);
+    const FRoundDraw& D     = GRoundDraw;
+    const UBOOL       bLive = D.bLive && D.Frame == Frame && D.FrameNo == FrameNo;
+    INT               Kept  = 0;
+    for (INT k = 0; k < NumPts && bLive; k++)
+        Kept += (RoundVertexOf(D, Pts[k]) >= 0) ? 1 : 0;
+    // Cut: more corners than a triangle has, some of the draw's samples among others, or none of them with a corner on
+    // the view's edge.
+    const UBOOL bCut = NumPts != 3 || (Kept > 0 && Kept < 3) || (Kept == 0 && RoundLooksCut(Frame, Pts, NumPts));
+    if (bCut)
+    {
+        if (bLive && RoundCutFace(Frame, Pts, NumPts, OffX, OffY, Whole, Face))
+        {
+            GRoundCut++;
+            return 2;
+        }
+        if (Kept > 0)
+        {
+            GRoundCutMissed++;
+            return 0;
+        }
+        // None of its corners is the live draw's: a piece of a model not known yet. Not tried as a triangle of a draw -
+        // a piece's new corners are no samples, so it would not be known, and its failure would be taken for its
+        // model's: every triangle after it that shares a corner with it drawn flat unasked, the whole model square.
+        GRoundCutUnknown++;
+        return 3;
+    }
+    return RoundTriangle(Frame, Pts, OffX, OffY, FrameNo, Whole, Face) ? 1 : 0;
+}
+
+// Edge E's number among the frame's edges (FSolidPass::MeshEdgeRoom): its terms written there the first time the draw
+// asks, in the draw's pose, with how far its bends reach together and the least of its rooms. -1: the frame's room for
+// edges is used up.
+static INT RoundEdgeNo(FBackend& Backend, FRoundModel& R, INT E)
+{
+    RdxMeshRound::FShape& S = *R.Shape;
+    if (R.EdgeStamp[E] != S.Stamp)
+    {
+        INT          First = 0;
+        FLOAT* const Out   = Backend.MeshEdgeRoom(1, First);
+        if (!Out)
+            return -1;
+        RdxMeshRound::FEdgeTerms T;
+        S.EdgeData(E, T);
+        FLOAT Reach = 0.0f, Room = 1.0f;
+        for (INT k = 0; k < RdxMeshRound::EDGE_SLOTS; k++)
+        {
+            Out[k * 4]     = T.T[k].X;
+            Out[k * 4 + 1] = T.T[k].Y;
+            Out[k * 4 + 2] = T.T[k].Z;
+            Out[k * 4 + 3] = T.Room[k];
+            const FLOAT L  = RdxMeshRound::Length(T.T[k]);
+            Reach += L * T.Room[k];
+            if (L > 1e-4f && T.Room[k] < Room)
+                Room = T.Room[k];
+        }
+        R.EdgeNo[E]    = First;
+        R.EdgeStamp[E] = S.Stamp;
+        R.EdgeSize[E]  = Reach;
+        R.EdgeRoom[E]  = Room;
+    }
+    return R.EdgeNo[E];
+}
+
+// Face F's edge from its corner c to the next, as a patch's corner carries it (DSMesh): its number among the frame's edges
+// (RoundEdgeNo) times two, and one where F goes along it from its end B to its end A; how far its bends reach together;
+// and the least of its rooms. False: the frame's room for edges is used up.
+static UBOOL RoundEdgeRef(FBackend& Backend, FRoundModel& R, INT F, INT c, FLOAT& Ref, FLOAT& Size, FLOAT& Least)
+{
+    RdxMeshRound::FShape& S = *R.Shape;
+    const INT             E = S.EdgeOf[F * 3 + c];
+    if (RoundEdgeNo(Backend, R, E) < 0)
+        return 0;
+    const UBOOL bBack = S.Weld[R.Model->Corner[F * 3 + c]] != S.EdgeA[E];
+    Ref   = (FLOAT)(R.EdgeNo[E] * 2 + (bBack ? 1 : 0));
+    Size  = R.EdgeSize[E];
+    Least = R.EdgeRoom[E];
+    return 1;
+}
+
+// Face F's flat polygon where it is one of several faces, as a patch's corners carry it (DSMesh's MeshPolyPlaneMove):
+// the number among the frame's edges of its outline's record, plus one - written the first time the draw asks: how many
+// outline edges and the plane's normal, then for each its end A and number (RoundEdgeNo) times two, and its end B, in the
+// draw's pose. 0: none - a polygon of one face, of more outline edges than the shader reads, or no room left.
+static FLOAT RoundPolyRef(FBackend& Backend, FRoundModel& R, INT F)
+{
+    RdxMeshRound::FShape& S      = *R.Shape;
+    const INT             Lowest = S.Poly[F];
+    if (R.PolyStamp[Lowest] == S.Stamp)
+        return (FLOAT)R.PolyNo[Lowest];
+    R.PolyStamp[Lowest] = S.Stamp;
+    R.PolyNo[Lowest]    = 0;
+    INT       Edges[RdxMeshRound::POLY_EDGES_MOST], Nos[RdxMeshRound::POLY_EDGES_MOST];
+    const INT Num = S.PolyOutline(F, Edges, RdxMeshRound::POLY_EDGES_MOST);
+    if (Num <= 0)
+        return 0.0f;
+    for (INT g = 0; g < Num; g++)
+        if ((Nos[g] = RoundEdgeNo(Backend, R, Edges[g])) < 0)
+            return 0.0f;
+    INT          First = 0;
+    FLOAT* const Out   = Backend.MeshEdgeRoom((4 + 8 * Num + 15) / 16, First);
+    if (!Out)
+        return 0.0f;
+    const RdxMeshRound::FV N = S.PlaneOfFace(Lowest);
+    Out[0] = (FLOAT)Num;
+    Out[1] = N.X;
+    Out[2] = N.Y;
+    Out[3] = N.Z;
+    for (INT g = 0; g < Num; g++)
+    {
+        const RdxMeshRound::FV A = S.P.At(S.EdgeA[Edges[g]]), B = S.P.At(S.EdgeB[Edges[g]]);
+        FLOAT* const           W = Out + 4 + g * 8;
+        W[0] = A.X;
+        W[1] = A.Y;
+        W[2] = A.Z;
+        W[3] = (FLOAT)(Nos[g] * 2);
+        W[4] = B.X;
+        W[5] = B.Y;
+        W[6] = B.Z;
+        W[7] = 0.0f;
+    }
+    R.PolyNo[Lowest] = First + 1;
+    return (FLOAT)R.PolyNo[Lowest];
+}
+
+// The game's bullet hole (DeusExItems' FlatFXTex9, HDTP's HDTPFlatFXtex9): a picture of a hole on a grey field, laid by
+// the engine as a decal - a modulated square - where a shot hit. With the relief on (Geometry: POM or
+// DisplacementMapping) it is drawn with depth: the relief's walk, its axes worked out by the pixel shader as on a grown
+// plant's bark, over a height map of its own picture (BulletHoleHeights) - the grey the wall's own plane, the hole a
+// pit into it as deep as the hole is wide - so from aside its near rim hides the bottom and its far side shows, the
+// wall's own colour darkening down to the black bottom (the pixel shader's POM_FINE), and its hollows darken
+// (BulletHoleRun).
+static UBOOL IsBulletHolePicture(const UTexture* T)
+{
+    static const UTexture* Last  = nullptr;
+    static UBOOL           bLast = 0;
+    if (T != Last)
+    {
+        Last = T;
+        const TCHAR* const N   = T ? T->GetName() : TEXT("");
+        const INT          Len = appStrlen(N);
+        bLast = (Len >= 10 && !appStricmp(N + Len - 10, TEXT("FlatFXTex9"))) ? 1 : 0;
+    }
+    return bLast;
+}
+
+// A bullet hole's height map from its own picture (P8, by its palette): the hole is where the picture is darker than
+// half way from its grey - the colour most of its texels have - down to its darkest, closed over what the picture paints
+// lighter inside its rim (the light on its edge) as far in as a tenth of its width; its side falls from the hole's edge
+// to its floor smoothly over seven tenths of the way to its middle, a pit with a small flat floor (a cliff there would
+// walk into steps); then softened twice by a texel. A byte a texel, 255 the wall's plane and 0 the floor; Hole the
+// hole's width, of the picture's. Null where the picture is no such one.
+static BYTE* BulletHoleHeights(UTexture* T, INT& W, INT& H, FLOAT& Hole)
+{
+    W = H = 0;
+    Hole  = 0.0f;
+    if (!T || T->Format != TEXF_P8 || !T->Palette || T->Mips.Num() <= 0)
+        return nullptr;
+    FMipmap& Mip = T->Mips(0);
+    Mip.DataArray.Load();
+    const INT U = Mip.USize, V = Mip.VSize;
+    if (U < 8 || V < 8 || U > 1024 || V > 1024 || Mip.DataArray.Num() < U * V)
+        return nullptr;
+    const BYTE* const D = &Mip.DataArray(0);
+    FLOAT Bright[256];
+    INT   Uses[256];
+    for (INT c = 0; c < 256; c++)
+    {
+        const FColor Cl = (c < T->Palette->Colors.Num()) ? T->Palette->Colors(c) : FColor(0, 0, 0, 0);
+        Bright[c] = 0.299f * (FLOAT)Cl.R + 0.587f * (FLOAT)Cl.G + 0.114f * (FLOAT)Cl.B;
+        Uses[c]   = 0;
+    }
+    FLOAT Darkest = 255.0f;
+    for (INT i = 0; i < U * V; i++)
+    {
+        Uses[D[i]]++;
+        Darkest = Min(Darkest, Bright[D[i]]);
+    }
+    INT Grey = 0;
+    for (INT c = 1; c < 256; c++)
+        if (Uses[c] > Uses[Grey])
+            Grey = c;
+    if (Bright[Grey] - Darkest < 16.0f)
+        return nullptr;
+    const FLOAT Cut = 0.5f * (Darkest + Bright[Grey]);
+    INT* const  Far = (INT*)appMalloc(U * V * sizeof(INT), TEXT("RdxBulletHole"));
+    BYTE* const Out = (BYTE*)appMalloc(U * V, TEXT("RdxBulletHole"));
+    if (!Far || !Out)
+    {
+        if (Far)
+            appFree(Far);
+        if (Out)
+            appFree(Out);
+        return nullptr;
+    }
+    // How far each texel the map says is inside lies from the nearest outside - a chamfer distance, three a step along
+    // and four across - forwards, then backwards; an outside texel stays zero.
+    const INT  Big     = 1 << 28;
+    const auto Chamfer = [&]()
+    {
+        for (INT y = 0; y < V; y++)
+            for (INT x = 0; x < U; x++)
+            {
+                INT& F = Far[y * U + x];
+                if (!F)
+                    continue;
+                if (x > 0)
+                    F = Min(F, Far[y * U + x - 1] + 3);
+                if (y > 0)
+                {
+                    F = Min(F, Far[(y - 1) * U + x] + 3);
+                    if (x > 0)
+                        F = Min(F, Far[(y - 1) * U + x - 1] + 4);
+                    if (x + 1 < U)
+                        F = Min(F, Far[(y - 1) * U + x + 1] + 4);
+                }
+            }
+        for (INT y = V - 1; y >= 0; y--)
+            for (INT x = U - 1; x >= 0; x--)
+            {
+                INT& F = Far[y * U + x];
+                if (!F)
+                    continue;
+                if (x + 1 < U)
+                    F = Min(F, Far[y * U + x + 1] + 3);
+                if (y + 1 < V)
+                {
+                    F = Min(F, Far[(y + 1) * U + x] + 3);
+                    if (x + 1 < U)
+                        F = Min(F, Far[(y + 1) * U + x + 1] + 4);
+                    if (x > 0)
+                        F = Min(F, Far[(y + 1) * U + x - 1] + 4);
+                }
+            }
+    };
+    // The dark first, and how wide it is; then closed: grown by a tenth of that width and shrunk back by as much.
+    for (INT i = 0; i < U * V; i++)
+        Far[i] = (Bright[D[i]] < Cut) ? Big : 0;
+    Chamfer();
+    INT Most = 0;
+    for (INT i = 0; i < U * V; i++)
+        Most = Max(Most, Far[i]);
+    if (Most <= 0 || Most >= Big)
+    {
+        appFree(Far);
+        appFree(Out);
+        return nullptr;
+    }
+    const INT Close = Max(3, (2 * Most) / 10);
+    for (INT i = 0; i < U * V; i++)
+        Far[i] = Far[i] ? 0 : Big;
+    Chamfer();
+    for (INT i = 0; i < U * V; i++)
+        Far[i] = (Far[i] <= Close) ? Big : 0;
+    Chamfer();
+    for (INT i = 0; i < U * V; i++)
+        Far[i] = (Far[i] > Close) ? Big : 0;
+    Chamfer();
+    Most = 0;
+    for (INT i = 0; i < U * V; i++)
+        Most = Max(Most, Far[i]);
+    if (Most <= 0 || Most >= Big)
+    {
+        appFree(Far);
+        appFree(Out);
+        return nullptr;
+    }
+    for (INT i = 0; i < U * V; i++)
+    {
+        const FLOAT S = Clamp((FLOAT)Far[i] / (0.7f * (FLOAT)Most), 0.0f, 1.0f);
+        Out[i]        = (BYTE)appRound(255.0f * (1.0f - S * S * (3.0f - 2.0f * S)));
+    }
+    // Softened: each the average of the nine round it, held inside the picture - twice.
+    for (INT Pass = 0; Pass < 2; Pass++)
+    {
+        for (INT y = 0; y < V; y++)
+            for (INT x = 0; x < U; x++)
+            {
+                INT Sum = 0;
+                for (INT dy = -1; dy <= 1; dy++)
+                    for (INT dx = -1; dx <= 1; dx++)
+                        Sum += Out[Clamp(y + dy, 0, V - 1) * U + Clamp(x + dx, 0, U - 1)];
+                Far[y * U + x] = Sum;
+            }
+        for (INT i = 0; i < U * V; i++)
+            Out[i] = (BYTE)((Far[i] + 4) / 9);
+    }
+    appFree(Far);
+    W    = U;
+    H    = V;
+    Hole = 2.0f * ((FLOAT)Most / 3.0f) / (FLOAT)U;
+    return Out;
+}
+
+// The run a bullet hole is drawn in (IsBulletHolePicture): its own height map's relief, walked as finely as the screen
+// asks (RdxMath::PomFlag_Fine), as deep as the hole is wide; and the engine's projection, which the pixel shader takes
+// the polygon's place in the view from. False where it cannot be had, and nothing is set.
+static UBOOL BulletHoleRun(FBackend& Backend, const FSceneNode* Frame, UTexture* T, FTransTexture* const* Pts,
+                           FLOAT OffX, FLOAT OffY)
+{
+    struct FMap
+    {
+        const UTexture* Texture;
+        BYTE*           Blob;
+        INT             Bytes, W, H;
+        FLOAT           Hole;
+    };
+    enum { MapsMost = 4 };
+    static FMap Maps[MapsMost];
+    static INT  MapCount = 0;
+    INT m = 0;
+    while (m < MapCount && Maps[m].Texture != T)
+        m++;
+    if (m == MapCount)
+    {
+        if (MapCount >= MapsMost)
+            return 0;
+        FMap& N = Maps[MapCount++];
+        N.Texture = T;
+        N.Blob    = nullptr;
+        N.Bytes   = 0;
+        INT         W = 0, H = 0;
+        BYTE* const Heights = BulletHoleHeights(T, W, H, N.Hole);
+        if (Heights)
+        {
+            N.Blob = FBackend::PomOwnBlob(Heights, W, H, N.Bytes);
+            appFree(Heights);
+        }
+        N.W = W;
+        N.H = H;
+        RDX_LOGF("bullet holes: %s - %s, %ix%i, the hole %.2f of the picture across", T->GetPathName(),
+                 N.Blob ? TEXT("its height map made") : TEXT("no height map can be made of it"), W, H, N.Hole);
+    }
+    const FMap& Mp = Maps[m];
+    if (!Mp.Blob || !Pts[0] || !Pts[1])
+        return 0;
+    static const char* const Keys[MapsMost] = { "secondrevision.bullethole0", "secondrevision.bullethole1",
+                                                "secondrevision.bullethole2", "secondrevision.bullethole3" };
+    const INT Entry = Backend.PomOwn(Keys[m], Mp.Blob, Mp.Bytes, Mp.W, Mp.H, 1.0f);
+    if (Entry < 0 || !Backend.PreparePom(Entry) || Backend.GetPomTable(Entry) < 0)
+        return 0;
+    // How wide the picture lies on the wall: along the polygon's first edge, the level's units a texel.
+    const FLOAT DU = Pts[1]->U - Pts[0]->U, DV = Pts[1]->V - Pts[0]->V;
+    const FLOAT Texels = appSqrt(DU * DU + DV * DV);
+    if (Texels < 1e-3f)
+        return 0;
+    const FLOAT Wide = (Pts[1]->Point - Pts[0]->Point).Size() / Texels * (FLOAT)Mp.W;
+    FLOAT       InvW = 0.0f, InvH = 0.0f;
+    Backend.GetPomSize(Entry, InvW, InvH);
+    static const FLOAT Zero[3] = { 0.0f, 0.0f, 0.0f };
+    Backend.SetReliefRun(0, Zero, Zero, Zero, 0.0f, 0.0f, 0.0f, Frame->Proj.Z, Frame->FX15 + OffX, Frame->FY15 + OffY,
+                         0.0f);
+    Backend.SetPomRun(Backend.GetPomTable(Entry), Mp.Hole * Wide,
+                      (FLOAT)(RdxMath::PomFlag_On | RdxMath::PomFlag_Rates | RdxMath::PomFlag_Fine), InvW, InvH);
+    return 1;
+}
+
+// A mesh polygon's whole triangle as a patch of the live draw's model (RoundPolygon's 1 and 2, RoundRelease): its
+// corners in Whole, its face Face, its edges' and its polygon's records Ref, Size, Least and Poly; its run's numbers;
+// the polygon the engine handed over (Wind, its first three corners) for the winding's count. False where the frame's
+// vertices are used up.
+static UBOOL RoundedTriangleOut(FBackend& Backend, const FSceneNode* Frame, const FTransTexture* Whole, INT Srv,
+                                EBlendMode Mode, UBOOL bNoSmooth, FLOAT InvU, FLOAT InvV, FLOAT Boost, const FLOAT* Ref,
+                                const FLOAT* Size, const FLOAT* Least, FLOAT Poly, const FTransTexture* const* Wind,
+                                FLOAT OffX, FLOAT OffY)
+{
+    const FRoundDraw& D = GRoundDraw;
+    Backend.SetMeshRun(MeshSag, D.Focal, D.CentreX, D.CentreY, (FLOAT)SpherifierCap(), MeshShape);
+    FSolidVertex* const V = Backend.BeginTriangle(Srv, -1, Mode, bNoSmooth);
+    Backend.ClearMeshRun();
+    if (!V)
+        return 0;
+    for (INT i = 0; i < 3; i++)
+    {
+        const FTransTexture& P = Whole[i];
+        V[i].X     = P.Point.X;
+        V[i].Y     = P.Point.Y;
+        V[i].Depth = P.Point.Z;
+        V[i].U     = P.U * InvU;
+        V[i].V     = P.V * InvV;
+        V[i].LU    = 0.0f;
+        V[i].LV    = 0.0f;
+        V[i].R     = RdxMath::GouraudLight(P.Light.X) * Boost;
+        V[i].G     = RdxMath::GouraudLight(P.Light.Y) * Boost;
+        V[i].B     = RdxMath::GouraudLight(P.Light.Z) * Boost;
+        V[i].A     = 1.0f;
+        // The edge from this corner to the next, in the relief's places (VSMesh).
+        V[i].PX    = Ref[i];
+        V[i].PY    = Size[i];
+        V[i].PN    = Least[i];
+        // And its flat polygon's record, where it is one of several faces (DSMesh).
+        V[i].PD    = Poly;
+    }
+    NoteWinding(Frame, 1, Wind[0]->ScreenX + OffX, Wind[0]->ScreenY + OffY, Wind[1]->ScreenX + OffX,
+                Wind[1]->ScreenY + OffY, Wind[2]->ScreenX + OffX, Wind[2]->ScreenY + OffY);
+    return 1;
+}
+
+// The pieces the engine cut at the view's edge out of a model not known yet (RoundPolygon's 3): a model whose first
+// polygons are such pieces is known only from its first whole triangle on, and drawn as they came they would stay flat
+// - the dish of a radar half out of view, square where the rest of it is round. Held back in the frame's own order -
+// copies of their corners, with the engine's own corners' places to know the draw's samples by - and drawn as soon as
+// anything else is (RoundRelease): rounded as the rest of the model where its draw is known by then and one of its
+// faces holds the piece, else flat, as they would have been. Only a solid one: a see-through or multiplying polygon has its own ways (ReliefDecalLift); and none
+// past the room, which is drawn flat at once. Within the frame: every piece is in every picture.
+struct FRoundHeld
+{
+    INT                 NumPts;
+    const FSceneNode*   Frame;          // compared and handed on, within the frame it was drawn in
+    INT                 FrameNo;
+    FTransTexture*      Orig[MAX_POLY_POINTS];  // the engine's corners: compared with the draw's samples, read only as those
+    INT                 Srv;
+    EBlendMode          Mode;
+    UBOOL               bNoSmooth, bInMirror;
+    FLOAT               InvU, InvV, Boost, OffX, OffY;
+    INT                 Kind, Beam;     // the surface kind and the flashlight's share it is drawn with
+};
+enum { RoundHeldMost = 64 };
+static FRoundHeld GRoundHeldList[RoundHeldMost];
+static INT        GRoundHeldCount = 0;
+// The held pieces' corners, made once (an array of the engine's FTransTexture is made element by element through
+// calls into Core.dll).
+static FTransTexture* RoundHeldCorners()
+{
+    static FTransTexture Corners[RoundHeldMost * MAX_POLY_POINTS];
+    return Corners;
+}
+
+// Holds the piece back; false where it cannot be - drawn flat at once then.
+static UBOOL RoundHold(const FSceneNode* Frame, INT FrameNo, FTransTexture* const* Pts, INT NumPts, INT Srv,
+                       EBlendMode Mode, UBOOL bNoSmooth, UBOOL bInMirror, FLOAT InvU, FLOAT InvV, FLOAT Boost, FLOAT OffX,
+                       FLOAT OffY, INT Kind, INT Beam)
+{
+    if (GRoundHeldCount >= RoundHeldMost || NumPts < 3 || NumPts > MAX_POLY_POINTS)
+    {
+        GRoundHeldRefused++;
+        return 0;
+    }
+    FRoundHeld&          H = GRoundHeldList[GRoundHeldCount];
+    FTransTexture* const C = RoundHeldCorners() + GRoundHeldCount * MAX_POLY_POINTS;
+    H.NumPts    = NumPts;
+    H.Frame     = Frame;
+    H.FrameNo   = FrameNo;
+    H.Srv       = Srv;
+    H.Mode      = Mode;
+    H.bNoSmooth = bNoSmooth;
+    H.bInMirror = bInMirror;
+    H.InvU      = InvU;
+    H.InvV      = InvV;
+    H.Boost     = Boost;
+    H.OffX      = OffX;
+    H.OffY      = OffY;
+    H.Kind      = Kind;
+    H.Beam      = Beam;
+    for (INT k = 0; k < NumPts; k++)
+    {
+        H.Orig[k] = Pts[k];
+        C[k]      = *Pts[k];
+    }
+    GRoundHeldCount++;
+    return 1;
+}
+
+// Draws the held pieces, in the order they came: each as the whole triangle of the live draw's model it was cut out of
+// (RoundCutFace), its corners that are the draw's own read where the draw keeps them, where the draw is the model's by
+// now; else flat from the copies. Each with the surface kind, the flashlight's share and the traced mirror's view it
+// came with - left so: who draws next sets its own.
+static void RoundRelease(FBackend& Backend)
+{
+    if (GRoundHeldCount <= 0)
+        return;
+    const FRoundDraw& D = GRoundDraw;
+    for (INT h = 0; h < GRoundHeldCount; h++)
+    {
+        const FRoundHeld&    H = GRoundHeldList[h];
+        FTransTexture* const C = RoundHeldCorners() + h * MAX_POLY_POINTS;
+        Backend.SetSurfaceKind(H.Kind);
+        Backend.SetSurfaceBeam(H.Beam);
+        Backend.SetInMirror(H.bInMirror);
+        UBOOL bDone = 0;
+        if (D.bLive && D.Frame == H.Frame && D.FrameNo == H.FrameNo && !D.bFlat)
+        {
+            // The engine hands a cut piece's corners over as new points, the ones it kept of the triangle often among
+            // them: a corner is the draw's own where it is one of its samples, else its copy - and the piece is the
+            // model's where one of the model's faces holds every corner of it, as RoundCutFace finds it.
+            FTransTexture* P[MAX_POLY_POINTS];
+            for (INT k = 0; k < H.NumPts; k++)
+                P[k] = (RoundVertexOf(D, H.Orig[k]) >= 0) ? H.Orig[k] : &C[k];
+            static FTransTexture Whole[3];
+            INT   Face = -1;
+            FLOAT Ref[3], Size[3], Least[3];
+            UBOOL bOk = RoundCutFace(H.Frame, P, H.NumPts, H.OffX, H.OffY, Whole, Face);
+            for (INT c = 0; c < 3 && bOk; c++)
+                bOk = RoundEdgeRef(Backend, *D.Model, Face, c, Ref[c], Size[c], Least[c]);
+            if (bOk)
+            {
+                const FLOAT Poly = RoundPolyRef(Backend, *D.Model, Face);
+                const FTransTexture* const Wind[3] = { &C[0], &C[1], &C[2] };
+                bDone = RoundedTriangleOut(Backend, H.Frame, Whole, H.Srv, H.Mode, H.bNoSmooth, H.InvU, H.InvV,
+                                           H.Boost, Ref, Size, Least, Poly, Wind, H.OffX, H.OffY);
+            }
+        }
+        if (bDone)
+        {
+            GRoundHeldRound++;
+            GRoundTraceHeldRound++;
+            continue;
+        }
+        // Flat, as the piece would have been drawn when it came.
+        FSolidVertex Verts[MAX_POLY_POINTS];
+        for (INT k = 0; k < H.NumPts; k++)
+            FillGouraudVertex(Verts[k], C[k], H.OffX, H.OffY, H.InvU, H.InvV, H.Boost);
+        NoteWinding(H.Frame, 1, Verts[0].X, Verts[0].Y, Verts[1].X, Verts[1].Y, Verts[2].X, Verts[2].Y);
+        Backend.AddFan(Verts, H.NumPts, H.Srv, -1, H.Mode, H.bNoSmooth);
+        GRoundHeldFlat++;
+        GRoundTraceHeldFlat++;
+    }
+    GRoundHeldCount = 0;
+    Backend.SetInMirror(0);
+}
+
+static void RoundHeldForget()
+{
+    GRoundHeldCount = 0;
+}
+
+// The held pieces drawn when a mesh polygon's drawing ends without having drawn them - a polygon of another kind of
+// the engine's, on its way out of this path before its rounding is asked (Keep: it held its own piece, or drew them).
+struct FRoundHeldScope
+{
+    FBackend& Backend;
+    UBOOL     bKeep;
+    explicit FRoundHeldScope(FBackend& InBackend) : Backend(InBackend), bKeep(0) {}
+    ~FRoundHeldScope()
+    {
+        if (!bKeep)
+            RoundRelease(Backend);
+    }
+};
+
+// The readout's LOOKING AT (GLookName): a mesh polygon of the main view under its middle, nearer than any before it this
+// frame, said as the actor drawn there - the nearest for its size whose reach takes the place in (RoundTraceNote's
+// way), among all the level's models, not only those big enough to round - with its class and how far it is.
+static void LookPick(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, FLOAT OffX, FLOAT OffY, INT FrameNo)
+{
+    if (NumPts < 3 || NumPts > MAX_POLY_POINTS)
+        return;
+    FLOAT   Xs[MAX_POLY_POINTS], Ys[MAX_POLY_POINTS], Near = 0.0f;
+    FVector Middle(0.0f, 0.0f, 0.0f);
+    for (INT i = 0; i < NumPts; i++)
+    {
+        if (!Pts[i])
+            return;
+        Xs[i] = Pts[i]->ScreenX + OffX;
+        Ys[i] = Pts[i]->ScreenY + OffY;
+        Near += Pts[i]->Point.Z;
+        Middle += Pts[i]->Point;
+    }
+    Near /= (FLOAT)NumPts;
+    if (!(Near > 0.0f) || (GLookDepth > 0.0f && Near >= GLookDepth) ||
+        !RdxMath::PointInFan(Xs, Ys, NumPts, (FLOAT)Frame->X * 0.5f + OffX, (FLOAT)Frame->Y * 0.5f + OffY))
+        return;
+    Middle /= (FLOAT)NumPts;
+    GLookDepth = Near;
+    GLookAt    = Middle.TransformPointBy(Frame->Uncoords);
+    GLookLevel = Frame->Level;
+    RoundListActors(Frame, FrameNo);
+    RoundPlaceActors(Frame, FrameNo);
+    const AActor* Best    = nullptr;
+    FLOAT         BestOff = 0.0f;
+    for (INT i = 0; i < GRoundActorCount; i++)
+    {
+        const FRoundActor& R = GRoundActors[i];
+        const FLOAT        D = (R.View - Middle).Size();
+        if (!(D <= R.Reach * 1.25f + 16.0f))
+            continue;
+        const FLOAT Off = D / (R.Reach + 16.0f);
+        if (!Best || Off < BestOff)
+        {
+            Best    = R.Actor;
+            BestOff = Off;
+        }
+    }
+    GLookName[0] = 0;
+    if (Best)
+    {
+        LookAppend(GLookName, LOOK_CHARS, Best->GetName());
+        LookAppend(GLookName, LOOK_CHARS, TEXT(" ("));
+        LookAppend(GLookName, LOOK_CHARS, Best->GetClass()->GetName());
+        LookAppend(GLookName, LOOK_CHARS, TEXT(")"));
+    }
+    else
+        LookAppend(GLookName, LOOK_CHARS, TEXT("A MODEL OF NO ACTOR"));
+    LookAppend(GLookName, LOOK_CHARS, TEXT(", "));
+    LookAppendNumber(GLookName, LOOK_CHARS, (INT)Near);
+    LookAppend(GLookName, LOOK_CHARS, TEXT(" AWAY"));
+}
+
+// A measurement (the marker SecondRevision-sliver-log.txt): a mesh's polygon drawn as a long, thin sliver across the
+// screen - its longest edge over three tenths of the screen's width, its thickness under a tenth of that edge, as a
+// corner flung far from the rest of its mesh draws it - or with a corner that is no number: written to the log with
+// the frame, the texture, the corners on the screen and in the view, the first few dozen of a start. What the engine
+// handed over is what is told: a polygon told here was wrong before the renderer drew it.
+// And every frame, one line - the first 1800 frames of a start, all of the intro: how many such polygons it drew, its
+// longest edge on the screen, and the thinnest of its polygons whose longest edge is over a fifth of the screen's
+// width (thickness by that edge) with its texture: a sliver shows as a jump there, whatever the line above caught.
+static void NoteSliverFrame(INT EngineFrame, FLOAT Wide, FLOAT Long, FLOAT Thin, const FTextureInfo* Info)
+{
+    static INT    Frame = -1, Count = 0, Lines = 0;
+    static FLOAT  Most = 0.0f, Least = 1e30f, Width = 1.0f;
+    static TCHAR  Tex[128] = TEXT("none");
+    if (EngineFrame != Frame)
+    {
+        if (Frame >= 0 && Count > 0 && Lines < 1800)
+        {
+            Lines++;
+            RDX_LOGF("slivers (marker): frame %i - %i polygons, the longest edge %.0f px of %.0f, the thinnest long one "
+                     "%.4f (%s)", Frame, Count, Most, Width, (Least < 1e29f) ? Least : -1.0f, Tex);
+        }
+        Frame = EngineFrame;
+        Count = 0;
+        Most  = 0.0f;
+        Least = 1e30f;
+        appStrcpy(Tex, TEXT("none"));
+    }
+    if (!Info)
+        return;
+    Count++;
+    Width = Wide;
+    Most  = Max(Most, Long);
+    if (Long > 0.2f * Wide && Thin < Least)
+    {
+        Least = Thin;
+        appStrncpy(Tex, Info->Texture ? Info->Texture->GetPathName() : TEXT("none"), 128);
+    }
+}
+
+static void NoteSliver(const FSceneNode* Frame, const FTextureInfo& Info, FTransTexture** Pts, INT NumPts, DWORD Flags,
+                       INT EngineFrame)
+{
+    static INT Told = 0;
+    if (!Frame || !Pts)
+        return;
+    const FLOAT Wide = (FLOAT)Max(Frame->X, 1);
+    for (INT k = 1; k + 1 < NumPts; k++)
+    {
+        const FTransTexture* const T[3] = { Pts[0], Pts[k], Pts[k + 1] };
+        UBOOL bNumber = 1;
+        FLOAT Long    = 0.0f;
+        for (INT e = 0; e < 3; e++)
+        {
+            const FLOAT dx = T[(e + 1) % 3]->ScreenX - T[e]->ScreenX, dy = T[(e + 1) % 3]->ScreenY - T[e]->ScreenY;
+            Long = Max(Long, (FLOAT)appSqrt(dx * dx + dy * dy));
+            const FLOAT Sum = T[e]->ScreenX + T[e]->ScreenY + T[e]->Point.X + T[e]->Point.Y + T[e]->Point.Z;
+            bNumber = bNumber && (Sum == Sum) && Sum < 3.0e38f && Sum > -3.0e38f;
+        }
+        const FLOAT Area2 = Abs((T[1]->ScreenX - T[0]->ScreenX) * (T[2]->ScreenY - T[0]->ScreenY) -
+                                (T[2]->ScreenX - T[0]->ScreenX) * (T[1]->ScreenY - T[0]->ScreenY));
+        NoteSliverFrame(EngineFrame, Wide, Long, (Long > 0.0f) ? Area2 / (Long * Long) : 0.0f, &Info);
+        if (Told >= 40 || (bNumber && !(Long > 0.3f * Wide && Area2 < 0.1f * Long * Long)))
+            continue;
+        Told++;
+        RDX_LOGF("sliver (marker): frame %i, %s, texture %s, flags 0x%08X; on the screen %.0f,%.0f  %.0f,%.0f  %.0f,%.0f "
+                 "(%.0f wide); in the view %.1f,%.1f,%.1f  %.1f,%.1f,%.1f  %.1f,%.1f,%.1f", EngineFrame,
+                 bNumber ? TEXT("a sliver") : TEXT("a corner is no number"),
+                 Info.Texture ? Info.Texture->GetPathName() : TEXT("none"), (DWORD)Flags, T[0]->ScreenX, T[0]->ScreenY,
+                 T[1]->ScreenX, T[1]->ScreenY, T[2]->ScreenX, T[2]->ScreenY, Wide, T[0]->Point.X, T[0]->Point.Y,
+                 T[0]->Point.Z, T[1]->Point.X, T[1]->Point.Y, T[1]->Point.Z, T[2]->Point.X, T[2]->Point.Y, T[2]->Point.Z);
+        return;
+    }
+}
+
 void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& Info,
                                                FTransTexture** Pts, int NumPts,
                                                DWORD PolyFlags, FSpanBuffer* /*Span*/)
 {
     NoteDraw(Frame, 1);
     FDrawTimer Timer(1);
+    // The pieces held back from the polygons before (RoundHold): drawn as this one's drawing goes on, or when it ends.
+    FRoundHeldScope Held(Backend);
     NoteShadowSubView(Backend, Frame, FrameCounter);
     NoteFlags(TEXT("gouraud"), PolyFlags);
     // An actor's mesh (the shadows' stencil kinds) - 3 for the intro's Ion Storm logo, which casts none of our shadows
     // (CastsNoShadowOfOurs) and so hides nothing from the screen's occlusion either: known by its textures.
+    INT CallKind = 1;
     {
         static const UTexture* LastTex  = nullptr;
         static UBOOL           bLogoTex = 0;
@@ -26788,9 +34445,11 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
             LastTex  = Info.Texture;
             bLogoTex = Info.Texture && appStrnicmp(Info.Texture->GetName(), TEXT("IonStormLogoTex"), 15) == 0;
         }
-        Backend.SetSurfaceKind(bLogoTex ? 3 : 1);
+        CallKind = bLogoTex ? 3 : 1;
+        Backend.SetSurfaceKind(CallKind);
     }
-    Backend.SetSurfaceBeam(BeamLights(Frame, FrameCounter, PolyFlags));
+    const INT CallBeam = BeamLights(Frame, FrameCounter, PolyFlags);
+    Backend.SetSurfaceBeam(CallBeam);
     // The engine's blob shadow, while the shadow maps are on - see GBlobTextures.
     if (GBlobTextureCount && Backend.WantsShadows() && IsBlobShadowTexture(Info.Texture))
     {
@@ -26802,9 +34461,13 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
     // (docs/meres-01 section 3b.4c), so this is the path that has to be efficient.
     if (!Pts || NumPts < 3 || NumPts > MAX_POLY_POINTS)
         return;
+    static const UBOOL bSliverLog = FreshMarker(L"SecondRevision-sliver-log.txt");
+    if (bSliverLog)
+        NoteSliver(Frame, Info, Pts, NumPts, PolyFlags, FrameCounter);
     // Wind: the game's raindrops lean with the level's wind (RainLean) - copies of the corners, the engine's own stay
-    // as they are, shared with the drop's other polygons.
-    FTransTexture  Leaned[MAX_POLY_POINTS];
+    // as they are, shared with the drop's other polygons. Made once: an array of the engine's FTransTexture is made
+    // element by element through calls into Core.dll, and this is every mesh polygon's way.
+    static FTransTexture Leaned[MAX_POLY_POINTS];
     FTransTexture* LeanedPts[MAX_POLY_POINTS];
     if (GRunWind && (PolyFlags & PF_Translucent) && Info.Texture && IsRaindropPicture(Info.Texture) &&
         RainLean(Frame, Pts, NumPts, Leaned, FrameCounter))
@@ -27030,6 +34693,10 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
     const UBOOL      bNoSmooth = (PolyFlags & PF_NoSmooth) ? 1 : 0;
     const FLOAT      OffX      = FrameOffsetX(Frame);
     const FLOAT      OffY      = FrameOffsetY(Frame);
+    // What the crosshair is on, where it is a model (the readout's LOOKING AT): the main view's only - a sub-view is a
+    // mirror or a security screen, and its middle is not where the player is aiming.
+    if (GRunReadout == RdxMath::Readout_On && Frame && !Frame->Parent && Frame->X > 0 && Frame->Y > 0)
+        LookPick(Frame, Pts, NumPts, OffX, OffY, FrameCounter);
     if (Mode != BLEND_Opaque)
         FlushMeshFog(Backend);   // a blended mesh goes over the fog of the ones before it
     static const UBOOL bReliefProbe = FreshMarker(L"SecondRevision-relief-decal-probe.txt");
@@ -27091,6 +34758,114 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
         }
     }
 
+    // The models rounded (Spherifier, RoundPolygon): a mesh triangle known by its model goes over as a patch, cut and
+    // bowed out on the card - a solid one, a mask, glass - and so does the whole triangle the engine cut a polygon out
+    // of at the view's edge, in the polygon's place. Not one the fog is laid over afterwards (its triangles are flat).
+    // A model of no curve (a decal's quad, the laser sight's spot) is drawn below as ever.
+    UBOOL bAllPts = NumPts >= 3;
+    for (INT i = 0; i < NumPts && bAllPts; i++)
+        bAllPts = Pts[i] != nullptr;
+    if (bAllPts && SpherifierCap() > 0 && !WantsMeshFog(PolyFlags, Mode) && Backend.CanRoundMeshes(Mode))
+    {
+        // Timed one triangle in RoundTimeSample, its time counted that many times over: the clock itself, asked three
+        // times a triangle, came to a good part of what it measured.
+        static INT    RoundTick = 0;
+        const UBOOL   bTimed    = (++RoundTick % RoundTimeSample) == 0;
+        const DOUBLE  T0        = bTimed ? appSeconds() : 0.0;
+        UBOOL         bRounded  = 0;
+        // Made once: an array of the engine's FTransTexture is made element by element through calls into Core.dll.
+        // RoundPolygon fills all three before they are read.
+        static FTransTexture Whole[3];
+        INT           Face = -1;
+        FLOAT         Ref[3], Size[3], Least[3];
+        // The counts of why a polygon was drawn flat, before this one is asked about (the measurement, GRoundTrace).
+        INT TraceBefore[7] = {};
+        if (GRoundTrace)
+            RoundTraceCounts(TraceBefore);
+        INT           How = RoundPolygon(Frame, Pts, NumPts, OffX, OffY, FrameCounter, Whole, Face);
+        // A piece of a model not known yet: held back - a solid one, while there is room (RoundHold).
+        if (How == 3)
+        {
+            if (!ReliefDecalCandidate(PolyFlags) &&
+                RoundHold(Frame, FrameCounter, Pts, NumPts, Srv, Mode, bNoSmooth, bInMirror, InvU, InvV, Boost, OffX,
+                          OffY, CallKind, CallBeam))
+            {
+                Held.bKeep = 1;
+                if (GRoundTrace)
+                    RoundTraceNote(Frame, FrameCounter, Pts[0]->Point, RTH_HELD);
+                if (bTimed)
+                    GRoundSeconds += (appSeconds() - T0) * (DOUBLE)RoundTimeSample;
+                return;
+            }
+            How = 0;
+        }
+        // The pieces held before it, before it: where it made their model known, they are drawn rounded as it is.
+        if (GRoundHeldCount > 0)
+        {
+            RoundRelease(Backend);
+            Backend.SetSurfaceKind(CallKind);
+            Backend.SetSurfaceBeam(CallBeam);
+            Backend.SetInMirror(bInMirror);
+        }
+        for (INT c = 0; c < 3 && How; c++)
+            if (!RoundEdgeRef(Backend, *GRoundDraw.Model, Face, c, Ref[c], Size[c], Least[c]))
+                How = 0;
+        const FLOAT Poly = How ? RoundPolyRef(Backend, *GRoundDraw.Model, Face) : 0.0f;
+        if (bTimed)
+            GRoundTriSeconds += (appSeconds() - T0) * (DOUBLE)RoundTimeSample;
+        if (How && RoundedTriangleOut(Backend, Frame, Whole, Srv, Mode, bNoSmooth, InvU, InvV, Boost, Ref, Size, Least,
+                                      Poly, Pts, OffX, OffY))
+        {
+            GRoundDone++;
+            bRounded = 1;
+        }
+        if (bTimed)
+            GRoundSeconds += (appSeconds() - T0) * (DOUBLE)RoundTimeSample;
+        if (GRoundTrace)
+        {
+            INT After[7];
+            RoundTraceCounts(After);
+            static const INT Hows[7] = { RTH_NOACTOR, RTH_NOFACE, RTH_SAMEFAIL, RTH_GAVEUP, RTH_NOTFACE, RTH_OFFPROJ,
+                                         RTH_CUTMISSED };
+            INT Traced = bRounded ? ((How == 2) ? RTH_CUT : RTH_ROUND) : RTH_FLAT;
+            for (INT k = 0; k < 7 && Traced == RTH_FLAT; k++)
+                if (After[k] != TraceBefore[k])
+                    Traced = Hows[k];
+            if (Traced == RTH_FLAT && GRoundDraw.bLive && GRoundDraw.bFlat)
+                Traced = RTH_DRAWFLAT;
+            RoundTraceNote(Frame, FrameCounter, Pts[0]->Point, Traced);
+        }
+        if (FrameCounter - GRoundSaid >= 600 || FrameCounter < GRoundSaid)
+        {
+            const INT Frames = FrameCounter - GRoundSaid;
+            if (GRoundSaid >= 0 && Frames > 0)
+                RDX_LOGF("models rounded: over the last %i frames, of the mesh triangles %i rounded (%i of them whole in "
+                         "the place of a piece cut at the view's edge), in %i draws "
+                         "known (%i of them of models all of flat parts, %i with a vertex out of the model's reach, %i "
+                         "bowed as their models rest); flat: %i of no model near, %i of no face of "
+                         "theirs so numbered (%i guesses, %i of them off), %i more of such a draw, %i not a face of the "
+                         "draw's model, %i off the projection, %i after their draw's tries ran out, %i cut pieces of no "
+                         "face of the draw, %i cut pieces of a model not known yet (held back: %i drawn rounded once it "
+                         "was, %i flat; %i not held); %.3f ms a frame, "
+                         "of it %.3f ms knowing the triangles' models and faces and their bows, %.3f ms of those "
+                         "knowing the draws",
+                         Frames, GRoundDone, GRoundCut, GRoundDraws, GRoundFlatModel, GRoundInsane, GRoundFits,
+                         GRoundNoActor,
+                         GRoundNoFace, GRoundGuesses,
+                         GRoundGuessesBad, GRoundSameFailed, GRoundNotFace, GRoundOffProjection, GRoundGaveUp,
+                         GRoundCutMissed, GRoundCutUnknown, GRoundHeldRound, GRoundHeldFlat, GRoundHeldRefused,
+                         1000.0 * GRoundSeconds / (DOUBLE)Frames, 1000.0 * GRoundTriSeconds / (DOUBLE)Frames,
+                         1000.0 * GRoundFindSeconds / (DOUBLE)Frames);
+            GRoundSaid = FrameCounter;
+            GRoundDone = GRoundDraws = GRoundFlatModel = GRoundNoActor = GRoundNoFace = GRoundGuesses = GRoundFits = 0;
+            GRoundInsane = GRoundCut = GRoundCutMissed = GRoundCutUnknown = 0;
+            GRoundHeldRound = GRoundHeldFlat = GRoundHeldRefused = 0;
+            GRoundGuessesBad = GRoundSameFailed = GRoundNotFace = GRoundOffProjection = GRoundGaveUp = 0;
+            GRoundSeconds = GRoundFindSeconds = GRoundTriSeconds = 0.0;
+        }
+        if (bRounded)
+            return;
+    }
     // Three points - a mesh triangle, which is nearly every call on this path - go straight into
     // this frame's upload buffer, with no local fan to copy across afterwards (measured: 8500
     // calls a frame in Liberty). That buffer is write-combined, so nothing may read a vertex
@@ -27099,16 +34874,48 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
     {
         if (!Pts[0] || !Pts[1] || !Pts[2])
             return;
-        // A decal on a raised surface, brought forward over its relief (ReliefDecalLift).
-        const FLOAT Lift = ReliefDecalCandidate(PolyFlags) ? ReliefDecalLift(Frame, FrameCounter, Pts, 3) : 0.0f;
+        // A decal on a raised surface, brought forward over its relief (ReliefDecalLift); or one laid on a wall the
+        // spherifier rounded - the laser sight's spot -, put where the wall went (SphereMeshDecal), made here first: what
+        // goes into the frame's buffer is not read back.
+        const FLOAT  Lift = ReliefDecalCandidate(PolyFlags) ? ReliefDecalLift(Frame, FrameCounter, Pts, 3) : 0.0f;
+        FSolidVertex Laid[3];
+        UBOOL        bLaid = 0;
+        if (GSphere->bOn && ReliefDecalCandidate(PolyFlags))
+        {
+            for (int i = 0; i < 3; i++)
+                FillGouraudVertex(Laid[i], *Pts[i], OffX, OffY, InvU, InvV, Boost);
+            bLaid = SphereMeshDecal(Frame, Pts, 3, Laid, OffX, OffY, Lift);
+        }
+        // A bullet hole with depth (BulletHoleRun): its run the relief's, its corners with no relief axes of their own.
+        const UBOOL bHole = (PolyFlags & PF_Modulated) && ReliefRuns() && IsBulletHolePicture(Info.Texture) &&
+                            BulletHoleRun(Backend, Frame, Info.Texture, Pts, OffX, OffY);
         FSolidVertex* const V = Backend.BeginTriangle(Srv, -1, Mode, bNoSmooth);
         if (!V)
+        {
+            if (bHole)
+            {
+                Backend.ClearPomRun();
+                Backend.ClearReliefRun();
+            }
             return;
+        }
         for (int i = 0; i < 3; i++)
         {
-            FillGouraudVertex(V[i], *Pts[i], OffX, OffY, InvU, InvV, Boost);
-            if (Lift > 0.0f)
-                V[i].Depth = LiftedDepth(Pts[i]->Point, Lift);
+            if (bLaid)
+                V[i] = Laid[i];
+            else
+            {
+                FillGouraudVertex(V[i], *Pts[i], OffX, OffY, InvU, InvV, Boost);
+                if (Lift > 0.0f)
+                    V[i].Depth = LiftedDepth(Pts[i]->Point, Lift);
+            }
+            if (bHole)
+                V[i].PX = V[i].PY = V[i].PN = V[i].PD = 0.0f;
+        }
+        if (bHole)
+        {
+            Backend.ClearPomRun();
+            Backend.ClearReliefRun();
         }
         NoteWinding(Frame, 1, Pts[0]->ScreenX + OffX, Pts[0]->ScreenY + OffY,
                     Pts[1]->ScreenX + OffX, Pts[1]->ScreenY + OffY,
@@ -27123,9 +34930,14 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
             FSolidVertex* const F = GMeshFog[Cut] + GMeshFogCount[Cut];
             for (int i = 0; i < 3; i++)
             {
-                FillGouraudVertex(F[i], *Pts[i], OffX, OffY, InvU, InvV, Boost);
-                if (Lift > 0.0f)
-                    F[i].Depth = LiftedDepth(Pts[i]->Point, Lift);
+                if (bLaid)
+                    F[i] = Laid[i];
+                else
+                {
+                    FillGouraudVertex(F[i], *Pts[i], OffX, OffY, InvU, InvV, Boost);
+                    if (Lift > 0.0f)
+                        F[i].Depth = LiftedDepth(Pts[i]->Point, Lift);
+                }
                 FogVertex(F[i], *Pts[i]);
                 NoteFogSample(Frame, *Pts[i]);
             }
@@ -27144,17 +34956,26 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
             return;
         FillGouraudVertex(Verts[i], *P, OffX, OffY, InvU, InvV, Boost);
     }
-    // A decal on a raised surface, brought forward over its relief (ReliefDecalLift).
+    // A decal on a raised surface, brought forward over its relief (ReliefDecalLift) - and one laid on a wall the
+    // spherifier rounded put where the wall went (SphereMeshDecal), brought forward over it as much.
     if (ReliefDecalCandidate(PolyFlags))
     {
         const FLOAT Lift = ReliefDecalLift(Frame, FrameCounter, Pts, NumPts);
-        if (Lift > 0.0f)
+        if (!SphereMeshDecal(Frame, Pts, NumPts, Verts, OffX, OffY, Lift) && Lift > 0.0f)
             for (int i = 0; i < NumPts; i++)
                 Verts[i].Depth = LiftedDepth(Pts[i]->Point, Lift);
     }
 
     NoteWinding(Frame, 1, Verts[0].X, Verts[0].Y, Verts[1].X, Verts[1].Y, Verts[2].X, Verts[2].Y);
+    // A bullet hole with depth (BulletHoleRun): drawn in a run of its own relief.
+    const UBOOL bHole = (PolyFlags & PF_Modulated) && ReliefRuns() && IsBulletHolePicture(Info.Texture) &&
+                        BulletHoleRun(Backend, Frame, Info.Texture, Pts, OffX, OffY);
     Backend.AddFan(Verts, NumPts, Srv, -1, Mode, bNoSmooth);
+    if (bHole)
+    {
+        Backend.ClearPomRun();
+        Backend.ClearReliefRun();
+    }
     if (WantsMeshFog(PolyFlags, Mode))
     {
         // The fan's triangles as FSolidPass::AddFan makes them, so the fog lies on exactly the same ones.
@@ -27684,6 +35505,7 @@ void URevisionRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info,
             YL *= GSplash.PerY * GSplash.Scale;
         }
     }
+    RoundRelease(Backend);
     FlushMeshFog(Backend);
     // A splash of the game's rain (IsRainSplash) is thrown up from what is behind it: not a sprite the soft particles
     // fade against that.

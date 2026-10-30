@@ -726,6 +726,89 @@ INT FPomLibrary::FindCached(QWORD CacheId, const TCHAR* PathName, INT USize, INT
     return Entry;
 }
 
+INT FPomLibrary::AddOwn(const char* Key, const BYTE* Blob, INT Bytes, INT W, INT H, FLOAT Depth)
+{
+    if (!Key || !Key[0] || !Blob || Bytes <= (INT)sizeof(FPomHeader) || W <= 0 || H <= 0)
+        return -1;
+    // Asked for every plant drawn: the last one found is tried first.
+    if (OwnLast >= 0 && OwnLast < Count && Entries[OwnLast].Own == Blob && SameKey(Entries[OwnLast].Key, Key))
+        return OwnLast;
+    for (INT i = 0; i < Count; i++)
+        if (Entries[i].Own == Blob && SameKey(Entries[i].Key, Key))
+            return OwnLast = i;
+    if (Count >= MAX_ENTRIES)
+        return -1;
+    FEntry& E = Entries[Count];
+    appMemzero(&E, sizeof(E));
+    for (INT k = 0; Key[k] && k < MAX_KEY - 1; k++)
+    {
+        E.Key[k]  = Lower(Key[k]);
+        E.Name[k] = Key[k];
+    }
+    E.Pack      = -1;
+    E.MapU      = W;
+    E.MapV      = H;
+    E.HeightSrv = -1;
+    E.Depth     = Clamp(Depth, 0.0f, 64.0f);
+    E.bOn       = (E.Depth > 0.0f) ? 1 : 0;
+    E.Own       = Blob;
+    E.OwnBytes  = Bytes;
+    OwnLast     = Count;
+    return Count++;
+}
+
+BYTE* FPomLibrary::MakeOwnBlob(const BYTE* Heights, INT W, INT H, INT& Bytes)
+{
+    Bytes = 0;
+    if (!Heights || W < 4 || H < 4)
+        return nullptr;
+    // The map and its halvings down to four texels a side, sixteen bits a height (R16), each the average of the four
+    // under it.
+    INT Mips = 0, Total = (INT)sizeof(FPomHeader);
+    for (INT w = W, h = H; Mips < MAX_MIPS; Mips++)
+    {
+        Total += w * h * 2;
+        if (w <= 4 || h <= 4)
+        {
+            Mips++;
+            break;
+        }
+        w /= 2;
+        h /= 2;
+    }
+    BYTE* const Blob = (BYTE*)appMalloc(Total, TEXT("RdxPomOwn"));
+    if (!Blob)
+        return nullptr;
+    FPomHeader& Hdr = *(FPomHeader*)Blob;
+    appMemzero(&Hdr, sizeof(Hdr));
+    Hdr.Magic   = POM_MAGIC;
+    Hdr.Version = POM_VERSION;
+    Hdr.Width   = (DWORD)W;
+    Hdr.Height  = (DWORD)H;
+    Hdr.Flags   = 0;
+    Hdr.Mips    = (DWORD)Mips;
+    unsigned short* Level = (unsigned short*)(Blob + sizeof(FPomHeader));
+    for (INT i = 0; i < W * H; i++)
+        Level[i] = (unsigned short)(Heights[i] * 257);
+    for (INT m = 1, w = W, h = H; m < Mips; m++)
+    {
+        unsigned short* const Next = Level + w * h;
+        const INT    nw = w / 2, nh = h / 2;
+        for (INT y = 0; y < nh; y++)
+            for (INT x = 0; x < nw; x++)
+            {
+                const INT Sum = Level[(2 * y) * w + 2 * x] + Level[(2 * y) * w + 2 * x + 1] +
+                                Level[(2 * y + 1) * w + 2 * x] + Level[(2 * y + 1) * w + 2 * x + 1];
+                Next[y * nw + x] = (unsigned short)((Sum + 2) / 4);
+            }
+        Level = Next;
+        w     = nw;
+        h     = nh;
+    }
+    Bytes = Total;
+    return Blob;
+}
+
 INT FPomLibrary::GetHeightSrv(INT Entry) const
 {
     return (Entry >= 0 && Entry < Count) ? Entries[Entry].HeightSrv : -1;
@@ -788,9 +871,10 @@ UBOOL FPomLibrary::Prepare(INT Entry, ID3D12GraphicsCommandList* Cmd, FTextureCa
         return 0;                 // read once and failed: not tried again every frame
     if (Hold > 0)
         return 0;                 // just after a set change - see Hold; the surface draws flat for those frames
-    // Two descriptors to an entry, and the shader's table reads four from an entry's first: the entry needs the two
-    // after its own to exist as well.
-    if (Entry * 2 + 4 > Textures.GetPomViews())
+    // Two descriptors to an entry, and the shader's table reaches seven from an entry's first (the water's table, with
+    // the caustics' net, the mirror probe and the own body after its four): the entry needs the five after its own to
+    // exist as well.
+    if (Entry * 2 + 7 > Textures.GetPomViews())
         return 0;
     // One upload buffer an entry, and it has to stay alive until the frame that copies from it has been through the
     // card. With no room for one this frame, leave the entry alone and come back next frame - marking it tried here
@@ -800,6 +884,14 @@ UBOOL FPomLibrary::Prepare(INT Entry, ID3D12GraphicsCommandList* Cmd, FTextureCa
     EnsureBlank(Textures);
     E.bTried = 1;
 
+    // An own map (AddOwn) is in memory already, laid out as Upload reads it.
+    if (E.Own)
+    {
+        const UBOOL bOwn = Upload(E, Entry, E.Own, E.OwnBytes, Cmd, Textures);
+        if (bOwn)
+            Uploaded++;
+        return bOwn;
+    }
     if (E.Pack < 0 || E.Pack >= PackCount || !Packs[E.Pack].Path[0])
         return 0;
     HANDLE F = ::CreateFileW(Packs[E.Pack].Path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);

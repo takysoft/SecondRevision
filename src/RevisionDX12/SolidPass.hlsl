@@ -124,6 +124,15 @@ float2 JitterUv()
 // it down towards a held edge, the more the lower - a band along a seam between two surfaces shows as a red line - and
 // blue where it goes round a bend, lifted along a direction the faces share.
 #define POM_SHOWKEEP  256.0f
+// The surface's vertices carry no axes of the relief - a grown plant's bark (RdxMath::PomFlag_Rates): PSCore works out
+// the way to the eye in the texture's own axes from how the place and the texture's coordinate run across the screen.
+#define POM_RATES     512.0f
+// Its relief walked as the bark's displacement builds it (TreeShader.h's TREE_BARK_PIXELS): the height read as coarse as
+// a piece of that many pixels, so the eye meets the same bark either way - its finest pits only shade it, as there.
+#define POM_RATES_PIXELS 6.0f
+// With POM_RATES: the height read as fine as the screen asks, not as the bark's displacement builds it - a bullet
+// hole's own map (the renderer's BulletHoleRun), which has no displacement to match.
+#define POM_FINE     1024.0f
 // How much of the baked light the lamps' directions reshape, 0..1: the rest of it is taken as coming from all around
 // (the light the level bounces, which the relief shadows little), and stays as it was.
 #define ReliefLampStrength WaterWave.x
@@ -165,8 +174,534 @@ cbuffer WaterLampConsts : register(b2)
     // then three rows each: one end in view space with the share of the band it keeps (w), the other end, and its
     // shear (ReliefHeldAt). With none the rim band is the one the patches' corners carry.
     float4 ReliefHeldCount;
+    // The spherifier's rows for a run whose patches it rounds (SphereMoveAt; zeros: none): x on, yz the light map's
+    // coordinates against the texture's along U and V, w how many of the level's polygons the run's patches lie on (none:
+    // any); the view's space to the level's, and the level's to the view's - three rows each, an axis and an offset; and
+    // those polygons, up to eight (SphereNodes).
+    float4 SphereRun;
+    float4 SphereToLevel[3];
+    float4 SphereToView[3];
+    uint4  SphereNodes[2];
     float4 ReliefHeld[3 * RELIEF_HELD_MAX];
 };
+
+// The level's rounding (LevelRound.h's PackRound, FSolidPass::SetSphereField): a header of ROUND_HEADER words - the plan
+// grid's width and height, its corner, its cell, the cap, where the cells, their items, the polygons and the faces
+// start, how many polygons and faces there are, where the relief's outline records start and how many there are, and
+// where their points start; then each cell's first item and count; the items, polygons; each polygon's first face and
+// count; each face's kind, four corners and four edges' terms, ROUND_FACE_WORDS words a face; each outline record's
+// first point and count and its edge's two ends, ROUND_CHORD_WORDS words; and each point's place along the edge and
+// its move, ROUND_POINT_WORDS words. Then the relief's floor (SpherePieceMoveAt): the header's last seven words say
+// where each polygon's record of its drawn triangles starts (0: none), and the floor's own plan grid of those polygons
+// - its width and height, its corner, where its cells and their items start. A record, ROUND_PIECE_HEADER words: the
+// polygon's plane, the axis its plan is laid flat along, a grid over that plan - its width and height in one word, its
+// corner and one over its cell's sides - and where its places, triangles and items start from the record's start; then
+// each cell's first item and count, sixteen bits each. A place, ROUND_PLACE_WORDS words: where it was in the plan, how
+// far it moved, three half floats, and the drawn surface's normal there, three more (LevelRound.h's PlaceNormalOf); a
+// triangle its three places, sixteen bits each, in two words; the items its triangles over each cell, sixteen bits
+// each, two to a word (LevelRound.h's PackRound).
+ByteAddressBuffer SphereField : register(t20);
+#define ROUND_HEADER        22u
+#define ROUND_FACE_WORDS    77u
+#define ROUND_CHORD_WORDS   8u
+#define ROUND_POINT_WORDS   4u
+#define ROUND_PIECE_HEADER  13u
+#define ROUND_PLACE_WORDS   5u
+#define ROUND_PIECE_INSIDE  1e-4f   // a triangle's share a point may lie outside it by and still be on it
+#define ROUND_PIECE_OUTSIDE 0.05f   // and by which the triangle it lies least outside of is still its own
+#define ROUND_PIECE_PLANE   0.1f    // the units a polygon's plane may lie further off than the nearest and be looked at
+#define ROUND_CHORD_NEAR  0.5f      // the units a point may lie off an outline record's edge and still be on it
+#define ROUND_NEAR       2.0f       // the units a point may lie off a face's plane and still be on it (MoveOnPolygon's)
+#define ROUND_SURE       0.01f      // a point this near a face's plane of its own way lies on it: taken at once
+#define ROUND_ALONG      0.9f       // a face this much along the point's own polygon's normal is of that plane's way
+#define ROUND_STEP       0.5f       // the step the rounded surface's way is measured over
+
+float3 SphereLevelOf(float3 V)
+{
+    return float3(dot(SphereToLevel[0].xyz, V) + SphereToLevel[0].w, dot(SphereToLevel[1].xyz, V) + SphereToLevel[1].w,
+                  dot(SphereToLevel[2].xyz, V) + SphereToLevel[2].w);
+}
+float3 SphereLevelDir(float3 V)
+{
+    return float3(dot(SphereToLevel[0].xyz, V), dot(SphereToLevel[1].xyz, V), dot(SphereToLevel[2].xyz, V));
+}
+float3 SphereViewDir(float3 W)
+{
+    return float3(dot(SphereToView[0].xyz, W), dot(SphereToView[1].xyz, W), dot(SphereToView[2].xyz, W));
+}
+
+// MeshRound.h's BendOf: s (1 - s)^2 within the bend's room, none past it.
+float RoundBend(float S)
+{
+    return (S < 1.0f) ? S * (1.0f - S) * (1.0f - S) : 0.0f;
+}
+
+// A face of the level's rounding, read once: its four edges' four bends each (MeshRound.h's FEdgeTerms, from corner k to
+// k + 1), a bend's way and its room in each - a triangle's last edge none.
+struct FRoundFace
+{
+    float4 S[16];
+};
+
+FRoundFace RoundFaceAt(uint At)
+{
+    FRoundFace F;
+    [unroll] for (uint k = 0u; k < 16u; k++)
+        F.S[k] = asfloat(SphereField.Load4(At + k * 16u));
+    return F;
+}
+
+// Edge e's curve at U from its start (MeshRound.h's EdgeCurveAt): each bend scaled by its room.
+float3 RoundEdgeAt(FRoundFace F, uint e, float U)
+{
+    const float4 S0 = F.S[e * 4u], S1 = F.S[e * 4u + 1u], S2 = F.S[e * 4u + 2u], S3 = F.S[e * 4u + 3u];
+    return S0.xyz * (S0.w * RoundBend(U / S0.w)) + S1.xyz * (S1.w * RoundBend(U / S1.w)) +
+           S2.xyz * (S2.w * RoundBend((1.0f - U) / S2.w)) + S3.xyz * (S3.w * RoundBend((1.0f - U) / S3.w));
+}
+
+// A triangle's move at the corners' shares B (MeshRound.h's PatchMoveAt): each edge's curve weighed by the cube of its
+// two corners' shares together, and half of every bend, at its room, for the middle.
+float3 RoundPatchMove(FRoundFace F, float3 B)
+{
+    float3 Move = float3(0.0f, 0.0f, 0.0f), Middle = float3(0.0f, 0.0f, 0.0f);
+    const float Bs[3] = { B.x, B.y, B.z };
+    [unroll] for (uint e = 0u; e < 3u; e++)
+    {
+        const float Ba = Bs[e], Bb = Bs[(e + 1u) % 3u], S = Ba + Bb;
+        if (S > 1e-6f)
+            Move += RoundEdgeAt(F, e, Bb / S) * (S * S * S);
+        [unroll] for (uint k = 0u; k < 4u; k++)
+            Middle += F.S[e * 4u + k].xyz * F.S[e * 4u + k].w;
+    }
+    return Move + Middle * (0.5f * B.x * B.y * B.z);
+}
+
+// A quad's move at its U and V (LevelRound.h's QuadMoveAt): each side's curve where the point's lines across the quad
+// meet it, the two pairs blended by how far across it lies - a Coons patch.
+float3 RoundQuadMove(FRoundFace F, float2 Uv)
+{
+    return RoundEdgeAt(F, 0u, Uv.x) * (1.0f - Uv.y) + RoundEdgeAt(F, 2u, 1.0f - Uv.x) * Uv.y +
+           RoundEdgeAt(F, 3u, 1.0f - Uv.y) * (1.0f - Uv.x) + RoundEdgeAt(F, 1u, Uv.y) * Uv.x;
+}
+
+// A face's move: a triangle's at its corners' shares B, a quad's at its U and V (B.xy).
+float3 RoundFaceMove(FRoundFace F, uint Kind, float3 B)
+{
+    return (Kind == 0u) ? RoundPatchMove(F, B) : RoundQuadMove(F, B.xy);
+}
+
+// A move held to the rounding's cap.
+float3 RoundCapped(float3 M)
+{
+    const float Cap = asfloat(SphereField.Load(20u));
+    const float L   = length(M);
+    return (L > Cap && L > 0.0f) ? M * (Cap / L) : M;
+}
+
+// Where W lies in the flat quad of corners Q0 .. Q3 (the way round), laid flat along the axis Drop (LevelRound.h's
+// QuadUvOf): the share of the way from corner 0 to 1 (Uv.x) and from 0 to 3 (Uv.y). False where it has none.
+bool RoundQuadUv(float3 Q0, float3 Q1, float3 Q2, float3 Q3, uint Drop, float3 W, out float2 Uv)
+{
+    Uv = float2(-1.0f, -1.0f);
+    const float3 E3 = Q1 - Q0, F3 = Q3 - Q0, G3 = Q0 - Q1 + Q2 - Q3, H3 = W - Q0;
+    const float2 E = (Drop == 0u) ? E3.yz : (Drop == 1u) ? E3.xz : E3.xy;
+    const float2 F = (Drop == 0u) ? F3.yz : (Drop == 1u) ? F3.xz : F3.xy;
+    const float2 G = (Drop == 0u) ? G3.yz : (Drop == 1u) ? G3.xz : G3.xy;
+    const float2 H = (Drop == 0u) ? H3.yz : (Drop == 1u) ? H3.xz : H3.xy;
+    const float  K2 = G.x * F.y - G.y * F.x, K1 = E.x * F.y - E.y * F.x + H.x * G.y - H.y * G.x;
+    const float  K0 = H.x * E.y - H.y * E.x;
+    if (!(abs(E.x * F.y - E.y * F.x) > 1e-12f))
+        return false;
+    // K2 V^2 + K1 V + K0 = 0, its roots taken without the difference of two near numbers (LevelRound.h's QuadUvOf):
+    // q = -(K1 + sign K1 root) / 2, the roots q / K2 and K0 / q; the one whose U and V both lie in the quad.
+    const float Wd = K1 * K1 - 4.0f * K0 * K2;
+    if (Wd < 0.0f)
+        return false;
+    const float Qr = -0.5f * (K1 + ((K1 < 0.0f) ? -sqrt(Wd) : sqrt(Wd)));
+    if (Qr == 0.0f)
+        return false;
+    const float  V1 = K0 / Qr, V2 = (K2 != 0.0f) ? Qr / K2 : 1e30f;
+    const float2 D1 = E + G * V1, D2 = E + G * V2;
+    const float  U1 = (abs(D1.x) >= abs(D1.y)) ? (H.x - F.x * V1) / D1.x : (H.y - F.y * V1) / D1.y;
+    const float  U2 = (abs(D2.x) >= abs(D2.y)) ? (H.x - F.x * V2) / D2.x : (H.y - F.y * V2) / D2.y;
+    const float  Off1 = max(max(-V1, V1 - 1.0f), max(-U1, U1 - 1.0f));
+    const float  Off2 = (V2 < 1e29f) ? max(max(-V2, V2 - 1.0f), max(-U2, U2 - 1.0f)) : 1e30f;
+    Uv = (Off1 <= Off2) ? float2(U1, V1) : float2(U2, V2);
+    return true;
+}
+
+// Whether the level's place W lies on face f, within ROUND_NEAR of its plane: its kind (0 a triangle, 1 + the axis its
+// plane is laid flat along for a quad), its shares there (B: a triangle's corners', a quad's U and V), a triangle's
+// two sides from its first corner (E1, E2), how far off the plane W lies (Off) and the plane's normal (Nf, of length one).
+bool RoundOnFace(uint FacesAt, uint f, float3 W, out uint Kind, out float3 B, out float3 E1, out float3 E2, out float Off,
+                 out float3 Nf)
+{
+    Off = 1e30f;
+    Nf  = float3(0.0f, 0.0f, 0.0f);
+    const uint   At = (FacesAt + f * ROUND_FACE_WORDS) * 4u;
+    Kind            = SphereField.Load(At);
+    const float3 A  = asfloat(SphereField.Load3(At + 4u));
+    const float3 Q1 = asfloat(SphereField.Load3(At + 16u));
+    const float3 Q2 = asfloat(SphereField.Load3(At + 28u));
+    E1              = Q1 - A;
+    E2              = Q2 - A;
+    B               = float3(0.0f, 0.0f, 0.0f);
+    const float3 Q  = W - A;
+    if (Kind != 0u)
+    {
+        const float3 Q3 = asfloat(SphereField.Load3(At + 40u));
+        const float3 Nq = cross(E1, Q3 - A);
+        const float  NQ = length(Nq);
+        float2       Uv;
+        if (!(NQ > 1e-12f) || abs(dot(Q, Nq)) > ROUND_NEAR * NQ || !RoundQuadUv(A, Q1, Q2, Q3, Kind - 1u, W, Uv))
+            return false;
+        Off = abs(dot(Q, Nq)) / NQ;
+        Nf  = Nq / NQ;
+        B   = float3(Uv, 0.0f);
+        return Uv.x >= -1e-3f && Uv.x <= 1.0f + 1e-3f && Uv.y >= -1e-3f && Uv.y <= 1.0f + 1e-3f;
+    }
+    const float3 N  = cross(E1, E2);
+    const float  NL = length(N);
+    if (!(NL > 1e-12f) || abs(dot(Q, N)) > ROUND_NEAR * NL)
+        return false;
+    Off = abs(dot(Q, N)) / NL;
+    Nf  = N / NL;
+    const float D00 = dot(E1, E1), D01 = dot(E1, E2), D11 = dot(E2, E2);
+    const float Den = D00 * D11 - D01 * D01;
+    if (!(abs(Den) > 1e-12f))
+        return false;
+    const float D20 = dot(Q, E1), D21 = dot(Q, E2);
+    const float B1 = (D11 * D20 - D01 * D21) / Den, B2 = (D00 * D21 - D01 * D20) / Den, B0 = 1.0f - B1 - B2;
+    B = float3(B0, B1, B2);
+    return B0 >= -1e-3f && B1 >= -1e-3f && B2 >= -1e-3f;
+}
+
+// The face of the level's rounding the place W lies on (LevelRound.h's PolygonAt and MoveOnPolygon): the byte it starts
+// at, its kind, its shares there (B) and a triangle's sides (E1, E2). The polygons looked through: the run's own
+// (SphereRun.w of them, SphereNodes), else those the plan grid lists in W's cell. Of the faces W lies on, one of the
+// way of its own polygon's plane (Nl, ROUND_ALONG) before any other, and of those the one whose plane it lies nearest:
+// a wall it stands beside, or the far side of a thin slat, is no face of its own - the first such one found as near as
+// ROUND_SURE is taken at once. False where it lies on no moved one.
+bool SphereFaceAt(float3 W, float3 Nl, out uint FaceAt, out uint Kind, out float3 B, out float3 E1, out float3 E2)
+{
+    FaceAt = Kind = 0u;
+    B = E1 = E2 = float3(0.0f, 0.0f, 0.0f);
+    const uint GW = SphereField.Load(0u), GH = SphereField.Load(4u);
+    if (GW == 0u || GH == 0u)
+        return false;
+    const uint PolysAt = SphereField.Load(32u), FacesAt = SphereField.Load(36u);
+    const uint Own     = (uint)SphereRun.w;
+    uint       First = 0u, Count = Own, ItemsAt = 0u;
+    if (Own == 0u)
+    {
+        const float X0 = asfloat(SphereField.Load(8u)), Y0 = asfloat(SphereField.Load(12u));
+        const float Cell = asfloat(SphereField.Load(16u));
+        const int   Cx = (int)floor((W.x - X0) / Cell), Cy = (int)floor((W.y - Y0) / Cell);
+        if (Cx < 0 || Cy < 0 || Cx >= (int)GW || Cy >= (int)GH)
+            return false;
+        const uint  CellsAt = SphereField.Load(24u);
+        const uint2 Items   = SphereField.Load2((CellsAt + 2u * ((uint)Cy * GW + (uint)Cx)) * 4u);
+        ItemsAt             = SphereField.Load(28u);
+        First               = Items.x;
+        Count               = Items.y;
+    }
+    bool  bFound = false, bAlong = false;
+    float Best   = 1e30f;
+    [loop] for (uint i = 0u; i < Count; i++)
+    {
+        const uint  P     = (Own > 0u) ? SphereNodes[i >> 2u][i & 3u] : SphereField.Load((ItemsAt + First + i) * 4u);
+        const uint2 Faces = SphereField.Load2((PolysAt + 2u * P) * 4u);
+        [loop] for (uint f = Faces.x; f < Faces.x + Faces.y; f++)
+        {
+            uint   K;
+            float3 Bf, A1, A2, Nf;
+            float  Off;
+            if (!RoundOnFace(FacesAt, f, W, K, Bf, A1, A2, Off, Nf))
+                continue;
+            const bool bWay = abs(dot(Nf, Nl)) >= ROUND_ALONG;
+            if (bFound && ((bAlong && !bWay) || (bAlong == bWay && Off >= Best)))
+                continue;
+            bFound = true;
+            bAlong = bWay;
+            Best   = Off;
+            FaceAt = (FacesAt + f * ROUND_FACE_WORDS) * 4u;
+            Kind   = K;
+            B      = (K == 0u) ? max(Bf, 0.0f) : float3(saturate(Bf.xy), 0.0f);
+            E1     = A1;
+            E2     = A2;
+            if (bWay && Off <= ROUND_SURE)
+                return true;
+        }
+    }
+    return bFound;
+}
+
+// The change of a triangle's corners' shares for the step D in the level (E1, E2 its sides).
+float3 RoundSharesOf(float3 D, float3 E1, float3 E2)
+{
+    const float D00 = dot(E1, E1), D01 = dot(E1, E2), D11 = dot(E2, E2);
+    const float Den = D00 * D11 - D01 * D01;
+    const float D20 = dot(D, E1), D21 = dot(D, E2);
+    const float B1 = (D11 * D20 - D01 * D21) / Den, B2 = (D00 * D21 - D01 * D20) / Den;
+    return float3(-B1 - B2, B1, B2);
+}
+
+// A quad's U and V a step D off W, and which way the step went (S): towards its inside.
+float3 RoundQuadStep(uint FaceAt, uint Kind, float3 W, float3 D, out float S)
+{
+    const float3 Q0 = asfloat(SphereField.Load3(FaceAt + 4u)), Q1 = asfloat(SphereField.Load3(FaceAt + 16u));
+    const float3 Q2 = asfloat(SphereField.Load3(FaceAt + 28u)), Q3 = asfloat(SphereField.Load3(FaceAt + 40u));
+    float2       Uv;
+    S = 1.0f;
+    if (!RoundQuadUv(Q0, Q1, Q2, Q3, Kind - 1u, W + D, Uv) || any(Uv < 0.0f) || any(Uv > 1.0f))
+    {
+        S = -1.0f;
+        if (!RoundQuadUv(Q0, Q1, Q2, Q3, Kind - 1u, W - D, Uv))
+            Uv = float2(0.5f, 0.5f);
+    }
+    return float3(saturate(Uv), 0.0f);
+}
+
+// The relief's floor (LevelRound.h's PackRound and PackedPieceMoveAt): how far the level's place W moves as the drawn
+// triangle it lies on moves it. Of the polygons that face the way Nl does (ROUND_ALONG) and whose plane it lies within
+// ROUND_NEAR of, only those whose plane it lies nearest to, within ROUND_PIECE_PLANE - its own and those in its plane
+// beside it, not the far side of a thin wall: the first triangle of theirs it lies on, else the one it lies least
+// outside of if that is within ROUND_PIECE_OUTSIDE of its shares, its shares held to it. The polygons looked through:
+// the run's own (SphereRun.w of them, SphereNodes), else those the floor's own plan grid lists in W's cell. The faces'
+// curve is met by those triangles only at their corners: a bend near the end of an edge they keep straight would leave
+// a relief on the curve behind the surface drawn under it, pressed down by it (ReliefClear). And the drawn surface's
+// normal there (Normal): its corners' normals between them, of length one, turned to Nl's side - Nl where they add up
+// to none; and the normal of the triangle itself (Flat), the flat surface drawn under the relief there, turned the same
+// way. False where W lies on none.
+float SpherePiecePlaneOff(uint At, float3 W, float3 Nl)
+{
+    const float4 Plane = asfloat(SphereField.Load4(At * 4u));
+    const float  Off   = abs(dot(Plane.xyz, W) - Plane.w);
+    return (Off > ROUND_NEAR || abs(dot(Plane.xyz, Nl)) < ROUND_ALONG) ? 1e30f : Off;
+}
+bool SpherePieceMoveAt(float3 W, float3 Nl, out float3 Move, out float3 Normal, out float3 Flat)
+{
+    Move   = float3(0.0f, 0.0f, 0.0f);
+    Normal = Nl;
+    Flat   = Nl;
+    const uint PiecesAt = SphereField.Load(60u), GW = SphereField.Load(64u), GH = SphereField.Load(68u);
+    if (PiecesAt == 0u)
+        return false;
+    const uint Own   = (uint)SphereRun.w;
+    uint       First = 0u, Count = Own;
+    if (Own == 0u)
+    {
+        if (GW == 0u || GH == 0u)
+            return false;
+        const float X0 = asfloat(SphereField.Load(72u)), Y0 = asfloat(SphereField.Load(76u));
+        const float Cell = asfloat(SphereField.Load(16u));
+        const int   Cx = (int)floor((W.x - X0) / Cell), Cy = (int)floor((W.y - Y0) / Cell);
+        if (Cx < 0 || Cy < 0 || Cx >= (int)GW || Cy >= (int)GH)
+            return false;
+        const uint2 Items = SphereField.Load2((SphereField.Load(80u) + 2u * ((uint)Cy * GW + (uint)Cx)) * 4u);
+        First             = Items.x;
+        Count             = Items.y;
+    }
+    float Nearest = 1e30f;
+    [loop] for (uint i = 0u; i < Count; i++)
+    {
+        const uint P  = (Own > 0u) ? SphereNodes[i >> 2u][i & 3u] : SphereField.Load((First + i) * 4u);
+        const uint At = SphereField.Load((PiecesAt + P) * 4u);
+        if (At != 0u)
+            Nearest = min(Nearest, SpherePiecePlaneOff(At, W, Nl));
+    }
+    if (Nearest > ROUND_NEAR)
+        return false;
+    float  Best   = -1e30f;
+    float3 BestB  = float3(0.0f, 0.0f, 0.0f);
+    uint   BestAt = 0u, BestT = 0u;
+    [loop] for (uint i2 = 0u; i2 < Count && Best < -ROUND_PIECE_INSIDE; i2++)
+    {
+        const uint P  = (Own > 0u) ? SphereNodes[i2 >> 2u][i2 & 3u] : SphereField.Load((First + i2) * 4u);
+        const uint At = SphereField.Load((PiecesAt + P) * 4u);
+        if (At == 0u || SpherePiecePlaneOff(At, W, Nl) > Nearest + ROUND_PIECE_PLANE)
+            continue;
+        const uint   Drop  = SphereField.Load((At + 4u) * 4u);
+        const uint   GxGy  = SphereField.Load((At + 5u) * 4u);
+        const uint2  G     = uint2(GxGy & 0xFFFFu, GxGy >> 16);
+        const float4 Plan  = asfloat(SphereField.Load4((At + 6u) * 4u));
+        const uint3  Offs  = SphereField.Load3((At + 10u) * 4u);
+        const float2 Q     = float2((Drop == 0u) ? W.y : W.x, (Drop == 2u) ? W.y : W.z);
+        const int2   Pc    = clamp((int2)floor((Q - Plan.xy) * Plan.zw), int2(0, 0), (int2)G - int2(1, 1));
+        const uint   Cw    = SphereField.Load((At + ROUND_PIECE_HEADER + (uint)Pc.y * G.x + (uint)Pc.x) * 4u);
+        [loop] for (uint j = 0u; j < (Cw >> 16) && Best < -ROUND_PIECE_INSIDE; j++)
+        {
+            const uint Item = (Cw & 0xFFFFu) + j;
+            const uint T    = (SphereField.Load((At + Offs.z + (Item >> 1)) * 4u) >> ((Item & 1u) * 16u)) & 0xFFFFu;
+            const uint2 Tw  = SphereField.Load2((At + Offs.y + 2u * T) * 4u);
+            const uint3 V   = uint3(Tw.x & 0xFFFFu, Tw.x >> 16, Tw.y);
+            float2      C[3];
+            [unroll] for (uint k = 0u; k < 3u; k++)
+                C[k] = asfloat(SphereField.Load2((At + Offs.x + ROUND_PLACE_WORDS * V[k]) * 4u));
+            const float2 E1 = C[1] - C[0], E2 = C[2] - C[0], D = Q - C[0];
+            const float  Den = E1.x * E2.y - E2.x * E1.y;
+            if (!(abs(Den) > 1e-12f))
+                continue;
+            const float B1 = (D.x * E2.y - E2.x * D.y) / Den, B2 = (E1.x * D.y - D.x * E1.y) / Den;
+            const float B0 = 1.0f - B1 - B2;
+            const float L  = min(B0, min(B1, B2));
+            if (L > Best)
+            {
+                Best   = L;
+                BestB  = float3(B0, B1, B2);
+                BestAt = At;
+                BestT  = T;
+            }
+        }
+    }
+    if (Best < -ROUND_PIECE_OUTSIDE)
+        return false;
+    const float3 S    = max(BestB, 0.0f);
+    const uint3  Offs = SphereField.Load3((BestAt + 10u) * 4u);
+    const uint2  Tw   = SphereField.Load2((BestAt + Offs.y + 2u * BestT) * 4u);
+    const uint3  V    = uint3(Tw.x & 0xFFFFu, Tw.x >> 16, Tw.y);
+    // Each corner where it is drawn: where it was - its place in the plan, put back onto the polygon's plane along the
+    // axis the plan leaves out - and its move.
+    const float4 Plane = asfloat(SphereField.Load4(BestAt * 4u));
+    const uint   Drop  = SphereField.Load((BestAt + 4u) * 4u);
+    float3       N = float3(0.0f, 0.0f, 0.0f), Drawn[3];
+    [unroll] for (uint k = 0u; k < 3u; k++)
+    {
+        const uint   At = (BestAt + Offs.x + ROUND_PLACE_WORDS * V[k]) * 4u;
+        const float2 Q  = asfloat(SphereField.Load2(At));
+        const uint3  H  = SphereField.Load3(At + 8u);
+        const float3 M  = float3(f16tof32(H.x & 0xFFFFu), f16tof32(H.x >> 16), f16tof32(H.y & 0xFFFFu));
+        Move += M * S[k];
+        N += float3(f16tof32(H.y >> 16), f16tof32(H.z & 0xFFFFu), f16tof32(H.z >> 16)) * S[k];
+        float3 O;
+        if (Drop == 0u)
+            O = float3((Plane.w - Plane.y * Q.x - Plane.z * Q.y) / Plane.x, Q.x, Q.y);
+        else if (Drop == 1u)
+            O = float3(Q.x, (Plane.w - Plane.x * Q.x - Plane.z * Q.y) / Plane.y, Q.y);
+        else
+            O = float3(Q.x, Q.y, (Plane.w - Plane.x * Q.x - Plane.y * Q.y) / Plane.z);
+        Drawn[k] = O + M;
+    }
+    Move /= (S.x + S.y + S.z);
+    if (dot(N, N) > 1e-12f)
+    {
+        Normal = normalize(N);
+        Normal = (dot(Normal, Nl) < 0.0f) ? -Normal : Normal;
+    }
+    const float3 F = cross(Drawn[1] - Drawn[0], Drawn[2] - Drawn[0]);
+    if (dot(F, F) > 1e-12f)
+    {
+        Flat = normalize(F);
+        Flat = (dot(Flat, Nl) < 0.0f) ? -Flat : Flat;
+    }
+    return true;
+}
+
+// Where the level's place W moves with the polygon it lies on (Move, held to the cap), and the rounded surface's normal
+// there (Normal): the moved surface's ways along the polygon's two axes (Tu, Tv, of length one) measured a step off on
+// the same face - towards its inside. Nl, the polygon's own normal, orients it. Where the drawn triangle it lies on is
+// had (SpherePieceMoveAt, bFloor), the place goes where that triangle has it, and its normal is the drawn surface's
+// there, between the triangle's corners: the faces' curve's would stand off the triangles it rises from, and the
+// relief's lines step at their edges. False where W lies on no moved polygon.
+bool SphereMoveAt(float3 W, float3 Tu, float3 Tv, float3 Nl, out float3 Move, out float3 Normal, out bool bFloor,
+                  out float3 Flat)
+{
+    Move   = float3(0.0f, 0.0f, 0.0f);
+    Normal = Nl;
+    float3     Piece, PieceNormal;
+    const bool bPiece = SpherePieceMoveAt(W, Nl, Piece, PieceNormal, Flat);
+    bFloor            = bPiece;
+    uint   FaceAt, Kind;
+    float3 B, E1, E2;
+    if (!SphereFaceAt(W, Nl, FaceAt, Kind, B, E1, E2))
+    {
+        Move   = Piece;
+        Normal = PieceNormal;
+        return bPiece;
+    }
+    const FRoundFace F = RoundFaceAt(FaceAt + 52u);
+    Move               = RoundCapped(RoundFaceMove(F, Kind, B));
+    float  Su = 1.0f, Sv = 1.0f;
+    float3 Bu, Bv;
+    if (Kind == 0u)
+    {
+        const float3 Du = RoundSharesOf(Tu * ROUND_STEP, E1, E2), Dv = RoundSharesOf(Tv * ROUND_STEP, E1, E2);
+        Su              = (min(min(B.x + Du.x, B.y + Du.y), B.z + Du.z) < 0.0f) ? -1.0f : 1.0f;
+        Sv              = (min(min(B.x + Dv.x, B.y + Dv.y), B.z + Dv.z) < 0.0f) ? -1.0f : 1.0f;
+        Bu              = B + Du * Su;
+        Bv              = B + Dv * Sv;
+    }
+    else
+    {
+        Bu = RoundQuadStep(FaceAt, Kind, W, Tu * ROUND_STEP, Su);
+        Bv = RoundQuadStep(FaceAt, Kind, W, Tv * ROUND_STEP, Sv);
+    }
+    const float3 Mu = RoundCapped(RoundFaceMove(F, Kind, Bu));
+    const float3 Mv = RoundCapped(RoundFaceMove(F, Kind, Bv));
+    const float3 N  = cross(Tu + (Mu - Move) * (Su / ROUND_STEP), Tv + (Mv - Move) * (Sv / ROUND_STEP));
+    if (dot(N, N) > 1e-12f)
+    {
+        Normal = normalize(N);
+        Normal = (dot(Normal, Nl) < 0.0f) ? -Normal : Normal;
+    }
+    if (bPiece)
+    {
+        Move   = Piece;
+        Normal = PieceNormal;
+    }
+    return true;
+}
+
+// How far the level's place W on the relief's outline edge E moves (LevelRound.h's ChordsOf and PackedChordAt): as the
+// triangles' side through it moves it - between the two of the record's points round it, in a straight line - so the
+// relief's outline lies on the very sides the pieces beside it and under it are drawn with, not on the curve those
+// sides are cut from. False where E is no record of the field on the card, or W lies off its edge (the patches were
+// laid by another rounding).
+bool SphereChordAt(uint E, float3 W, out float3 Move)
+{
+    Move = float3(0.0f, 0.0f, 0.0f);
+    if (E >= SphereField.Load(52u))
+        return false;
+    const uint   At     = (SphereField.Load(48u) + E * ROUND_CHORD_WORDS) * 4u;
+    const uint   Points = SphereField.Load(56u);
+    const uint2  Range  = SphereField.Load2(At);
+    const float3 A      = asfloat(SphereField.Load3(At + 8u));
+    const float3 D      = asfloat(SphereField.Load3(At + 20u)) - A;
+    if (Range.y < 2u)
+        return false;
+    const float L2 = dot(D, D);
+    const float T  = (L2 > 1e-8f) ? saturate(dot(W - A, D) / L2) : 0.0f;
+    const float3 Off = W - A - D * T;
+    if (dot(Off, Off) > ROUND_CHORD_NEAR * ROUND_CHORD_NEAR)
+        return false;
+    uint Lo = 0u, Hi = Range.y - 1u;
+    [loop] while (Hi - Lo > 1u)
+    {
+        const uint Mid = (Lo + Hi) / 2u;
+        if (asfloat(SphereField.Load((Points + (Range.x + Mid) * ROUND_POINT_WORDS) * 4u)) <= T)
+            Lo = Mid;
+        else
+            Hi = Mid;
+    }
+    const float4 P0 = asfloat(SphereField.Load4((Points + (Range.x + Lo) * ROUND_POINT_WORDS) * 4u));
+    const float4 P1 = asfloat(SphereField.Load4((Points + (Range.x + Hi) * ROUND_POINT_WORDS) * 4u));
+    const float  S  = (P1.x > P0.x) ? saturate((T - P0.x) / (P1.x - P0.x)) : 0.0f;
+    Move = lerp(P0.yzw, P1.yzw, S);
+    return true;
+}
+
+// A view-space direction turned as the level's direction From turns onto To (both of length one): round their common
+// perpendicular, by the angle between them.
+float3 SphereTurnedBy(float3 Dir, float3 From, float3 To)
+{
+    const float3 Ax = cross(From, To);
+    const float  S  = length(Ax), C = dot(From, To);
+    if (S < 1e-6f)
+        return Dir;
+    const float3 K = Ax / S;
+    const float3 L = SphereLevelDir(Dir);
+    return SphereViewDir(L * C + cross(K, L) * S + K * (dot(K, L) * (1.0f - C)));
+}
 
 struct VSIn  { float3 Pos : POSITION; float2 Uv : TEXCOORD0; float2 Lv : TEXCOORD1; float4 Colour : COLOR;
                float4 Pom : TEXCOORD2; };
@@ -398,6 +933,48 @@ float OwnShadow(uint L, float3 W, float3 N, float Dist)
     }
     return 0.25f * Lit;
 }
+// An own lamp's light off the wet floor below it (OwnLampsAt): its place's spare holds that floor - its height's whole
+// part, how wet it is there as the fraction (0.99 the wettest), below OWN_WET_NONE none (RenderDevice.cpp's
+// OwnLampWetFloor). The light comes from the lamp's image under the floor, through the floor's point the way crosses,
+// as the lamp's own light by the same cone, fall and facing, by the water's Fresnel there and how wet the floor is -
+// where the lamp's own light reaches that point (its map), for a place above the floor.
+#define OWN_WET_NONE -1.0e29f
+float3 OwnBounce(uint L, float3 W, float3 N, float4 Rims, float4 Fall, float4 Reach)
+{
+    const uint   B  = RDX_OWN_HEAD_ROWS + L * RDX_OWN_LAMP_ROWS;
+    const float4 At = OwnRow(B);
+    const float  Zf = floor(At.w);
+    if (At.w < OWN_WET_NONE || W.z <= Zf + 1.0f || At.z <= Zf + 1.0f)
+        return float3(0.0f, 0.0f, 0.0f);
+    const float3 Img   = float3(At.x, At.y, 2.0f * Zf - At.z);
+    const float3 D     = W - Img;
+    const float  Dist2 = dot(D, D);
+    if (Dist2 >= Reach.x * Reach.x || Dist2 < 1.0f)
+        return float3(0.0f, 0.0f, 0.0f);
+    const float  Dist = sqrt(Dist2);
+    const float3 Dir  = D / Dist;
+    const float3 Axis = OwnRow(B + 1u).xyz;
+    const float  Cos  = dot(Dir, float3(Axis.xy, -Axis.z));
+    const float  Face = -dot(N, Dir);
+    if (Cos <= Rims.z || Face <= 0.0f || Dir.z <= 0.0f)
+        return float3(0.0f, 0.0f, 0.0f);
+    const float3 Cross = Img + D * ((Zf - Img.z) / D.z);
+    const float  Lit   = OwnShadow(L, Cross, float3(0.0f, 0.0f, 1.0f), length(Cross - At.xyz));
+    if (Lit <= 0.0f)
+        return float3(0.0f, 0.0f, 0.0f);
+    const float Wet   = frac(At.w) / 0.99f;
+    const float Fr    = 0.02f + 0.98f * pow(1.0f - saturate(Dir.z), 5.0f);
+    const float Hot   = smoothstep(0.0f, 1.0f, (Cos - Rims.x) * Rims.y);
+    const float Spill = smoothstep(0.0f, 1.0f, (Cos - Rims.z) * Rims.w);
+    const float Cone  = Hot + (1.0f - Hot) * Fall.w * Spill;
+    const float Near  = smoothstep(0.0f, 1.0f, (Dist - Fall.y) * Fall.z);
+    const float Far   = 1.0f - smoothstep(0.5f * Reach.x, Reach.x, Dist);
+    const float Q     = Dist / max(Fall.x, 1.0f);
+    const float F     = min(Face, 1.0f);
+    const float Light = Cone * Near * Far * min(F * 10.0f, 1.0f) * (Reach.y + (1.0f - Reach.y) * F) / (1.0f + Q * Q);
+    return OwnRow(B + 2u).rgb * (Light * Lit * Fr * Wet);
+}
+
 // The own lamps' light at W, a place in the level whose face's normal N looks out towards whoever sees it: every lamp
 // from First on that W lies in the cone of, as far as its map lets the light through (RdxMath::OwnLampLight is the
 // same arithmetic).
@@ -412,6 +989,7 @@ float3 OwnLampsAt(float3 W, float3 N, uint First)
     [loop] for (uint L = First; L < Count; L++)
     {
         const uint   B     = RDX_OWN_HEAD_ROWS + L * RDX_OWN_LAMP_ROWS;
+        Sum += OwnBounce(L, W, N, Rims, Fall, Reach);
         const float3 D     = W - OwnRow(B).xyz;
         const float  Dist2 = dot(D, D);
         if (Dist2 >= Reach.x * Reach.x || Dist2 < 1.0f)
@@ -518,6 +1096,135 @@ float3 FieldHumps(float2 P)
                        Du * float2((V10 - V00) + U.y * K, (V01 - V00) + U.x * K);
     return float3(S, H);
 }
+
+// The wet floors (docs/terv-nedves-feluletek.md 8.5; FSolidPass::SetWetBlocks). The run's block: where the world's view
+// stands in the level - a pixel's place there lies at WetView[0].xyz + P.x * WetView[1].xyz + P.y * WetView[2].xyz +
+// P.z * WetView[3].xyz, P its place in the view as BeamLight finds it -, the kind in WetView[0].w (1 stone, 2 metal,
+// 3 wood, 0 none); the view's centre in the target's pixels with this frame's jitter in it, and its projection (WetScreen.xyz),
+// and the measuring view asked for (w, SecondRevision-wet-view.txt); then the look's numbers, RdxMath's WetPatchUnits
+// and on (WetLook). Not in the builds for rays: no run of theirs is a floor.
+#if !RDX_RT
+cbuffer WetConsts : register(b5)
+{
+    float4 WetView[4];
+    float4 WetScreen;
+    float4 WetLook[2];
+    float4 WetCover;
+};
+// The floor's mark for the late reflection pass (RdxMath::WetMarkPack; FBackend's WetMark): the nearest wet floor at
+// each pixel, kept by an atomic maximum whatever order the floors come in - at the pixel's even column, and its relief's
+// normal (WetTiltOf) at the odd one beside it. At u4 in the pass's own builds alone: the builds for rays have their
+// rays' heads there.
+RWTexture2D<uint> WetMark : register(u4);
+// The rain's cover over the wet floors (FBackend::SetWetCover): the open share, the highest wet floor's height, the
+// lower floors' open share and the highest floor near it, a cell to a texel - t27 of the same table.
+Texture2D<float4> WetCoverMap : register(t27);
+
+// ---- WET-SHARED-BEGIN: SolidPass.hlsl and WetReflect.hlsl hold this alike (scripts/check_shaders.py checks it), so
+// the late reflection pass finds the patches the floor was drawn with. The arithmetic is RdxMath's, WetLean and on.
+// The hash of a grid point the noise leans by there: FieldLean's, by whole-number arithmetic.
+float2 WetLean(int2 Q)
+{
+    uint H = (uint)Q.x * 0x9E3779B9u + (uint)Q.y * 0xBB67AE85u;
+    H ^= H >> 15;
+    H *= 0x6A09E667u;
+    H ^= H >> 13;
+    H *= 0x510E527Fu;
+    H ^= H >> 16;
+    return float2((float)(H & 0xFFFFu), (float)(H >> 16)) * (2.0f / 65535.0f) - 1.0f;
+}
+// The gradient noise the patches are made of: zero at every grid point, leaning there, a quintic ease between.
+float WetNoise(float2 P)
+{
+    const float2 I   = floor(P);
+    const float2 F   = P - I;
+    const float2 U   = F * F * F * (F * (F * 6.0f - 15.0f) + 10.0f);
+    const int2   Q   = (int2)I;
+    const float  V00 = dot(WetLean(Q), F);
+    const float  V10 = dot(WetLean(Q + int2(1, 0)), F - float2(1.0f, 0.0f));
+    const float  V01 = dot(WetLean(Q + int2(0, 1)), F - float2(0.0f, 1.0f));
+    const float  V11 = dot(WetLean(Q + int2(1, 1)), F - float2(1.0f, 1.0f));
+    return V00 + U.x * (V10 - V00) + U.y * (V01 - V00) + U.x * U.y * (V00 - V10 - V01 + V11);
+}
+// The patch value at a place of the level: three sizes of the noise, each half the one before.
+float WetPatch(float2 Level)
+{
+    float2 P   = Level / WetLook[0].x;
+    float  Sum = 0.0f;
+    float  Amp = 1.0f;
+    [unroll] for (int i = 0; i < 3; i++)
+    {
+        Sum += Amp * WetNoise(P);
+        P    = P * 2.03f + float2(17.7f, 31.3f);
+        Amp *= 0.5f;
+    }
+    return Sum;
+}
+// How wet the floor is with that patch value, and how high the water stands in its relief.
+float WetLevelOf(float Patch)
+{
+    return saturate(WetLook[0].y + WetLook[0].z * Patch);
+}
+float WetFloodOf(float Patch)
+{
+    return WetLook[1].x + (WetLook[1].y - WetLook[1].x) * saturate(0.5f + WetLook[1].z * Patch);
+}
+// A pixel's place in the view (its depth Pos.z holds one over the view depth) and in the level, by the view's rows.
+float3 WetViewPlace(float4 Pos)
+{
+    const float Z = 1.0f / max(Pos.z, 1e-6f);
+    return float3((Pos.xy - WetScreen.xy) * (Z / max(WetScreen.z, 1.0f)), Z);
+}
+float3 WetLevelPlace(float4 Pos)
+{
+    const float3 P = WetViewPlace(Pos);
+    return WetView[0].xyz + P.x * WetView[1].xyz + P.y * WetView[2].xyz + P.z * WetView[3].xyz;
+}
+// The rain's cover at a place of the level (FBackend::SetWetCover; docs/terv-nedves-feluletek.md 8.4): its open share
+// there, eased by a roof's edge - 1 where the rain falls, 0 under the roof. A floor more than 64 units
+// (RdxMath::WetUnderFloor) below the highest floor near it - a pier under its shelter's roof - takes the lower floors'
+// share, eased the same way from the edge of the floor above; any other the highest floor's own. No grid (WetCover.z
+// nought): open everywhere.
+float WetCoverOf(float3 Place)
+{
+    if (WetCover.z <= 0.0f)
+        return 1.0f;
+    const float2 Uv = (Place.xy - WetCover.xy) * WetCover.zw;
+    if (any(Uv < 0.0f) || any(Uv > 1.0f))
+        return 1.0f;
+    // Each of the four cells round the place gives its own share - the lower floors' where the place lies more than 64
+    // units under that cell's highest floor, else the highest floor's - and the four are mixed by how near the place is
+    // to each: a floor under a higher one dries across a cell, not cut along the grid's lines.
+    float2 Size;
+    WetCoverMap.GetDimensions(Size.x, Size.y);
+    const float2 At = Uv * Size - 0.5f;
+    const float2 C0 = floor(At);
+    const float2 F  = At - C0;
+    float        S[4];
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        const float4 V = WetCoverMap.Load(int3(clamp(C0 + float2(k & 1, k >> 1), 0.0f, Size - 1.0f), 0));
+        S[k] = (Place.z < V.w - 64.0f) ? V.z : V.x;
+    }
+    return lerp(lerp(S[0], S[1], F.x), lerp(S[2], S[3], F.x), F.y);
+}
+// ---- WET-SHARED-END
+// The mark of a wet floor's pixel (RdxMath::WetMarkPack): its depth's top bits, the share of it under water, the kind.
+uint WetMarkOf(float Depth, float Puddle, bool bMetal)
+{
+    return (asuint(Depth) & 0xFFFFF000u) | (uint)(saturate(Puddle) * 63.0f + 0.5f) | (bMetal ? 64u : 0u);
+}
+// The word beside the mark (RdxMath::WetTiltPack): its depth's top twelve bits - the nearest floor's the larger, as its
+// mark is -, then the relief's normal in the level, its X and Y ten bits each from 1; the depth's bits alone where the
+// floor has no relief.
+uint WetTiltOf(float Depth, float3 Level, bool bRelief)
+{
+    const uint  Tag = asuint(Depth) & 0xFFF00000u;
+    const uint2 Q   = (uint2)(saturate(Level.xy * 0.5f + 0.5f) * 1022.0f + 1.5f);
+    return bRelief ? (Tag | (Q.x << 10) | Q.y) : Tag;
+}
+#endif
+
 // The relief is drawn at its full depth everywhere, never eased by angle or by distance: an ease has a band where it
 // happens, and on a floor that band is a ring around the player that travels with them, so the carpet would swell and
 // flatten under their feet. Distance needs no ease of its own - the height map's own shrunken copies flatten the relief
@@ -531,8 +1238,8 @@ float3 FieldHumps(float2 P)
 // whole grooves.
 //
 // RateX and RateY are the screen rates of the ORIGINAL coordinate, taken by the caller outside any branch - a
-// derivative asked for inside one is not defined.
-float2 PomWalk(float2 Uv, float4 Pom, float2 RateX, float2 RateY, out float OutHeight, out float OutLevel)
+// derivative asked for inside one is not defined. Least: the finest shrunken copy of the height the walk may read.
+float2 PomWalk(float2 Uv, float4 Pom, float2 RateX, float2 RateY, float Least, out float OutHeight, out float OutLevel)
 {
     // How far a point one unit deep slides: the sideways parts of the direction to the eye over its outward part,
     // which is the tangent of the angle the surface is seen at. The division is HERE and not at the vertex, because
@@ -576,7 +1283,7 @@ float2 PomWalk(float2 Uv, float4 Pom, float2 RateX, float2 RateY, out float OutH
     const float2 PixU   = RateX / max(PomTexel, 1e-6f);
     const float2 PixV   = RateY / max(PomTexel, 1e-6f);
     const float  Screen = 0.5f * log2(max(max(dot(PixU, PixU), dot(PixV, PixV)), 1.0f));
-    const float  Level  = max(max(log2(max(Texels * Layer, 1.0f)), 0.0f), Screen);
+    const float  Level  = max(max(max(log2(max(Texels * Layer, 1.0f)), 0.0f), Screen), Least);
     OutLevel = Level;
 
     // A texture laid on once (a sign) is held inside itself, half a texel in from each edge: sliding past it would
@@ -700,23 +1407,32 @@ float ReliefLampShare(int i, float3 N, float3 View)
     return Near * Flat * dot(WaterLamp[2 * i + 1].rgb, float3(0.299f, 0.587f, 0.114f));
 }
 
-// The lamps around the relief (POM_LAMPS): a factor for the baked light here, 1 on a flat wall. The light map says how
-// much light reaches the wall, but not where it comes from - the lamps do. Each lamp's share is what it would give the
-// flat wall here: its colour, how near it is within its reach, the angle it falls at. The relief's slope turns that
-// share up or down (Lambert against the slope over Lambert against the wall), and ReliefLampShadow takes away what the
-// relief itself shades. Only proportions: the light map's own level stays, and a wall no lamp of the list reaches is
-// left as it was.
-float ReliefLamps(float2 Uv, float Height, float Level, float3 View)
+// The relief's slope at Uv, from the height map's neighbours at the same copy: rise per unit of the level along U and V.
+float2 ReliefSlopeAt(float2 Uv, float Level)
 {
-    // The slope here, from the height map's neighbours at the same copy: rise per unit of the level along U and V.
     const float2 Texel = PomTexel * exp2(Level);
     const float  HR    = SceneCopy.SampleLevel(Samp, Uv + float2(Texel.x, 0.0f), Level).r;
     const float  HL    = SceneCopy.SampleLevel(Samp, Uv - float2(Texel.x, 0.0f), Level).r;
     const float  HU    = SceneCopy.SampleLevel(Samp, Uv + float2(0.0f, Texel.y), Level).r;
     const float  HD    = SceneCopy.SampleLevel(Samp, Uv - float2(0.0f, Texel.y), Level).r;
-    const float2 Slope = float2(HR - HL, HU - HD) / (2.0f * max(Texel, 1e-6f)) * ReliefRate * PomDepth;
+    return float2(HR - HL, HU - HD) / (2.0f * max(Texel, 1e-6f)) * ReliefRate * PomDepth;
+}
+// The relief's normal for that slope, in the view's space: the surface's own turned along the texture's directions.
+float3 ReliefTilt(float2 Slope)
+{
+    return normalize(ReliefNormal - Slope.x * ReliefAxisU - Slope.y * ReliefAxisV);
+}
+
+// The lamps around the relief (POM_LAMPS): a factor for the baked light here, 1 on a flat wall. The light map says how
+// much light reaches the wall, but not where it comes from - the lamps do. Each lamp's share is what it would give the
+// flat wall here: its colour, how near it is within its reach, the angle it falls at. The relief's slope there
+// (ReliefSlopeAt) turns that share up or down (Lambert against the slope over Lambert against the wall), and
+// ReliefLampShadow takes away what the relief itself shades. Only proportions: the light map's own level stays, and a
+// wall no lamp of the list reaches is left as it was.
+float ReliefLamps(float2 Uv, float Height, float Level, float3 View, float2 Slope)
+{
     const float3 N     = ReliefNormal;
-    const float3 Tilt  = normalize(N - Slope.x * ReliefAxisU - Slope.y * ReliefAxisV);
+    const float3 Tilt  = ReliefTilt(Slope);
     // Each lamp's share first: the walk through the height map is the expensive part, and only the three lamps giving
     // the most here get one - the others' light is still turned by the slope, it only goes unshadowed. The first pass
     // finds the third largest share; the second takes every lamp and walks for those at or above it.
@@ -754,12 +1470,20 @@ float ReliefLamps(float2 Uv, float Height, float Level, float3 View)
 // at once and the surface shadowed itself away. Doing it properly means moving the shadow pass's own bias by the
 // same amount, which is a change to that pass and not to this one. What is left here is the split into a core and
 // two entry points, which that change will want anyway.
-float4 PSCore(VSOut In)
+// bWet: a wet floor's run (PSMainWet) - the stone darkened where it soaks the water up, and the mark for the late
+// reflection pass. Every other entry point passes false, and the compiler leaves all of it out of theirs.
+float4 PSCoreAny(VSOut In, bool bWet)
 {
     // The relief, where this surface has a height map. Everything below then works from the place the eye actually
     // reaches INTO the surface rather than the place the flat wall would have shown.
     float2 Uv    = In.Uv;
     float  Shade = 1.0f;
+    float  Met   = 1.0f;          // the height where the eye met the relief, 1 the surface's plane
+    float  WetH  = 1.0f;          // the same for a wet floor's water, its relief made real included (POM_TESS)
+    float  WetMip = -1.0f;        // the copy of the height its relief's slope is read at; none, below nought
+    float2 Slope  = float2(0.0f, 0.0f);   // that slope, once the lamps have read it (bSlope)
+    bool   bSlope = false;
+    float4 WetShow = float4(0.0f, 0.0f, 0.0f, 0.0f);    // a wet floor's measuring view, where alpha is 1
     const bool bPom = PomHas(POM_ON);
     // How fast the texture runs across the screen HERE, taken from the coordinate BEFORE the relief moves it. The
     // card picks which shrunken copy of the texture to read from exactly this, and the moved coordinate is not fit to
@@ -771,11 +1495,50 @@ float4 PSCore(VSOut In)
     const float2 LRateX = ddx(In.Lv);
     const float2 LRateY = ddy(In.Lv);
     float2 Lv = In.Lv;
+    // The way to the eye in the texture's own axes, as RdxMath::PomVertex lays it at a level polygon's corners; where the
+    // vertices carry none (POM_RATES, a grown plant's bark, its axes turning round the branch), worked out here: the
+    // texture's coordinate along the surface rises along its two gradients - each in the surface's plane, found from
+    // how the place and the coordinate run across the screen (the surface's cotangent frame) - and their lengths are the
+    // texture's repeats a unit of the level.
+    float4 Pom = In.Pom;
+    // The finest copy of the height the walk reads - none held back but on the bark (POM_RATES_PIXELS) - and the copy
+    // as fine as the screen, the bark's shading's.
+    float Least = 0.0f, Fine = 0.0f;
+    if (bPom && PomHas(POM_RATES))
+    {
+        const float2 PixU = RateX / max(PomTexel, 1e-6f);
+        const float2 PixV = RateY / max(PomTexel, 1e-6f);
+        const float  Most = max(dot(PixU, PixU), dot(PixV, PixV));
+        Least = PomHas(POM_FINE) ? 0.0f : log2(max(POM_RATES_PIXELS * sqrt(Most), 1.0f));
+        Fine  = 0.5f * log2(max(Most, 1.0f));
+        const float3 D1  = ddx(In.View);
+        const float3 D2  = ddy(In.View);
+        const float3 Up  = cross(D1, D2);
+        const float  Det = length(Up);
+        Pom = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (Det > 1e-12f)
+        {
+            const float3 F  = Up / Det;
+            const float3 P2 = cross(D2, F);
+            const float3 P1 = cross(F, D1);
+            // The surface's own normal where the vertices bring it (the bark's, smooth round the branch, in the view's
+            // space): the gradients laid into its plane, so the eye's angle does not jump from triangle to triangle of
+            // a curved surface.
+            const float  Ns = dot(In.Pom.xyz, In.Pom.xyz);
+            const float3 N  = (Ns > 1e-6f) ? In.Pom.xyz * rsqrt(Ns) : F;
+            float3       GU = (P2 * RateX.x + P1 * RateY.x) / Det;
+            float3       GV = (P2 * RateX.y + P1 * RateY.y) / Det;
+            GU -= N * dot(GU, N);
+            GV -= N * dot(GV, N);
+            const float3 E  = -In.View;
+            Pom = float4(dot(E, GU), dot(E, GV), abs(dot(E, N)), sqrt(length(GU) * length(GV)));
+        }
+    }
     if (bPom)
     {
         float Height = 1.0f;
         float Level  = 0.0f;
-        Uv = PomWalk(In.Uv, In.Pom, RateX, RateY, Height, Level);
+        Uv = PomWalk(In.Uv, Pom, RateX, RateY, Least, Height, Level);
         // The baked light moves with the relief, or the light and the shadows painted into it stay on the flat wall
         // while the texture slides over them. Both coordinates come from the same mapping axes, so along each one the
         // light map runs a fixed number of times as fast as the texture: that ratio is read off the two sets of rates,
@@ -783,10 +1546,24 @@ float4 PSCore(VSOut In)
         const float2 TexSq = RateX * RateX + RateY * RateY;
         const float2 Ratio = (LRateX * RateX + LRateY * RateY) / max(TexSq, 1e-12f);
         Lv = In.Lv + (Uv - In.Uv) * Ratio;
-        // The relief darkens its own hollows, always, and the lamps shade it from the point the eye reached.
+        // The relief darkens its own hollows, always, and the lamps shade it from the point the eye reached. The bark's
+        // finest pits, which its walk passes over, shade it there as they shade its displacement (the POM_TESS shading
+        // below): the height there read as fine as the screen.
+        if (PomHas(POM_RATES))
+        {
+            Level  = Fine;
+            Height = SceneCopy.SampleLevel(Samp, Uv, Level).r;
+        }
         Shade = 1.0f - PomOcclusion(Uv, Height, Level);
         if (PomHas(POM_LAMPS))
-            Shade *= ReliefLamps(Uv, Height, Level, In.View);
+        {
+            Slope  = ReliefSlopeAt(Uv, Level);
+            bSlope = true;
+            Shade *= ReliefLamps(Uv, Height, Level, In.View, Slope);
+        }
+        Met    = Height;
+        WetH   = Height;
+        WetMip = Level;
     }
     // Geometry=Tessellation: the surface already stands out of the wall (DSRelief), so there is nothing to walk - only
     // the shading the relief gives it, from the height map at the texel's own place and at the screen's own copy.
@@ -799,7 +1576,13 @@ float4 PSCore(VSOut In)
         const float  Height = SceneCopy.SampleLevel(Samp, Uv, Level).r;
         Shade = 1.0f - PomOcclusion(Uv, Height, Level);
         if (PomHas(POM_LAMPS))
-            Shade *= ReliefLamps(Uv, Height, Level, In.View);
+        {
+            Slope  = ReliefSlopeAt(Uv, Level);
+            bSlope = true;
+            Shade *= ReliefLamps(Uv, Height, Level, In.View, Slope);
+        }
+        WetH   = Height;
+        WetMip = Level;
     }
     // PF_NoSmooth asks for the texels unfiltered. Measured: the stock renderer draws
     // the HUD icons with visible square texels, where ours smeared them.
@@ -816,6 +1599,54 @@ float4 PSCore(VSOut In)
     // rather than blend: that keeps the depth buffer correct, which blending would not.
 #if !RDX_DEBUG_NOCLIP
     clip(T.a - 0.5f);
+#endif
+#if !RDX_RT && !RDX_MODULATED
+    // A wet floor (the wet block's kind): its place in the level and the patches there, how high the water stands and
+    // how much of the pixel is under it - by the relief's height where the eye met it, the surface's plane where it has
+    // none -, the stone and the wood darkened as they soak the water up (metal does not), and the mark the late
+    // reflection pass reads - none on wood, which gives nothing back.
+    if (bWet && WetView[0].w > 0.5f)
+    {
+        const float3 Place  = WetLevelPlace(In.Pos);
+        const float  Patch  = WetPatch(Place.xy);
+        // Under a roof's edge the stone dries, and the water draws back into its hollows (WetCoverOf).
+        const float  Cover  = WetCoverOf(Place);
+        const float  Wet    = WetLevelOf(Patch) * Cover;
+        const float  Flood  = WetFloodOf(Patch) * Cover;
+        const float  Puddle = saturate((Flood - WetH) / WetLook[1].w + 0.5f);
+        const bool   bStone = WetView[0].w < 1.5f;
+        const bool   bWood  = WetView[0].w > 2.5f;
+        if (bStone || bWood)
+            T.rgb *= lerp(1.0f, WetLook[0].w, max(Wet, Puddle));
+        // The mark, and beside it the relief's normal where the eye met it, in the level: the damp stone gives back by
+        // it, and only where it has one (Geometry=POM or Tessellation, and a height map) - none on a flat floor.
+        if (!bWood)
+        {
+            const uint2 At      = uint2(In.Pos.xy) * uint2(2u, 1u);
+            const bool  bRelief = WetMip >= 0.0f && dot(ReliefNormal, ReliefNormal) > 0.25f;
+            float3      Tilt    = float3(0.0f, 0.0f, 1.0f);
+            if (bRelief)
+            {
+                if (!bSlope)
+                    Slope = ReliefSlopeAt(Uv, WetMip);
+                const float3 V = ReliefTilt(Slope);
+                Tilt = V.x * WetView[1].xyz + V.y * WetView[2].xyz + V.z * WetView[3].xyz;
+            }
+            InterlockedMax(WetMark[At], WetMarkOf(In.Pos.z, Puddle, !bStone));
+            InterlockedMax(WetMark[At + uint2(1u, 0u)], WetTiltOf(In.Pos.z, Tilt, bRelief));
+        }
+        // The measuring views (SecondRevision-wet-view.txt): 1 the patches - grey the wetter, blue the share under
+        // water, a red tint on metal, a green one on wood; 2 the place in the level - a line every 64 units along X (red) and Y (green),
+        // and the height in bands of 16 (blue).
+        if (WetScreen.w > 0.5f && WetScreen.w < 1.5f)
+            WetShow = float4(0.5f * Wet * ((bStone || bWood) ? 1.0f : 0.6f), 0.5f * Wet * (bWood ? 1.4f : 1.0f),
+                             0.5f * Wet + 0.5f * Puddle, 1.0f);
+        if (WetScreen.w > 1.5f && WetScreen.w < 2.5f)
+        {
+            const float2 Line = step(frac(Place.xy / 64.0f), 0.04f);
+            WetShow = float4(Line.x, Line.y, 0.25f + 0.5f * frac(Place.z / 16.0f), 1.0f);
+        }
+    }
 #endif
 
     // Baked lighting for BSP surfaces. Geometry without a light map gets a neutral
@@ -852,7 +1683,13 @@ float4 PSCore(VSOut In)
     // could never exceed 1: a texel above 128 could not brighten anything. Measured: the
     // vision augmentation lays its SolidGreen (0,255,0) twice, each should double the
     // green, and our window came out exactly four times too dark before the output curve.
-    return float4(T.rgb, 1.0f);
+    // A bullet hole's own run (POM_FINE, the renderer's BulletHoleRun): where the eye met the hole rather than the
+    // wall's plane, the hole's side shows where the picture has its flat dark - the wall's own colour (a modulation of
+    // one half), darker the deeper it lies, black at the bottom; what it paints lighter there stays. And a modulated
+    // run with relief darkens its hollows.
+    if (PomHas(POM_FINE))
+        T.rgb = lerp(T.rgb, max(T.rgb, (0.5f * Met * sqrt(Met)).xxx), saturate((1.0f - Met) * 8.0f));
+    return float4(T.rgb * Shade, 1.0f);
 #else
     // The surface in its own light, and in the flashlight's where the run takes it: the cone itself, and what the
     // level's mirrors give back of it.
@@ -866,16 +1703,36 @@ float4 PSCore(VSOut In)
         C = lerp(C, float3(0.0f, 0.3f, 1.0f), 0.8f * saturate(In.Pom.w * 200.0f));
         // And green where a cover holds it under itself, by how much of its lift that took.
         C = lerp(C, float3(0.0f, 1.0f, 0.0f), 0.8f * saturate(In.Pom.y * 2.0f));
+        // And yellow towards a point of the outline put on the pieces' side (SphereChordAt), magenta towards one the
+        // field had no side for, cyan towards a point inside the polygon the field had no face for (left unmoved).
+        C = lerp(C, float3(1.0f, 1.0f, 0.0f), 0.9f * saturate(In.Pom.x));
+        C = lerp(C, float3(1.0f, 0.0f, 1.0f), 0.9f * saturate(-In.Pom.x) * (1.0f - saturate(-In.Pom.x - 1.0f)));
+        C = lerp(C, float3(0.0f, 1.0f, 1.0f), 0.9f * saturate(-In.Pom.x - 1.0f));
     }
-    return float4(C, 1.0f);
+    return (WetShow.a > 0.5f) ? WetShow : float4(C, 1.0f);
 #endif
 #endif
+}
+
+float4 PSCore(VSOut In)
+{
+    return PSCoreAny(In, false);
 }
 
 float4 PSMain(VSOut In) : SV_Target
 {
     return PSCore(In);
 }
+#if !RDX_RT && !RDX_FOG && !RDX_MODULATED
+// A wet floor's run (FSolidPass's WetPipelines): PSMain's, and its mark for the late reflection pass. The depth is tested
+// before the shader, so only what stands nearest so far marks; the mark is an atomic maximum, so of those the nearest is
+// kept whatever order they come in.
+[earlydepthstencil]
+float4 PSMainWet(VSOut In) : SV_Target
+{
+    return PSCoreAny(In, true);
+}
+#endif
 
 // The relief's covers (FSolidPass::DrawReliefCovers): depth alone, with the holes a masked texture has - a grating's gaps
 // let the relief through, as they let the eye through.
@@ -901,14 +1758,18 @@ void PSCover(VSOut In)
 // without it, only the beam's light lies over it.
 
 struct PSLitOut { float4 Colour : SV_Target0; float4 Lit : SV_Target1; float4 Added : SV_Target2; };
-PSLitOut PSMainLit(VSOut In)
+PSLitOut PSMainLitAny(VSOut In, bool bWet)
 {
     PSLitOut Out;
-    Out.Colour = PSCore(In);
+    Out.Colour = PSCoreAny(In, bWet);
     float3 Lit = In.Colour.rgb * Light.Sample(Samp, In.Lv).rgb * RDX_LIGHT_SCALE;
     Out.Lit = float4(dot(Lit, float3(0.299f, 0.587f, 0.114f)), 0.0f, 0.0f, 1.0f);
     Out.Added = Out.Colour;
     return Out;
+}
+PSLitOut PSMainLit(VSOut In)
+{
+    return PSMainLitAny(In, false);
 }
 // A draw that is the surface - opaque, or translucent claiming the depth: of its colour only the flashlight's part
 // goes into the added target, replacing what was there. Without the flashlight that is nothing.
@@ -918,6 +1779,16 @@ PSLitOut PSMainLitSurface(VSOut In)
     Out.Added = float4(GBeamPart, 1.0f);
     return Out;
 }
+#if !RDX_RT && !RDX_FOG && !RDX_MODULATED
+// A wet floor's run with the shadows' targets (PSMainWet's way).
+[earlydepthstencil]
+PSLitOut PSMainLitSurfaceWet(VSOut In)
+{
+    PSLitOut Out = PSMainLitAny(In, true);
+    Out.Added = float4(GBeamPart, 1.0f);
+    return Out;
+}
+#endif
 #endif
 
 // Water (BLEND_Water): a see-through water surface over copies of the picture and the depth taken at the frame's
@@ -945,11 +1816,12 @@ float2 WaterSlope(float2 Uv, float Time, float Strength)
 // the picture holds there, that is what the water mirrors - a few halvings of the last step find the place more
 // closely. Behind by more than the step itself, or by a wall's thickness, is something in front, not what the ray met.
 // rgb: the image, a: how much of it to trust - nothing where the ray found nothing, and less towards the picture's
-// edges, where the image would otherwise end in a hard line.
-float4 WaterReflect(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 AY, float3 AZ, float Focal, float2 Size)
+// edges, where the image would otherwise end in a hard line. Steps: how many steps the ray takes (WaterMirrorSteps).
+#define WATER_REFLECT_REACH 4096.0f
+float4 WaterReflect(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 AY, float3 AZ, float Focal, float2 Size,
+                    int Steps)
 {
-    const int   Steps = 24;
-    const float Reach = 4096.0f;
+    const float Reach = WATER_REFLECT_REACH;
     float  Prev = 0.0f, PrevZ = dot(Sp - Eye, AZ);
     [loop] for (int i = 1; i <= Steps; i++)
     {
@@ -992,6 +1864,28 @@ float4 WaterReflect(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 AY, flo
                            JitterUv();
         if (all(Far >= 0.0f) && all(Far <= 1.0f) &&
             1.0f / max(DepthCopy.Load(int3(min(Far * Size, Size - 1.0f), 0)).r, 1e-6f) > PrevZ)
+        {
+            const float2 Edge = saturate(min(Far, 1.0f - Far) * 12.0f);
+            return float4(SceneCopy.SampleLevel(Samp, Far, 0.0f).rgb, Edge.x * Edge.y);
+        }
+    }
+    return 0.0f;
+}
+
+// The far image (Reflections=Low): no trace - only the trace's own last look (WaterReflect), what lies along the mirrored
+// view's direction beyond the trace's reach: the sky, a skyline, wherever the picture holds something that far off
+// there. Nearer than that - a wall across a pool, a room's ceiling - it gives nothing, and the surface's own light stands
+// in, as it does wherever a trace finds nothing.
+float4 WaterFarImage(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 AY, float3 AZ, float Focal, float2 Size)
+{
+    const float RZ = dot(Ray, AZ);
+    if (RZ > 0.01f)
+    {
+        const float2 Far = (WaterScreen.xy + float2(dot(Ray, AX), dot(Ray, AY)) * (Focal / RZ)) * InvHalfSize * 0.5f +
+                           JitterUv();
+        if (all(Far >= 0.0f) && all(Far <= 1.0f) &&
+            1.0f / max(DepthCopy.Load(int3(min(Far * Size, Size - 1.0f), 0)).r, 1e-6f) >
+                dot(Sp + Ray * WATER_REFLECT_REACH - Eye, AZ))
         {
             const float2 Edge = saturate(min(Far, 1.0f - Far) * 12.0f);
             return float4(SceneCopy.SampleLevel(Samp, Far, 0.0f).rgb, Edge.x * Edge.y);
@@ -1092,6 +1986,9 @@ static bool GRtEyeSeen = false;
 // first request the first slot of the one written at that pixel before it.
 RWTexture2D<uint>   RtHeads : register(u4);
 RWByteAddressBuffer RtAsked : register(u5);
+// Reflections=RTLow (RtEye.w 2): the list the pixels write into instead, this process's own - the pass that thins it
+// puts what the host is to trace into the host's (RaySparse.hlsl).
+RWByteAddressBuffer RtAskedLow : register(u7);
 // What the pixel has asked so far - a request's first four uints and its last four - until RtAskFlush writes them
 // out; and whether the pixel is thrown away, and asks nothing after all (the build has no target to keep it from).
 static uint  GRtAskCount = 0u;
@@ -1100,18 +1997,29 @@ static uint4 GRtAskB[RDX_RAY_BLOCK_MOST];
 static bool  GRtAskDead  = false;
 #else
 // In the masks' place - the host tests them where it traces: the pixels' blocks. In the scene's place: the requests,
-// for a block's key. And the answers, and the see-through surfaces the rays passed on their way.
+// for a block's key - at RTLow the own list the pixels wrote into (RtAskedLow). And the answers, and the see-through
+// surfaces the rays passed on their way.
 Texture2D<uint>   RtHeads   : register(t9);
 ByteAddressBuffer RtAsked   : register(t6);
 ByteAddressBuffer RtAnswers : register(t16);
 ByteAddressBuffer RtPassed  : register(t17);
-// The pixel's own block - its first slot, and how many requests it has: none until RtFind found it - and how many of
-// their answers the pixel has taken.
+// The pixel's own block - its first slot, and how many requests it has: none until RtFind found it - where its answers
+// begin - the block's own slot, or at RTLow where the thinning pass put its requests in the host's list - and how
+// many of them the pixel has taken.
 static uint GRtBlock      = 0u;
 static uint GRtBlockCount = 0u;
+static uint GRtAnswer     = 0u;
 static uint GRtTaken      = 0u;
-// Whether the block is another pixel's of the two by two (Reflections=RTHalf, RtFind).
+// Whether the block is another pixel's - of the two by two (Reflections=RTHalf) or the three by three (RTLow; RtFind).
 static bool GRtBorrowed   = false;
+// The corners the rays are traced against, as the host has them (FHostRayFeed::GetCorners): the level's, the frame's
+// bodies' and the arena's - for a borrowed answer's triangle, met with the pixel's own ray (RtOwnHit).
+ByteAddressBuffer RtLevelCorners : register(t23);
+ByteAddressBuffer RtFrameCorners : register(t24);
+ByteAddressBuffer RtArenaCorners : register(t25);
+// How the pixel's first borrowed answer of a triangle went (RtOwnHit), for the measuring view 12: 0 none borrowed, 1
+// the pixel's own ray meets the triangle, 2 it does not.
+static uint GRtOwnHit     = 0u;
 // What the host traced on to from the answer last taken (an answer's last four uints): the lamps' light where the
 // ray met something, with what stood in that light's way looked for among GRtLitBy - RtLampLight gives it back
 // where it is asked for the same -, and the see-through surfaces the ray passed: how many, and the first one's slot
@@ -1120,6 +2028,75 @@ static float3 GRtLit         = float3(0.0f, 0.0f, 0.0f);
 static uint   GRtLitBy       = 0u;
 static uint   GRtPassedCount = 0u;
 static uint   GRtPassedFirst = 0u;
+#endif
+
+#if !RDX_RT_ASK
+// Reflections=RTLow: a borrowed answer met with the pixel's own ray (Origin, Way, From, To). Where the pixel's ray meets
+// the triangle the lender's met too, the answer takes this ray's distance and weights - as sharp as the pixel's own
+// answer would be. Where it passes it - another triangle of the same face, or past the edge of what the lender met -
+// the answer stays as it came: the triangle alone cannot tell the two apart. RT_LOW_EDGE_SLACK: how far past the
+// triangle's edges, in its own weights, still meets it. The level's triangles and the bodies'; the sky's walls and
+// nothing stay as they came. The measuring view 13 takes a ray that passes the triangle for one that met nothing.
+#define RT_LOW_EDGE_SLACK 0.02f
+void RtOwnHit(inout FRtHit Q, float3 Origin, float3 Way, float From, float To)
+{
+    const uint Instance = Q.CommittedInstanceID();
+    if (Q.CommittedStatus() != COMMITTED_TRIANGLE_HIT || Instance > 1u)
+        return;
+    const uint Prim = Q.CommittedPrimitiveIndex();
+    float3 A, B, C;
+    [branch] if (Instance == 0u)
+    {
+        const uint At = Prim * 36u;
+        A = asfloat(RtLevelCorners.Load3(At));
+        B = asfloat(RtLevelCorners.Load3(At + 12u));
+        C = asfloat(RtLevelCorners.Load3(At + 24u));
+    }
+    else
+    {
+        const uint Info = RtGeoFirst(Q.CommittedGeometryIndex());
+        const uint At   = ((Info & 0x7FFFFFFFu) + Prim * 3u) * 12u;
+        [branch] if ((Info >> 31) != 0u)
+        {
+            A = asfloat(RtArenaCorners.Load3(At));
+            B = asfloat(RtArenaCorners.Load3(At + 12u));
+            C = asfloat(RtArenaCorners.Load3(At + 24u));
+        }
+        else
+        {
+            A = asfloat(RtFrameCorners.Load3(At));
+            B = asfloat(RtFrameCorners.Load3(At + 12u));
+            C = asfloat(RtFrameCorners.Load3(At + 24u));
+        }
+    }
+    // The ray against the triangle's plane: the distance, and the second and the third corner's weights.
+    const float3 E1  = B - A;
+    const float3 E2  = C - A;
+    const float3 P   = cross(Way, E2);
+    const float  Det = dot(E1, P);
+    bool  bMeets = false;
+    float T = 0.0f, U = 0.0f, V = 0.0f;
+    if (abs(Det) > 1e-12f)
+    {
+        const float  Inv = 1.0f / Det;
+        const float3 S   = Origin - A;
+        const float3 R   = cross(S, E1);
+        U = dot(S, P) * Inv;
+        V = dot(Way, R) * Inv;
+        T = dot(E2, R) * Inv;
+        bMeets = U >= -RT_LOW_EDGE_SLACK && V >= -RT_LOW_EDGE_SLACK && U + V <= 1.0f + RT_LOW_EDGE_SLACK &&
+                 T >= From && T <= To;
+    }
+    if (GRtOwnHit == 0u)
+        GRtOwnHit = bMeets ? 1u : 2u;
+    if (bMeets)
+    {
+        Q.Rec.x = asuint(T);
+        Q.Rec.w = ((uint)(saturate(U) * 65535.0f + 0.5f) << 16) | (uint)(saturate(V) * 65535.0f + 0.5f);
+    }
+    else if (RtLevel.z == 13u)
+        Q.Rec = uint4(0xFFFFFFFFu, 0u, 0u, 0u);
+}
 #endif
 
 // One ray of the pixel's: written down (RDX_RT_ASK) - what comes back is "met nothing", and the build draws no
@@ -1155,11 +2132,14 @@ FRtHit RtAsk(uint Kind, float3 Origin, float3 Way, float From, float To, uint Ma
             GRtTaken++;
             return Q;
         }
-        Q.Rec = RtAnswers.Load4(At);
+        const uint Answer = (GRtAnswer + GRtTaken) * RDX_RAY_SLOT_BYTES;
+        Q.Rec = RtAnswers.Load4(Answer);
+        if (GRtBorrowed && RtEye.w > 1.5f)
+            RtOwnHit(Q, Origin, Way, From, To);
         // What the host traced on to is there only where the request asked for it.
         if ((All & (RDX_RAY_FLAG_LAMPS | RDX_RAY_FLAG_THIN | RDX_RAY_FLAG_EYE)) != 0u)
         {
-            const uint4 More = RtAnswers.Load4(At + 16u);
+            const uint4 More = RtAnswers.Load4(Answer + 16u);
             GRtLit         = asfloat(More.xyz);
             GRtLitBy       = RayMoreLit(More.w);
             GRtPassedCount = RayMorePassed(More.w);
@@ -1174,17 +2154,13 @@ FRtHit RtAsk(uint Kind, float3 Origin, float3 Way, float From, float To, uint Ma
 }
 
 #if RDX_RT_ASK
-// How alike a pixel's first ray must be to the first ray of the pixel that asks for it (RtAskLed): the cosine between
-// their ways at least, and their starts no further apart than this share of their distance from the eye and a unit.
-#define RT_HALF_ALIKE_COS 0.99f
-#define RT_HALF_ALIKE_FAR 0.03f
-
-// Reflections=RTHalf (RtEye.w): the pixels run in fours, two by two, and the first of the four that writes requests
+// Reflections=RTHalf (RtEye.w 1): the pixels run in fours, two by two, and the first of the four that writes requests
 // down - first in the four's order among those the wave counts as running: a helper lane, run for the derivatives
 // alone, writes nothing, and is not - asks for the others whose requests are the same sort - the same ways of tracing,
 // in the same order - and whose first ray starts at about the same place and goes about the same way. Those ask
 // nothing: the build that reads the answers takes that one's for them (RtFind), with their own starts and ways and
-// its distances. All four run this, before any of them leaves. Whether this pixel is one of the others.
+// its distances - alike as RayListSlots.hlsli's RAY_ALIKE_* say. All four run this, before any of them leaves. Whether
+// this pixel is one of the others.
 bool RtAskLed(bool bWrites)
 {
     uint Sig = GRtAskCount;
@@ -1215,9 +2191,55 @@ bool RtAskLed(bool bWrites)
     }
     if (!bWrites || Lead == 4u || LeadIn == WaveGetLaneIndex() || LeadSig != Sig)
         return false;
-    const float  Reach = RT_HALF_ALIKE_FAR * length(At - RtEye.xyz) + 1.0f;
+    const float  Reach = RAY_ALIKE_FAR * length(At - RtEye.xyz) + 1.0f;
     const float3 Gap   = At - LeadAt;
-    return dot(Gap, Gap) < Reach * Reach && dot(RayUnpackWay(Way), RayUnpackWay(LeadWay)) > RT_HALF_ALIKE_COS;
+    return dot(Gap, Gap) < Reach * Reach && dot(RayUnpackWay(Way), RayUnpackWay(LeadWay)) > RAY_ALIKE_COS;
+}
+
+// Reflections=RTLow (RtEye.w 2): the pixel's requests into the own list, as RtAskFlush writes them into the host's -
+// for the pass that thins them (RaySparse.hlsl). The slots of a wave's writing lanes are taken together, with one
+// atomic, by the first of them - a helper lane, run for the derivatives alone, writes nothing, nor takes. And the
+// block's sort (RaySortStep), which the pass compares blocks by, where the pass reads the first request anyway - in
+// its fourth uint, how far its ray may go; that goes beside the second request, where the host reads nothing, and
+// the pass puts it back where it copies the block for the host. A block of one request has its sort in its word.
+void RtAskFlushLow(float4 Pos, bool bWrites)
+{
+    const uint  Count  = bWrites ? GRtAskCount : 0u;
+    const uint  Before = WavePrefixSum(Count);
+    const uint  All    = WaveActiveSum(Count);
+    const uint4 Live   = WaveActiveBallot(Count != 0u);
+    if (All == 0u)
+        return;
+    const uint Lead = (Live.x != 0u) ? firstbitlow(Live.x)
+                    : (Live.y != 0u) ? 32u + firstbitlow(Live.y)
+                    : (Live.z != 0u) ? 64u + firstbitlow(Live.z) : 96u + firstbitlow(Live.w);
+    uint Base = 0u;
+    if (WaveGetLaneIndex() == Lead)
+        RtAskedLow.InterlockedAdd(0u, All, Base);
+    Base = WaveReadLaneAt(Base, Lead);
+    if (!bWrites)
+        return;
+    const uint First = Base + Before;
+    if (First + GRtAskCount > RtAskedLow.Load(4u))
+        return;
+    uint Prev;
+    InterlockedExchange(RtHeads[uint2(Pos.xy)], First, Prev);
+    GRtAskB[0].y  = asuint(Pos.z);
+    GRtAskB[0].z  = Prev;
+    GRtAskB[0].w |= GRtAskCount << RDX_RAY_COUNT_SHIFT;
+    uint Sig = GRtAskCount;
+    [loop] for (uint s = 0u; s < GRtAskCount; s++)
+        Sig = RaySortStep(Sig, GRtAskB[s].w);
+    if (GRtAskCount > 1u)
+    {
+        GRtAskB[1].y = GRtAskA[0].w;
+        GRtAskA[0].w = Sig;
+    }
+    [loop] for (uint i = 0u; i < GRtAskCount; i++)
+    {
+        RtAskedLow.Store4((First + i) * RDX_RAY_SLOT_BYTES, GRtAskA[i]);
+        RtAskedLow.Store4((First + i) * RDX_RAY_SLOT_BYTES + 16u, GRtAskB[i]);
+    }
 }
 
 // The pixel's requests into the list, at the end of its shader - Cover: the pixel's coverage, none for a helper lane.
@@ -1227,6 +2249,14 @@ bool RtAskLed(bool bWrites)
 void RtAskFlush(float4 Pos, uint Cover)
 {
     const bool bWrites = !GRtAskDead && GRtAskCount != 0u && Cover != 0u;
+    // Reflections=RTLow: of each two by two the first pixel that writes asks for the alike others, as at RTHalf, and
+    // what the fours ask goes into the own list, which the pass thins further, three by three (RaySparse.hlsl).
+    if (RtEye.w > 1.5f)
+    {
+        const bool bLed = RtAskLed(bWrites);
+        RtAskFlushLow(Pos, bWrites && !bLed);
+        return;
+    }
     if (RtEye.w > 0.5f && RtAskLed(bWrites))
         return;
     if (!bWrites)
@@ -1255,9 +2285,11 @@ void RtFind(float4 Pos)
 {
     GRtBlock      = 0u;
     GRtBlockCount = 0u;
+    GRtAnswer     = 0u;
     GRtTaken      = 0u;
     GRtEyeSeen    = false;
     GRtBorrowed   = false;
+    GRtOwnHit     = 0u;
     const uint2 Head = RtAsked.Load2(0u);
     const uint2 Past = RtPassed.Load2(0u);
     if (Head.x <= Head.y && Past.x <= Past.y)
@@ -1271,27 +2303,55 @@ void RtFind(float4 Pos)
             {
                 GRtBlock      = At;
                 GRtBlockCount = RayWordCount(B.w);
+                GRtAnswer     = At;
+                // Reflections=RTLow (RtEye.w 2): the blocks are in the own list. A kept block's requests went into the
+                // host's list where the block says (RaySparseAnswerAt) - none where it had no room (0); a block the
+                // host passed over, its kind none, names in its first uint the kept block of its three by three it
+                // borrows (RaySparse.hlsl).
+                if (RtEye.w > 1.5f)
+                {
+                    uint Kept = At;
+                    if (RayWordKind(B.w) == RDX_RAY_KIND_NONE)
+                    {
+                        Kept        = RtAsked.Load(At * RDX_RAY_SLOT_BYTES);
+                        GRtBorrowed = true;
+                    }
+                    GRtBlockCount = 0u;
+                    if (Kept != 0u && Kept < Head.x)
+                    {
+                        const uint Word   = RtAsked.Load(Kept * RDX_RAY_SLOT_BYTES + 28u);
+                        const uint Answer = RtAsked.Load(RaySparseAnswerAt(Kept, RayWordCount(Word)));
+                        GRtBlock  = Kept;
+                        GRtAnswer = Answer;
+                        if (Answer != 0u && RayWordKind(Word) != RDX_RAY_KIND_NONE)
+                            GRtBlockCount = RayWordCount(Word);
+                    }
+                }
                 break;
             }
             At = B.z;
         }
     }
-    // Reflections=RTHalf (RtEye.w): a pixel that asked nothing of its own takes the block of the first of its two by
-    // two that has one - the one that asked for it (RtAskLed). All four run this, before any of them is thrown away.
+    // Reflections=RTHalf (RtEye.w 1) and RTLow (2): a pixel that asked nothing of its own takes the block of the first
+    // of its two by two that has one - the one that asked for it (RtAskLed) - as that one found it: at RTLow perhaps
+    // borrowed in turn. All four run this, before any of them is thrown away.
     if (RtEye.w > 0.5f)
     {
-        const uint  OwnBlock = GRtBlock;
-        const uint  OwnCount = GRtBlockCount;
-        const uint4 Live     = WaveActiveBallot(OwnCount != 0u);
+        const uint  OwnBlock  = GRtBlock;
+        const uint  OwnCount  = GRtBlockCount;
+        const uint  OwnAnswer = GRtAnswer;
+        const uint4 Live      = WaveActiveBallot(OwnCount != 0u);
         [unroll] for (uint k = 0u; k < 4u; k++)
         {
-            const uint Lane   = QuadReadLaneAt(WaveGetLaneIndex(), k);
-            const uint KBlock = QuadReadLaneAt(OwnBlock, k);
-            const uint KCount = QuadReadLaneAt(OwnCount, k);
+            const uint Lane    = QuadReadLaneAt(WaveGetLaneIndex(), k);
+            const uint KBlock  = QuadReadLaneAt(OwnBlock, k);
+            const uint KCount  = QuadReadLaneAt(OwnCount, k);
+            const uint KAnswer = QuadReadLaneAt(OwnAnswer, k);
             if (GRtBlockCount == 0u && ((Live[Lane >> 5u] >> (Lane & 31u)) & 1u) != 0u)
             {
                 GRtBlock      = KBlock;
                 GRtBlockCount = KCount;
+                GRtAnswer     = KAnswer;
                 GRtBorrowed   = true;
             }
         }
@@ -1446,6 +2506,11 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
     FRtHit Q = RtAsk(RDX_RAY_KIND_FIRST, RtEye.xyz + (Sp - Eye), Ray, 2.0f, 65536.0f, 0x07u, MirrorFlags);
     // How far off the ray met it - or that it met nothing: what it passes on its way is asked up to there.
     Reach = (Q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ? Q.CommittedRayT() : 65536.0f;
+    // RtLevel.z 12: how the pixel's borrowed answer went at RTLow (RtOwnHit) - green its own ray meets the borrowed
+    // triangle, red it passes it, grey nothing borrowed.
+    if (RtLevel.z == 12u)
+        return (GRtOwnHit == 1u) ? float4(0.0f, 0.8f, 0.0f, 1.0f)
+             : ((GRtOwnHit == 2u) ? float4(0.9f, 0.0f, 0.0f, 1.0f) : float4(0.2f, 0.2f, 0.2f, 1.0f));
     // The measuring view (RtLevel.z 1): blue the sky taken from the picture, light blue from the far probe, black none; the
     // level green where the picture shows the spot, yellow where its own colour stands in; an actor cyan and magenta the
     // same way. RtLevel.z 3: how far
@@ -1864,11 +2929,13 @@ void WaterSlopeSpread(float2 DUx, float2 DUy, out float2 SpreadU, out float2 Spr
 // flicker. WaterRainOn: how thick the rain falls into the water, 0 none to 1 (a quarter of it rides on the run's
 // second spare number, whose whole part is another flag). Returned as a slope of the surface, as the ripples' is.
 #define WaterRainOn        (frac(WaterSpare.y) * 4.0f)
-#define RAIN_RING_REACH    12.0f      // how far a ring runs, in the level's units
+// ---- RAIN-SHARED-BEGIN: SolidPass.hlsl and WetReflect.hlsl hold this alike (scripts/check_shaders.py checks it), so
+// the water and the wet floors' puddles ring alike under the same rain.
+#define RAIN_RING_REACH    6.0f       // how far a ring runs, in the level's units
 #define RAIN_RING_WIDTH    2.5f       // its crest's width
 #define RAIN_RING_SECONDS  0.7f       // how long it lasts
 #define RAIN_RING_STEEP    0.4f       // the crest's slope, before the bell's own 0.86
-#define RAIN_RING_FAR      640.0f
+#define RAIN_RING_FAR      2560.0f
 // Two numbers in 0..1 out of a cell's whole-number place and a count: a scramble of integers, the same on every card.
 float2 RainDice(int2 Cell, int Count)
 {
@@ -1880,9 +2947,11 @@ float2 RainDice(int2 Cell, int Count)
     H ^= H >> 16;
     return float2(H & 0xFFFFu, H >> 16) / 65535.0f;
 }
-// One net's ring at a point: Cell the cells' size, Beat the seconds between two drops in a cell, Salt the net's own
-// number. The drop lands in the cell's middle part, so its ring stays inside the cell.
-float2 RainRing(float2 World, float Time, float Cell, float Beat, int Salt)
+// One net's ring at a point: Foot how much of the level a pixel covers there along the view, Cell the cells' size, Beat
+// the seconds between two drops in a cell, Salt the net's own number. The drop lands in the cell's middle part, so its
+// ring stays inside the cell. A crest finer than a pixel's share of the level is drawn as wide as that and as much
+// lower: the slope it gives the pixel is the same on the whole, where a finer crest would come and go between pixels.
+float2 RainRing(float2 World, float Time, float Foot, float Cell, float Beat, int Salt)
 {
     const float2 P    = World / Cell;
     const int2   Id   = (int2)floor(P);
@@ -1891,12 +2960,69 @@ float2 RainRing(float2 World, float Time, float Cell, float Beat, int Salt)
     const float2 Mid  = (float2)Id + 0.3f + 0.4f * RainDice(Id, Salt + 1 + (int)floor(T));
     const float2 D    = (P - Mid) * Cell;
     const float  R    = length(D);
-    const float  X    = (R - Age * RAIN_RING_REACH) / RAIN_RING_WIDTH;
+    const float  Wide = max(RAIN_RING_WIDTH, Foot);
+    const float  X    = (R - Age * RAIN_RING_REACH) / Wide;
     // At its full height while it runs out, and gone over the last part of the way: a ring that faded from the start
     // would be seen only as the dot it begins as.
     const float  Live = saturate((1.0f - Age) * 2.5f);
-    return D / max(R, 0.01f) * (-2.0f * X * exp(-X * X) * Live * RAIN_RING_STEEP);
+    return D / max(R, 0.01f) * (-2.0f * X * exp(-X * X) * Live * RAIN_RING_STEEP * (RAIN_RING_WIDTH / Wide));
 }
+// The rings at a point of the level, as a slope of the surface: Foot how much of the level a pixel covers there along
+// the view, Flat the square of its distance from the camera along the level, On how thick the rain falls, 0 to 1. They
+// go where a whole ring comes to no more than about a pixel.
+float2 RainRingsAt(float2 World, float Time, float Foot, float Flat, float On)
+{
+    const float Keep = saturate(1.5f - Foot / RAIN_RING_REACH) *
+                       saturate((RAIN_RING_FAR * RAIN_RING_FAR - Flat) / (0.4f * RAIN_RING_FAR * RAIN_RING_FAR));
+    if (Keep <= 0.0f)
+        return 0.0f;
+    return (RainRing(World, Time, Foot, 62.0f, 1.5f, 0) + RainRing(World, Time, Foot, 80.0f, 0.9f, 4096)) *
+           (Keep * On);
+}
+// How much of a wet floor's standing water is left near an edge the floor ends at and drops from, as water runs off
+// such an edge: none within WET_EDGE_NONE of it, all of it from WET_EDGE_ALL in, a smoothstep between - and a wall the
+// floor runs into keeps it to the wall's foot, where water gathers. Found in the picture: round the pixel's place, along
+// the floor in eight ways and at three reaches, each point put on the screen and the depth there read. Where the floor
+// goes on, what is seen there is the point itself; where it has ended, what is seen lies further off - the ground below;
+// a wall rises nearer, as does a thing lying on the floor. View space: P the pixel's place, Up the level's up (of
+// length one); a point Q is seen at the pixel (Centre + Q.xy * Focal / Q.z) * Scale + Offset of the depth's copy, whose
+// depth is one over the distance along the view.
+#define WET_EDGE_NONE 1.05f
+#define WET_EDGE_ALL  2.6f
+float WetEdgeKeep(float3 P, float3 Up, float2 Centre, float Focal, float2 Scale, float2 Offset)
+{
+    float2 Size;
+    DepthCopy.GetDimensions(Size.x, Size.y);
+    float3 A = float3(1.0f, 0.0f, 0.0f) - Up * Up.x;
+    if (dot(A, A) < 0.01f)
+        A = float3(0.0f, 1.0f, 0.0f) - Up * Up.y;
+    A = normalize(A);
+    const float3 B       = cross(Up, A);
+    const float  Reach[3] = { WET_EDGE_NONE, 0.5f * (WET_EDGE_NONE + WET_EDGE_ALL), WET_EDGE_ALL };
+    float        Edge    = WET_EDGE_ALL + 1.0f;
+    [unroll] for (int k = 0; k < 8; k++)
+    {
+        const float  T   = 0.78539816f * (float)k;
+        const float3 Way = A * cos(T) + B * sin(T);
+        [unroll] for (int r = 0; r < 3; r++)
+        {
+            const float3 Q = P + Way * Reach[r];
+            if (Q.z <= 1.0f)
+                break;
+            const float2 At = (Centre + Q.xy * (Focal / Q.z)) * Scale + Offset;
+            if (any(At < 0.0f) || any(At >= Size))
+                break;
+            const float Seen = 1.0f / max(DepthCopy.Load(int3(At, 0)).r, 1e-6f);
+            if (Seen > Q.z + max(2.0f, 0.01f * Q.z))
+            {
+                Edge = min(Edge, (r == 0) ? 0.0f : 0.5f * (Reach[r - 1] + Reach[r]));
+                break;
+            }
+        }
+    }
+    return smoothstep(WET_EDGE_NONE, WET_EDGE_ALL, Edge);
+}
+// ---- RAIN-SHARED-END
 float2 WaterRainRings(float2 World, float Time)
 {
     // How much of the water a pixel covers there, along the view: the farther and the flatter it is seen, the more.
@@ -1904,11 +3030,7 @@ float2 WaterRainRings(float2 World, float Time)
     const float  Flat = dot(Off, Off);
     const float  High = max(abs(WaterExtra.x), 8.0f);
     const float  Foot = (Flat + High * High) / (max(WaterView.y, 1.0f) * High);
-    const float  Keep = saturate(1.5f - Foot / RAIN_RING_WIDTH) *
-                        saturate((RAIN_RING_FAR * RAIN_RING_FAR - Flat) / (0.4f * RAIN_RING_FAR * RAIN_RING_FAR));
-    if (Keep <= 0.0f)
-        return 0.0f;
-    return (RainRing(World, Time, 62.0f, 1.5f, 0) + RainRing(World, Time, 80.0f, 0.9f, 4096)) * (Keep * WaterRainOn);
+    return RainRingsAt(World, Time, Foot, Flat, WaterRainOn);
 }
 
 // An ornamental fountain's pool (WaterWave.x at RdxMath::FountainPoolSheet: a fountain's water comes down into
@@ -2142,16 +3264,25 @@ float2 WaterSlopeAt(float2 Uv, float2 World, float Time, float2 DUx, float2 DUy,
     return Slope;
 }
 
-// The mirror image (Reflections=High and up) at a point of a water surface - the see-through water's (WaterSurface) and
+// The water's own trace's steps by its mirror switch (WaterSpare.x, RdxMath::WaterMirrorSwitch): half of them at
+// Reflections=Medium.
+int WaterMirrorSteps()
+{
+    return (WaterSpare.x < 0.875f) ? 12 : 24;
+}
+
+// The mirror image (Reflections=Medium and up) at a point of a water surface - the see-through water's (WaterSurface) and
 // the sludge's (SludgeMirror) alike: the view mirrored by the surface's normal, so the waves and the ripples break it
-// up, and followed through the copy of the picture (WaterReflect) or traced (Reflections=RT, WaterReflectRt). A wave
+// up, and followed through the copy of the picture (WaterReflect) or traced (Reflections=RT, WaterReflectRt); bFar: the
+// far image alone instead of the trace (WaterFarImage, Reflections=Low). A wave
 // steep enough to send the mirrored view back into the water sends it along the surface instead. Eye, Sp, Into, AX, AY,
 // AZ: the frame around the camera (WaterSurface); N the surface's normal on the camera's side (Up), Slope its slope;
 // World the point's place in the level; DUx, DUy the texture coordinate's change from one pixel to the next; Lit the
 // light the surface receives; Tir 1 where, from below, the surface is a full mirror. rgb: the image, a: how much of it
 // to trust.
 float4 WaterMirror(float3 Eye, float3 Sp, float3 Into, float3 N, float2 Slope, float Up, float2 World, float2 DUx,
-                   float2 DUy, float3 AX, float3 AY, float3 AZ, float Focal, float2 Size, float3 Lit, float Tir)
+                   float2 DUy, float3 AX, float3 AY, float3 AZ, float Focal, float2 Size, float3 Lit, float Tir,
+                   bool bFar)
 {
     float4 Mirror = 0.0f;
     // Over the slopes the pixel spans (WaterSlopeSpread): four views along the slope towards and away from the camera, at
@@ -2200,7 +3331,10 @@ float4 WaterMirror(float3 Eye, float3 Sp, float3 Into, float3 N, float2 Slope, f
         if (Trace > 0.0f)
             Mirror += WaterReflectRt(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, Lit, false);
 #else
-        Mirror += WaterReflect(Eye, Sp, Ray, AX, AY, AZ, Focal, Size);
+        [branch] if (bFar)
+            Mirror += WaterFarImage(Eye, Sp, Ray, AX, AY, AZ, Focal, Size);
+        else
+            Mirror += WaterReflect(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, WaterMirrorSteps());
 #endif
     }
     Mirror /= (float)Views;
@@ -2357,12 +3491,14 @@ float3 WaterSurface(VSOut In, out float3 Added)
     }
     else if (dot(Bent, Bent) <= 0.0f)
         Tir = 1.0f;
-    // The mirror image (Reflections=High and up): from above always, as the sheen below; from under the water where the
-    // surface is a full mirror (WaterMirror).
+    // The mirror image (Reflections=Medium and up): from above always, as the sheen below; from under the water where the
+    // surface is a full mirror (WaterMirror). At Low the far image alone (WaterFarImage), from above: under the water
+    // there is no sky.
     float4 Mirror = 0.0f;
-    if (WaterSpare.x > 0.5f && (H > 0.0f || Tir > 0.0f))
+    const bool bFar = WaterSpare.x < 0.5f;
+    if (WaterSpare.x > 0.125f && (H > 0.0f || (Tir > 0.0f && !bFar)))
     {
-        Mirror = WaterMirror(Eye, Sp, Into, N, Slope, Up, World, DUx, DUy, AX, AY, AZ, Focal, Size, Lit, Tir);
+        Mirror = WaterMirror(Eye, Sp, Into, N, Slope, Up, World, DUx, DUy, AX, AY, AZ, Focal, Size, Lit, Tir, bFar);
 #if RDX_RT
         if (RtLevel.z == 1u || RtLevel.z == 3u || RtLevel.z == 6u || RtLevel.z == 11u)
         {
@@ -2389,8 +3525,9 @@ float3 WaterSurface(VSOut In, out float3 Added)
     float3 Kept = Mirror.rgb * (Mirror.a * Tir);
     // The surface's sheen: water gives back more of the light around it the flatter it is seen, and a wave or a ripple
     // tilts it - which is what makes them visible over a floor with nothing on it to bend. What comes back is the
-    // mirror image (Reflections=High and up); where there is none - the reflections off, or a ray that found nothing -
-    // the light the surface itself receives stands in for the surroundings, and at most half of it comes back.
+    // mirror image (Reflections=Medium and up; the far image at Low); where there is none - the reflections off, or a
+    // ray that found nothing - the light the surface itself receives stands in for the surroundings, and at most half of
+    // it comes back.
     if (H > 0.0f)
     {
         const float3 ToEye = ChuteOn ? normalize(Eye - Sp)
@@ -2402,7 +3539,7 @@ float3 WaterSurface(VSOut In, out float3 Added)
         Kept  = Kept * (1.0f - Back) + Mirror.rgb * (Mirror.a * Back);
         if (PoolKind > 0.5f)
             Kept += PoolLight(World, ToEye, Up);
-        if (WaterSpare.x > 0.5f)
+        if (WaterSpare.x > 0.125f)
         {
 #if RDX_RT
             if (RtLevel.z == 2u)
@@ -2657,6 +3794,9 @@ VSOut DSWater(WaterPatch C, float3 B : SV_DomainLocation, const OutputPatch<Wate
 // straight edge is the nearest all across a patch: an edge between two corners that each lie on a held edge would come
 // out held along its length.
 #define RELIEF_BEVEL 2.0f
+// The square of the length past which the direction to lift along tells of a polygon the spherifier did not move
+// (DSRelief; RenderDevice's ReliefStillScale makes it four long at the corners).
+#define RELIEF_STILL_TEST 4.0f
 struct ReliefPoint
 {
     float3 View   : VIEWPOS;
@@ -2829,14 +3969,16 @@ float ReliefCoverZOn(float3 Q, float2 Size)
     return 1.0f / max(I + Off.x * Gx + Off.y * Gy, 1e-6f);
 }
 
-// P: the point on the flat surface, D: the direction it is lifted along, Lift: how far - all in view space.
-float ReliefClear(float3 P, float3 D, float Lift)
+// P: the point on the flat surface, D: the direction it is lifted along, N: that flat surface's normal (the surface's
+// own; on the spherifier's drawn triangles the triangle's, which the flat surface drawn under the relief lies in -
+// measured off the wall's plane, the rounded surface around the point stood above it, and held the relief down as a
+// cover in a smeared band), Lift: how far - all in view space.
+float ReliefClear(float3 P, float3 D, float3 N, float Lift)
 {
     float2 Size;
     ReliefCover.GetDimensions(Size.x, Size.y);
     if (Lift <= 0.0f || Size.x < 1.0f)
         return Lift;
-    const float3 N    = ReliefNormal;
     const float  Up   = max(dot(D, N), 0.25f);
     const float  Step = Lift / RELIEF_CLEAR_STEPS;
     // What one pixel of the covers spans at a unit's distance: the engine's pixels over its projection, for each of the
@@ -2883,6 +4025,28 @@ float ReliefClear(float3 P, float3 D, float Lift)
     return Lift;
 }
 
+// Which of the polygon's outline records a point of a relief patch lies on (RenderDevice's ReliefOutlineCode: a
+// corner's colour's alpha, -2 - the record, or -1 for none; SphereChordAt): a corner of the patch carries one it lies
+// on, a point of a side of the patch lies on one where both of that side's corners carry it. -1: none - inside the
+// polygon, or on an edge with no record.
+float ReliefOutlineOf(float3 B, float C0, float C1, float C2)
+{
+    float C = -1.0f;
+    if (B.x >= 1.0f - 1e-6f)
+        C = C0;
+    else if (B.y >= 1.0f - 1e-6f)
+        C = C1;
+    else if (B.z >= 1.0f - 1e-6f)
+        C = C2;
+    else if (B.x <= 1e-6f && C1 == C2)
+        C = C1;
+    else if (B.y <= 1e-6f && C2 == C0)
+        C = C2;
+    else if (B.z <= 1e-6f && C0 == C1)
+        C = C0;
+    return (C <= -1.5f) ? -2.0f - C : -1.0f;
+}
+
 [domain("tri")]
 VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<ReliefPoint, 3> P)
 {
@@ -2891,6 +4055,8 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     Out.Uv      = B.x * P[0].Uv + B.y * P[1].Uv + B.z * P[2].Uv;
     Out.Lv      = B.x * P[0].Lv + B.y * P[1].Lv + B.z * P[2].Lv;
     Out.Colour  = B.x * P[0].Colour + B.y * P[1].Colour + B.z * P[2].Colour;
+    // The alpha carried the outline's records (ReliefOutlineOf); the passes over the patches read it as the colour's.
+    Out.Colour.a = 1.0f;
     // How much of the relief stands here: none on a held edge, all of it a band's width in (RELIEF_BEVEL) - from the
     // run's held edges where it has them, else from the patches' corners.
     const float Bevel = (ReliefBevel > 0.0f) ? ReliefBevel : RELIEF_BEVEL;
@@ -2900,6 +4066,49 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     float2 Seam  = float2(0.0f, 0.0f);
     if (ReliefHeldCount.x > 0.5f)
         ReliefHeldAt(View, Width, Keep, Shear, Seam);
+    // The spherifier's rounding (SphereMoveAt), measured where the point was - as the rim band above is, the held edges
+    // being the level's own: the point moved as the polygon it lies on is moved there, a floor's texture read where it
+    // is now (a wall's goes with it), and the way the relief is lifted along turned as the surface turned there
+    // (SphereMoveAt) - on the drawn triangles (bFloor) their surface's own normal there, which the polygons sharing a
+    // place share: the corners' direction turned by it would turn twice at a bend, where it is that normal already.
+    // A patch of a polygon the spherifier left where it was (its corners' directions RenderDevice's ReliefStillScale
+    // long) stays where the level has it, as its flat surface is drawn: the field round it is its rounded neighbours'.
+    // Unit long at the corners, the direction between them is at most one long; four long, it is two or more wherever
+    // the corners' directions part by 120 degrees or less.
+    const float3 DirSum = B.x * P[0].Dir + B.y * P[1].Dir + B.z * P[2].Dir;
+    float3 SphereFrom = float3(0.0f, 0.0f, 0.0f), SphereTo = float3(0.0f, 0.0f, 0.0f);
+    float  OnChord    = 0.0f;
+    bool   bFloor     = false;
+    float3 FloorFlat  = float3(0.0f, 0.0f, 0.0f);
+    if (SphereRun.x > 0.5f && dot(DirSum, DirSum) < RELIEF_STILL_TEST)
+    {
+        const float3 W  = SphereLevelOf(View);
+        const float3 Nl = normalize(SphereLevelDir(ReliefNormal));
+        const float3 Ul = SphereLevelDir(ReliefAxisU);
+        const float3 Tu = normalize(Ul - Nl * dot(Ul, Nl));
+        float3       Ml, Nm, Mc;
+        const bool   bOn = SphereMoveAt(W, Tu, cross(Nl, Tu), Nl, Ml, Nm, bFloor, FloorFlat);
+        // A point of the polygon's outline goes where the pieces' side through it goes (SphereChordAt): the pieces
+        // beside it and under it end on those straight sides, and an outline on the curve itself would stand off
+        // them, with what is behind showing through between.
+        const float  Rec    = ReliefOutlineOf(B, P[0].Colour.a, P[1].Colour.a, P[2].Colour.a);
+        const bool   bChord = Rec >= 0.0f && SphereChordAt((uint)Rec, W, Mc);
+        if (bChord)
+            Ml = Mc;
+        OnChord = bChord ? 1.0f : (Rec >= 0.0f) ? -1.0f : bOn ? 0.0f : -2.0f;
+        if (bOn || bChord)
+        {
+            const float3 Moved = SphereViewDir(Ml);
+            View += Moved;
+            // The pictures read where the point was, moved as far as it moved along the surface (the pieces' rule,
+            // RenderDevice's SphereReadAt): the texture's and, by its own rate, the light map's.
+            const float2 Slide = float2(dot(Moved, ReliefAxisU) * ReliefRate.x, dot(Moved, ReliefAxisV) * ReliefRate.y);
+            Out.Uv += Slide;
+            Out.Lv += Slide * SphereRun.yz;
+            SphereFrom = Nl;
+            SphereTo   = Nm;
+        }
+    }
     // A texture laid on once reads its height inside itself: the wrap would bring the far side in at the rim. On a seam
     // carried over, where the other side reads it.
     float2 At = Out.Uv + Seam;
@@ -2909,11 +4118,12 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     const float Height = SceneCopy.SampleLevel(Samp, At, Level).r;
     // Lifted along the corners' direction: the surface's normal on a flat one, and at a bend (a round tower's faces)
     // the one both faces share there, so each lifts the edge between them alike.
-    const float3 DirSum = B.x * P[0].Dir + B.y * P[1].Dir + B.z * P[2].Dir;
-    const float3 Dir    = (dot(DirSum, DirSum) > 1e-8f) ? normalize(DirSum) : ReliefNormal;
+    float3 Dir = (dot(DirSum, DirSum) > 1e-8f) ? normalize(DirSum) : ReliefNormal;
+    if (dot(SphereTo, SphereTo) > 0.5f)
+        Dir = bFloor ? SphereViewDir(SphereTo) : SphereTurnedBy(Dir, SphereFrom, SphereTo);
     // Never through what stands above the point (ReliefClear).
     const float Wanted = PomDepth * Height * Keep;
-    const float Lift   = ReliefClear(View, Dir + Shear, Wanted);
+    const float Lift   = ReliefClear(View, Dir + Shear, bFloor ? SphereViewDir(FloorFlat) : ReliefNormal, Wanted);
     View += (Dir + Shear) * Lift;
     // The detail texture's pass over the same patches reads its own coordinate; the height above was read with the
     // surface's, so both passes lift every point alike (FSolidPass::SetTessUvMap).
@@ -2926,9 +4136,194 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     Out.Pos.w = View.z;
     // w: how far the direction lifted along turns from the surface's normal - only the measurement view reads it.
     Out.Pom   = float4(Height, Level, Keep, 1.0f - dot(Dir, ReliefNormal));
-    // The measurement view reads, in the level's place, how much of the lift the covers took (ReliefClear).
+    // The measurement view reads, in the level's place, how much of the lift the covers took (ReliefClear); and in the
+    // height's, whether the point went onto the pieces' side (SphereChordAt): 1 it did, -1 it lies on the outline and
+    // the field had no side for it, -2 it lies inside the polygon and the field had no face for it (SphereMoveAt).
     if (PomHas(POM_SHOWKEEP))
+    {
         Out.Pom.y = (Wanted > 1e-4f) ? 1.0f - Lift / Wanted : 0.0f;
+        Out.Pom.x = OnChord;
+    }
+    Out.View  = View;
+    return Out;
+}
+
+// The models rounded (Spherifier; FSolidPass::SetMeshRun, RenderDevice's RoundPolygon, MeshRound.h): a mesh triangle as
+// a patch - its corners in view space, each with the number of the edge from it to the next corner among the frame's
+// edges (FSolidPass::MeshEdgeRoom: an edge's terms from its end A to its end B, the same the triangle on the edge's other
+// side reads) - cut where the curve is big enough on the screen to be seen, and each new point moved off the flat
+// triangle by the edges' curves, each weighed by its two corners' shares, and a little of all of them for the middle
+// (MeshRound.h's PatchMoveAt): the corners stay where they are, each edge leaves its corner along the surface there and
+// bends back to the straight within its room. The run's numbers ride in the water's places, the frame's edges in the
+// spherifier field's.
+#define MeshSag    WaterView.x      // how far a cut piece of an edge may stand off its curve, in the engine's pixels
+#define MeshFocal  WaterView.y      // the engine's projection of the triangle, in its own pixels
+#define MeshMost   WaterView.z      // the most a point may move, level units (the spherifier's number)
+#define MeshShape  WaterView.w      // how much of the curve: 0 flat .. 1 the whole of it
+#define MeshCentre WaterScreen.xy   // the screen's centre, in the engine's pixels
+#define MeshEdges  SphereField      // the frame's edges, 64 bytes each: at end A two bends and their rooms, then at B
+struct MeshPoint
+{
+    float3 View   : VIEWPOS;
+    float2 Uv     : TEXCOORD0;
+    float4 Colour : COLOR;
+    float  Ref    : MESHEDGE;     // the edge from this corner to the next: its number times two, and one where this face
+                                  // goes along it from B to A
+    float  Size   : MESHSIZE;     // how far its bends reach together (each by its room), units
+    float  Room   : MESHROOM;     // the least of its rooms
+    float  Poly   : MESHPOLY;     // the face's flat polygon of several faces: its outline's number among the frame's
+                                  // edges, plus one (MeshPolyPlaneMove); 0 none
+};
+struct MeshPatch
+{
+    float Edge[3] : SV_TessFactor;
+    float Inner   : SV_InsideTessFactor;
+};
+
+MeshPoint VSMesh(VSIn In)
+{
+    MeshPoint Out;
+    Out.View   = In.Pos;          // a mesh patch's corner is in view space already
+    Out.Uv     = In.Uv;
+    Out.Colour = In.Colour;
+    Out.Ref    = In.Pom.x;
+    Out.Size   = In.Pom.y;
+    Out.Room   = In.Pom.z;
+    Out.Poly   = In.Pom.w;
+    return Out;
+}
+
+// The shape of a bend at one end of an edge: s (1 - s)^2 for s in [0, 1], none past it (MeshRound.h's BendOf).
+float MeshBend(float S)
+{
+    return (S < 1.0f) ? S * (1.0f - S) * (1.0f - S) : 0.0f;
+}
+
+// An edge's four bends and rooms (MeshRound.h's FEdgeTerms), the way this face goes along it: the start's two, then
+// the end's two.
+void MeshEdgeOf(float Ref, out float4 S0, out float4 S1, out float4 E0, out float4 E1)
+{
+    const uint R  = (uint)(Ref + 0.5f);
+    const uint At = (R >> 1) * 64u;
+    const float4 A0 = asfloat(MeshEdges.Load4(At)), A1 = asfloat(MeshEdges.Load4(At + 16u));
+    const float4 B0 = asfloat(MeshEdges.Load4(At + 32u)), B1 = asfloat(MeshEdges.Load4(At + 48u));
+    const bool   bBack = (R & 1u) != 0u;
+    S0 = bBack ? B0 : A0;
+    S1 = bBack ? B1 : A1;
+    E0 = bBack ? A0 : B0;
+    E1 = bBack ? A1 : B1;
+}
+
+// The edge's curve at U from its start (MeshRound.h's EdgeCurveAt), and the sum of its bends at their rooms (for the
+// patch's middle).
+float3 MeshEdge(float Ref, float U, inout float3 Middle)
+{
+    float4 S0, S1, E0, E1;
+    MeshEdgeOf(Ref, S0, S1, E0, E1);
+    Middle += S0.xyz * S0.w + S1.xyz * S1.w + E0.xyz * E0.w + E1.xyz * E1.w;
+    return S0.xyz * (S0.w * MeshBend(U / S0.w)) + S1.xyz * (S1.w * MeshBend(U / S1.w)) +
+           E0.xyz * (E0.w * MeshBend((1.0f - U) / E0.w)) + E1.xyz * (E1.w * MeshBend((1.0f - U) / E1.w));
+}
+
+// The share along its plane of a point's move in a flat polygon of several faces (MeshRound.h's PolyPlaneMoveAt): each
+// outline edge's curve where the point lies across from it - past an end, the curve turned back on itself there - along
+// the plane, weighed by one over the square of how far the point lies from the edge; one smooth move over the whole
+// polygon, a painted rim's lines kept smooth. The polygon's record among the frame's edges (RenderDevice's RoundPolyRef):
+// how many outline edges and the plane's normal, then for each its end A and number (times two), and its end B.
+float3 MeshPolyPlaneMove(uint Poly, float3 Flat, out float3 Normal)
+{
+    const uint   At  = Poly * 64u;
+    const float4 Top = asfloat(MeshEdges.Load4(At));
+    const uint   Num = min((uint)(Top.x + 0.5f), 32u);
+    Normal           = Top.yzw;
+    float3 Sum = float3(0.0f, 0.0f, 0.0f);
+    float  Weight = 0.0f;
+    [loop] for (uint g = 0u; g < Num; g++)
+    {
+        const float4 A    = asfloat(MeshEdges.Load4(At + 16u + g * 32u));
+        const float4 B    = asfloat(MeshEdges.Load4(At + 32u + g * 32u));
+        const float3 Way  = B.xyz - A.xyz;
+        const float  T    = dot(Flat - A.xyz, Way) / max(dot(Way, Way), 1e-12f);
+        const float3 Off  = Flat - (A.xyz + Way * saturate(T));
+        const float  D2   = dot(Off, Off);
+        const float  Past = (T < 0.0f) ? -T : ((T > 1.0f) ? 2.0f - T : T);
+        float3       Unused = float3(0.0f, 0.0f, 0.0f);
+        float3       C = MeshEdge(A.w, saturate(Past), Unused) * ((T < 0.0f || T > 1.0f) ? -1.0f : 1.0f);
+        C -= Normal * dot(C, Normal);
+        if (D2 < 1e-8f)
+            return C;
+        Sum += C * (1.0f / D2);
+        Weight += 1.0f / D2;
+    }
+    return (Weight > 0.0f) ? Sum / Weight : float3(0.0f, 0.0f, 0.0f);
+}
+
+// How many cuts the edge from A to B gets: enough that no piece of it stands further off its curve than MeshSag pixels -
+// a curve of height H cut into N pieces stands off them by H / N^2 - and more where a bend is done within a short room,
+// which the even cuts have to reach into. None where it does not bend. Only the edge's own data go into it, so the
+// patches on both sides of an edge cut it alike.
+float MeshCuts(MeshPoint A, MeshPoint B)
+{
+    const float Z      = max(0.5f * (A.View.z + B.View.z), 1.0f);
+    const float Height = (4.0f / 27.0f) * MeshShape * A.Size * MeshFocal / Z;
+    return clamp(sqrt(Height / max(MeshSag, 1e-3f)) / sqrt(max(A.Room, 0.05f)), 1.0f, 16.0f);
+}
+
+MeshPatch MeshPatchConstants(InputPatch<MeshPoint, 3> P)
+{
+    MeshPatch C;
+    C.Edge[0] = MeshCuts(P[1], P[2]);
+    C.Edge[1] = MeshCuts(P[2], P[0]);
+    C.Edge[2] = MeshCuts(P[0], P[1]);
+    C.Inner   = max(C.Edge[0], max(C.Edge[1], C.Edge[2]));
+    return C;
+}
+
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("MeshPatchConstants")]
+MeshPoint HSMesh(InputPatch<MeshPoint, 3> P, uint I : SV_OutputControlPointID)
+{
+    return P[I];
+}
+
+[domain("tri")]
+VSOut DSMesh(MeshPatch C, float3 B : SV_DomainLocation, const OutputPatch<MeshPoint, 3> P)
+{
+    VSOut Out;
+    const float3 Flat = B.x * P[0].View + B.y * P[1].View + B.z * P[2].View;
+    // Each edge's curve by the cube of its two corners' shares together - nothing on an edge but its own - and half of
+    // every term at its room for the middle, at most MeshMost from the flat.
+    const float  S0 = B.x + B.y, S1 = B.y + B.z, S2 = B.z + B.x;
+    float3       Middle = 0.0f;
+    float3       Move   = MeshEdge(P[0].Ref, B.y / max(S0, 1e-6f), Middle) * (S0 * S0 * S0) +
+                          MeshEdge(P[1].Ref, B.z / max(S1, 1e-6f), Middle) * (S1 * S1 * S1) +
+                          MeshEdge(P[2].Ref, B.x / max(S2, 1e-6f), Middle) * (S2 * S2 * S2);
+    Move += Middle * (0.5f * B.x * B.y * B.z);
+    // A flat polygon of several faces: along its plane its one smooth move, off it the patch's.
+    if (P[0].Poly >= 1.0f)
+    {
+        float3       Normal;
+        const float3 Along = MeshPolyPlaneMove((uint)(P[0].Poly - 0.5f), Flat, Normal);
+        Move = Along + Normal * dot(Move, Normal);
+    }
+    Move *= MeshShape;
+    const float Long = length(Move);
+    if (Long > MeshMost)
+        Move *= MeshMost / Long;
+    const float3 View = Flat + Move;
+    Out.Uv     = B.x * P[0].Uv + B.y * P[1].Uv + B.z * P[2].Uv;
+    Out.Lv     = float2(0.0f, 0.0f);
+    Out.Colour = B.x * P[0].Colour + B.y * P[1].Colour + B.z * P[2].Colour;
+    Out.Pom    = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // Onto the screen as DSRelief puts a point there: no division by the depth left in it, so a point within a unit of
+    // the eye is clipped like any other.
+    Out.Pos.x = View.x * (MeshFocal * InvHalfSize.x) + (MeshCentre.x * InvHalfSize.x - 1.0f + Jitter.x) * View.z;
+    Out.Pos.y = -View.y * (MeshFocal * InvHalfSize.y) + (1.0f - MeshCentre.y * InvHalfSize.y + Jitter.y) * View.z;
+    Out.Pos.z = 1.0f;
+    Out.Pos.w = View.z;
     Out.View  = View;
     return Out;
 }
@@ -3090,7 +4485,7 @@ float3 SludgeSurface(VSOut In)
             const float3 N    = normalize(float3(-Slope, 1.0f));
             const float  Back = 0.02f + 0.98f * pow(1.0f - saturate(dot(N, ToEye)), 5.0f);
             Seen = Seen * (1.0f - Back) + Lit * 0.5f * Back;
-            if (WaterSpare.x > 0.5f)
+            if (WaterSpare.x > 0.125f)
                 Seen += WaterGlints(Eye, Sp, N, H);
         }
     }
@@ -3144,7 +4539,7 @@ float4 SludgeMirror(VSOut In)
         float2 Size;
         SceneCopy.GetDimensions(Size.x, Size.y);
         Mirror = WaterMirror(Eye, Sp, normalize(Sp - Eye), N, Slope, 1.0f, World, DUx, DUy, AX, AY, AZ, WaterView.y,
-                             Size, Lit, 0.0f);
+                             Size, Lit, 0.0f, false);
     }
     float3 Given = lerp(Lit * 0.5f, Mirror.rgb, Mirror.a) * Back;
 #if RDX_RT
@@ -3230,11 +4625,174 @@ PSLitOut PSSludgeMirrorLit(VSOut In)
 }
 #endif
 
-// The levels' glass (Reflections=RT, BLEND_GlassMirror): what a pane gives back, as a layer of its own laid
-// over the pane - which is drawn before it as the level draws it, and stays so. The view is mirrored by the pane's
-// own plane and traced (WaterReflectRt). A pane has the layer on rays alone: followed through the copy of the
-// picture (WaterReflect) the image of what stands before a pane seen face on is not to be had - that way is left
-// to a mirror of the level's own whose rays fail for a frame.
+#if !RDX_RT
+// The probe gathered from the picture (MirrorProbe.hlsl, FMirrorProbe; docs/tukrozodes-szonda-terv.md): its pyramid,
+// the finest level first, which the glass's layer reads where no rays run (Reflections=High) - a view of the water's
+// table, after the caustics' net.
+ByteAddressBuffer ProbeLevels : register(t21);
+#define ProbeLevelLoad(Byte) ProbeLevels.Load4(Byte)
+// ---- PROBE-SHARED-BEGIN: MirrorProbe.hlsl and SolidPass.hlsl hold this block alike, character for character
+// (scripts/check_shaders.py), each with ProbeLevelLoad defined before it.
+// The probe's numbers (RenderLimits.h's RDX_PROBE_*_VALUE): texels a face of the finest level, the pyramid's levels,
+// and the mirror rays' march - its even steps and the halvings after the step that crossed.
+#define RDX_PROBE_SIDE     128u
+#define RDX_PROBE_LEVELS   8u
+#define RDX_PROBE_STEPS    8
+#define RDX_PROBE_HALVINGS 8
+// A direction's face of the cube and place on it, -1..1 each way, as Direct3D lays a cube's faces (RdxMath::ProbeFaceOf).
+uint ProbeFaceOf(float3 D, out float2 Uv)
+{
+    const float3 A = abs(D);
+    if (A.x >= A.y && A.x >= A.z)
+    {
+        Uv = float2((D.x > 0.0f) ? -D.z : D.z, -D.y) / A.x;
+        return (D.x > 0.0f) ? 0u : 1u;
+    }
+    if (A.y >= A.z)
+    {
+        Uv = float2(D.x, (D.y > 0.0f) ? D.z : -D.z) / A.y;
+        return (D.y > 0.0f) ? 2u : 3u;
+    }
+    Uv = float2((D.z > 0.0f) ? D.x : -D.x, -D.y) / A.z;
+    return (D.z > 0.0f) ? 4u : 5u;
+}
+// A level's texels a face, and where it starts among the pyramid's entries.
+uint ProbeLevelSide(uint Level)
+{
+    return RDX_PROBE_SIDE >> Level;
+}
+uint ProbeLevelStart(uint Level)
+{
+    // Six faces of the levels before it: 6 S^2 (1 + 1/4 + ... ) up to the level, which sums to this.
+    const uint S = RDX_PROBE_SIDE, L = RDX_PROBE_SIDE >> Level;
+    return 8u * (S * S - L * L);
+}
+// The entry of a level that holds a direction (not of length nought).
+uint ProbeEntryOf(uint Level, float3 D)
+{
+    float2     Uv;
+    const uint Face = ProbeFaceOf(D, Uv);
+    const uint S    = ProbeLevelSide(Level);
+    const uint2 T   = min(uint2((Uv * 0.5f + 0.5f) * float(S)), uint2(S - 1u, S - 1u));
+    return ProbeLevelStart(Level) + (Face * S + T.y) * S + T.x;
+}
+struct FProbeEntry
+{
+    float3 Colour;
+    float  Trust;       // 0: nothing known
+    float  Dist;        // the nearest point the entry holds, from the probe's centre
+};
+FProbeEntry ProbeRead(uint Entry)
+{
+    const uint4 V = ProbeLevelLoad(Entry * 16u);
+    FProbeEntry E;
+    E.Colour = float3(f16tof32(V.x), f16tof32(V.x >> 16), f16tof32(V.y));
+    E.Trust  = f16tof32(V.y >> 16);
+    E.Dist   = asfloat(V.z);
+    return E;
+}
+// Whether a place along a mirror ray, from the probe's centre, lies as far as the point the finest level holds in its
+// direction or further: the ray has passed that point's surface there. An entry that knows nothing stops no ray.
+bool ProbePassed(float3 Q)
+{
+    const float L = length(Q);
+    if (!(L > 0.0f))
+        return false;
+    const FProbeEntry E = ProbeRead(ProbeEntryOf(0u, Q));
+    return E.Trust > 0.0f && L >= E.Dist;
+}
+// RdxMath::ProbeMarch on the finest level: a ray from At (from the probe's centre) along Way (of length one), in even
+// steps out to Reach, the step that crossed then halved. T: how far along the ray; false where it crossed nothing.
+bool ProbeMarch(float3 At, float3 Way, float Reach, out float T)
+{
+    T = 0.0f;
+    float Prev = 0.0f;
+    [loop] for (int i = 1; i <= RDX_PROBE_STEPS; i++)
+    {
+        const float S = Reach * float(i) / float(RDX_PROBE_STEPS);
+        if (ProbePassed(At + Way * S))
+        {
+            float Lo = Prev, Hi = S;
+            [loop] for (int h = 0; h < RDX_PROBE_HALVINGS; h++)
+            {
+                const float M = 0.5f * (Lo + Hi);
+                if (ProbePassed(At + Way * M))
+                    Hi = M;
+                else
+                    Lo = M;
+            }
+            T = Hi;
+            return true;
+        }
+        Prev = S;
+    }
+    return false;
+}
+// ---- PROBE-SHARED-END
+// A pane's probe, in the water's constants of its run (GlassRunConstants): the probe's centre from the camera along the
+// world's axes, and how far round it the probe holds the level - 0 where the pane has no probe. And 1 for the probe's
+// measuring view (ProbeRunConstants).
+#define GlassProbe     WaterWave
+#define GlassProbeView WaterExtra.x
+// 1 where the own body's picture is this pane's (ProbeRunConstants): the pane lies in the plane the body was mirrored by.
+#define GlassBody      WaterScreen.z
+// 1 for the probe alone, without the picture's trace over it (Reflections=Medium; ProbeRunConstants); 2 for the far
+// image alone, with no probe (Reflections=Low, WaterFarImage).
+#define GlassProbeAlone WaterScreen.w
+// The own body as the pane gives it back (FMirrorBody): its colour, and in alpha the view depth there - on a flat
+// mirror the eye's path to the pane and on to the body; 0 where no body is.
+Texture2D<float4> MirrorBodyImage : register(t22);
+// The colour where a ray stopped (Q, from the probe's centre): the finest level's four texels nearest its direction on
+// the face it falls on, each by how near it stands and how much it is trusted - the probe's texels are larger than the
+// picture's pixels, and read one by one they show as squares. a: their trust, by the same weights.
+float4 ProbeColourAt(float3 Q)
+{
+    float2       Uv;
+    const uint   Face = ProbeFaceOf(Q, Uv);
+    const float2 At   = (Uv * 0.5f + 0.5f) * float(RDX_PROBE_SIDE) - 0.5f;
+    const int2   Lo   = int2(floor(At));
+    const float2 Fr   = At - float2(Lo);
+    const int    Last = int(RDX_PROBE_SIDE) - 1;
+    float3 Colour = float3(0.0f, 0.0f, 0.0f);
+    float  Weight = 0.0f;
+    [unroll] for (int k = 0; k < 4; k++)
+    {
+        const int2  T = clamp(Lo + int2(k & 1, k >> 1), int2(0, 0), int2(Last, Last));
+        const float W = ((k & 1) ? Fr.x : 1.0f - Fr.x) * ((k >> 1) ? Fr.y : 1.0f - Fr.y);
+        const FProbeEntry E = ProbeRead((Face * RDX_PROBE_SIDE + uint(T.y)) * RDX_PROBE_SIDE + uint(T.x));
+        Colour += E.Colour * (W * E.Trust);
+        Weight += W * E.Trust;
+    }
+    return (Weight > 0.0f) ? float4(Colour / Weight, Weight) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+// What a mirror ray from Sp (from the camera) along Ray meets of what the pane's probe holds: rgb its colour there, a how
+// much the probe trusts it - nothing where the ray leaves the probe's reach without meeting anything it knows, or starts
+// outside it. Along: how far the ray went before it met that - the eye's path on from the pane, which on a flat
+// mirror is the same as on along the eye's own line (Into); far off where it met nothing.
+float4 ProbeReflect(float3 Sp, float3 Ray, out float Along)
+{
+    Along = 1e30f;
+    if (!(GlassProbe.w > 0.0f))
+        return 0.0f;
+    const float3 At = Sp - GlassProbe.xyz;
+    const float  B  = dot(At, Ray), C = dot(At, At) - GlassProbe.w * GlassProbe.w;
+    if (C >= 0.0f)
+        return 0.0f;
+    float T;
+    if (!ProbeMarch(At, Ray, -B + sqrt(B * B - C), T))
+        return 0.0f;
+    Along = T;
+    return ProbeColourAt(At + Ray * T);
+}
+#endif
+
+// The levels' glass (BLEND_GlassMirror): what a pane gives back, as a layer of its own laid over the pane - which is
+// drawn before it as the level draws it, and stays so. The view is mirrored by the pane's own plane and traced
+// (Reflections=RT, WaterReflectRt), or where no rays run followed through the probe gathered from the picture
+// (Reflections=Medium and High, ProbeReflect); at Low only what lies far off along it is given back, the sky or a
+// skyline (WaterFarImage). Followed through the copy of the picture alone (WaterReflect) the image of what
+// stands before a pane seen face on is not to be had - that way is left to a mirror of the level's own whose rays
+// fail for a frame.
 // How much comes back goes by the angle the pane is seen at, as glass has it: a few hundredths face on, nearly all
 // along the pane. Premultiplied by that share - rgb + dst * (1 - a) - so the pane and what shows through it dim as
 // the mirror image takes over; and only as far as an image was found: where there is none nothing is laid on, and
@@ -3289,7 +4847,60 @@ float4 GlassMirror(VSOut In)
     // brightness, which says nothing of the street it mirrors.
     const float4 Mirror = WaterReflectRt(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, float3(-1.0f, -1.0f, -1.0f), true);
 #else
-    const float4 Mirror = WaterReflect(Eye, Sp, Ray, AX, AY, AZ, Focal, Size);
+    // Where no rays run, a pane with a probe (Reflections=Medium and High) mirrors what the probe holds - what stands
+    // before it, behind the eye, is not in the picture; a pane at Low (GlassProbeAlone 2) the far image alone; a mirror
+    // of the level's own whose rays failed for a frame mirrors the picture.
+    // Branches, not a choice of two values: each side follows its ray through a buffer or the picture, and a choice may
+    // work both out.
+    float  Along = 1e30f;
+    float4 Mirror;
+    [branch] if (GlassProbe.w > 0.0f)
+    {
+        Mirror = ProbeReflect(Sp, Ray, Along);
+        // Where the ray goes on away from the eye - a pane seen aslant - the picture holds what it meets, sharper than
+        // the probe and with the people in it: followed through the picture, over the probe's image. A ray coming
+        // back towards the eye finds in the picture only the backs of what stands before the pane, its outline in
+        // bands: the probe's image alone there.
+        const float Away = smoothstep(0.05f, 0.25f, dot(Ray, AZ));
+        [branch] if (Away > 0.0f && GlassProbeAlone < 0.5f)
+        {
+            // Laid over it as one see-through layer over another: the colours weighed by their trust, the trust of
+            // the two together, and the colour of that whole again.
+            const float4 Seen = WaterReflect(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, 24);
+            const float  W    = Seen.a * Away;
+            const float  Both = W + Mirror.a * (1.0f - W);
+            const float3 Pre  = Seen.rgb * W + Mirror.rgb * (Mirror.a * (1.0f - W));
+            if (Both > 0.0f)
+                Mirror = float4(Pre / Both, Both);
+        }
+    }
+    else
+    {
+        [branch] if (GlassProbeAlone > 1.5f)
+            Mirror = WaterFarImage(Eye, Sp, Ray, AX, AY, AZ, Focal, Size);
+        else
+            Mirror = WaterReflect(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, 24);
+    }
+    // The own body (FMirrorBody), where its picture shows it nearer along the eye's line than what the probe met: the
+    // probe holds no actor, and first person never draws the body.
+    if (GlassProbe.w > 0.0f && GlassBody > 0.5f)
+    {
+        const float4 Body = MirrorBodyImage.Load(int3(In.Pos.xy, 0));
+        if (Body.a > 0.0f && Body.a < dot(Sp + Into * Along, AZ))
+            Mirror = float4(Body.rgb, 1.0f);
+    }
+    // A measurement only (the marker SecondRevision-probe-view.txt, GlassProbeView): what the probe holds, the whole of
+    // it in the pane's place - magenta where it knows nothing along the ray, green-tinted where a coarser level stood in;
+    // and over it, wherever the own body's picture has the body (FMirrorBody), the body, blue-tinted where this pane is
+    // not the one it was mirrored by.
+    if (GlassProbe.w > 0.0f && GlassProbeView > 0.5f)
+    {
+        const float4 Body = MirrorBodyImage.Load(int3(In.Pos.xy, 0));
+        if (Body.a > 0.0f)
+            return float4((GlassBody > 0.5f) ? Body.rgb : lerp(Body.rgb, float3(0.0f, 0.0f, 1.0f), 0.5f), 1.0f);
+        return (Mirror.a <= 0.0f) ? float4(1.0f, 0.0f, 1.0f, 1.0f)
+             : float4((Mirror.a < 0.999f) ? lerp(Mirror.rgb, float3(0.0f, 1.0f, 0.0f), 0.35f) : Mirror.rgb, 1.0f);
+    }
 #endif
     // The mirror covers what was drawn there: where the image holds nothing, it is dark.
     if (bWhole)
@@ -3342,6 +4953,98 @@ PSLitOut PSGlassMirrorLit(VSOut In)
     Out.Added  = Out.Colour;
     return Out;
 }
+#endif
+
+#if RDX_RT
+// The wet floors' water on rays (Reflections=RTLow and up; FSolidPass::AddWetLayer, docs/terv-nedves-feluletek.md 8.6):
+// the water standing on the wet floors as a mirror traced against the scene - what the copy of the picture cannot give,
+// off the screen or behind something. One run over the whole screen, laid over the world's solid runs: a pixel the wet
+// floors marked (WetMarkRt, the late reflection pass's mark at the pixel's even column; its depth's top bits the copy's,
+// RdxMath::WetMarkHolds)
+// with water on it mirrors the view by the level's up from its place there, as GlassMirror mirrors it by a pane's plane,
+// and lays the image over the floor by the water's Fresnel (n = 1.33: 0.02 face on) and the share of the pixel under
+// water - premultiplied, rgb + dst * (1 - a), as the glass. The damp stone's film and the lamps' streaks stay the late
+// reflection pass's (WetReflect.hlsl), which leaves the water to this layer where it runs.
+// The run's numbers ride in the water's constants as a pane's do (GlassMirror): the engine's projection, the view's axes
+// in the world, the screen's centre.
+Texture2D<uint> WetMarkRt : register(t26);
+float4 WetMirror(VSOut In)
+{
+#if RDX_RT_HOST
+    RtFind(In.Pos);
+#endif
+    const uint  Mark   = WetMarkRt.Load(int3((int)In.Pos.x * 2, (int)In.Pos.y, 0));
+    const float Depth  = DepthCopy.Load(int3(In.Pos.xy, 0)).r;
+    const uint  Have   = Mark >> 12;
+    const uint  Seen   = asuint(Depth) >> 12;
+    const float Stands = (Mark != 0u && ((Have > Seen) ? Have - Seen : Seen - Have) <= 1u)
+                         ? (float)(Mark & 63u) / 63.0f : 0.0f;
+    float2 Size;
+    SceneCopy.GetDimensions(Size.x, Size.y);
+    // The pixel's place from the camera, along the world's axes, from the depth's copy - the run itself stands at the
+    // nearest depth, over everything.
+    const float  Z     = 1.0f / max(Depth, 1e-6f);
+    const float  Focal = WaterView.y;
+    const float2 Eng   = (In.Pos.xy / Size - JitterUv()) * (2.0f / InvHalfSize);
+    const float2 View  = (Eng - WaterScreen.xy) * (Z / Focal);
+    const float3 AX    = float3(WaterCamera.zw, WaterExtra.y);
+    const float3 AY    = float3(WaterAxes.xy,   WaterExtra.z);
+    const float3 AZ    = float3(WaterAxes.zw,   WaterExtra.w);
+    // The standing water thins out before an edge the floor drops from (WetEdgeKeep): the place and the level's up along
+    // the view's axes, a point put back on the copy's pixels as Eng is taken from them.
+    const float Puddle = (Stands > 0.0f) ? Stands * WetEdgeKeep(float3(View, Z), normalize(float3(AX.z, AY.z, AZ.z)),
+                                                                WaterScreen.xy, Focal, Size * InvHalfSize * 0.5f,
+                                                                JitterUv() * Size)
+                                         : 0.0f;
+#if RDX_RT_ASK
+    // No pixel to throw away in the build that only asks: one with no water on it asks nothing.
+    GRtAskDead = Puddle <= 0.0f;
+#else
+    clip(Puddle - 0.5f / 63.0f);
+#endif
+    const float3 Eye   = float3(0.0f, 0.0f, 0.0f);
+    const float3 Sp    = View.x * AX + View.y * AY + Z * AZ;
+    const float3 Into  = normalize(Sp);
+    // The water's surface is level, but where the rain falls into it its rings tilt it (RainRingsAt, as the late
+    // reflection pass's puddles ring): the run's clock, how thick the rain falls on the floors (FBackend::AddWetLayer).
+    const float  Foot  = length(Sp) / (max(Focal, 1.0f) * max(-Into.z, 0.01f));
+    const float2 Ring  = RainRingsAt(WaterCamera.xy + Sp.xy, WaterView.x, Foot, dot(Sp.xy, Sp.xy), WaterRainOn);
+    const float3 Up    = normalize(float3(-Ring, 1.0f));
+    const float  Back  = 0.02f + 0.98f * pow(1.0f - saturate(-dot(Into, Up)), 5.0f);
+    const float  Share = Back * Puddle;
+    const float3 Ray   = reflect(Into, Up);
+    RtShows(Share);
+    // No stand-in for a light that is not known, as the glass's: the floor's own light says nothing of the street it
+    // mirrors. And not the player's own body, as the water's.
+    const float4 Mirror = WaterReflectRt(Eye, Sp, Ray, AX, AY, AZ, Focal, Size, float3(-1.0f, -1.0f, -1.0f), false);
+    const float  Laid   = Share * Mirror.a;
+    return float4(Mirror.rgb * Laid, Laid);
+}
+
+float4 PSWetMirror(VSOut In) : SV_Target
+{
+    return WetMirror(In);
+}
+#if RDX_RT_ASK
+// The layer's rays alone, as the glass's layer asks its own (PSGlassMirrorAsk).
+[earlydepthstencil]
+void PSWetMirrorAsk(VSOut In, uint Cover : SV_Coverage)
+{
+    WetMirror(In);
+    RtAskFlush(In.Pos, Cover);
+}
+#endif
+#if RDX_LIGHT_TARGET
+// As the glass's layer: the light target left alone, the added target as the picture.
+PSLitOut PSWetMirrorLit(VSOut In)
+{
+    PSLitOut Out;
+    Out.Colour = WetMirror(In);
+    Out.Lit    = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    Out.Added  = Out.Colour;
+    return Out;
+}
+#endif
 #endif
 #if RDX_RT
 // A pane's part of the mirrors' map (FBeamBounce; FSolidPass::Flush draws the panes with it before the world): the
@@ -3989,7 +5692,7 @@ float4 SplashColour(float4 Pos)
 #if RDX_RT
             Mirror = WaterReflectRt(Eye, Sp, Ray, AX, AY, AZ, WaterTint.w, Size, 0.25f, false);
 #else
-            Mirror = WaterReflect(Eye, Sp, Ray, AX, AY, AZ, WaterTint.w, Size);
+            Mirror = WaterReflect(Eye, Sp, Ray, AX, AY, AZ, WaterTint.w, Size, WaterMirrorSteps());
 #endif
         }
         const float3 Room    = lerp(Around, Mirror.rgb, Mirror.a);

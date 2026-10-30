@@ -455,6 +455,13 @@ UBOOL FRtPass::CopyMaterial(ID3D12GraphicsCommandList* Cmd, ID3D12Resource* To) 
 // The level's pieces: at most this many triangles, or four times the level's own, whichever is more.
 enum { RT_LEVEL_TRIANGLES = 400000 };
 
+void FRtPass::WarmShaders()
+{
+    TComRef<ID3DBlob> Cs, Error;
+    RdxCompile(GFarProbeShader, strlen(GFarProbeShader), "FarProbe", nullptr, nullptr, "FarCS", "cs_5_0",
+               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, Cs.Slot(), Error.Slot());
+}
+
 UBOOL FRtPass::InitFar(ID3D12Device5* InDevice)
 {
     D3D12_HEAP_PROPERTIES Heap;
@@ -506,6 +513,7 @@ UBOOL FRtPass::InitFar(ID3D12Device5* InDevice)
         Far.Release();
         return 0;
     }
+    // The same as WarmShaders asks for.
     if (FAILED(RdxCompile(GFarProbeShader, strlen(GFarProbeShader), "FarProbe", nullptr, nullptr, "FarCS", "cs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, Cs.Slot(), Error.Slot())))
     {
@@ -606,8 +614,17 @@ void FRtPass::ForgetMaterial()
     bMaterialOnCard = 0;
 }
 
-ID3D12Resource* FRtPass::MakeVertexBuffer(const FLOAT* Src, INT Floats, const TCHAR* What)
+ID3D12Resource* FRtPass::MakeVertexBuffer(const FLOAT* Src, INT Floats, const TCHAR* What, FCardWriter* Card)
 {
+    if (Card)
+    {
+        const UINT64          Bytes  = (UINT64)Floats * sizeof(FLOAT);
+        ID3D12Resource* const OnCard = Card->MakeCardBuffer(Bytes, What);
+        if (OnCard && Card->WriteCardBuffer(OnCard, 0, Src, Bytes))
+            return OnCard;
+        if (OnCard)
+            OnCard->Release();
+    }
     D3D12_HEAP_PROPERTIES Heap;
     appMemzero(&Heap, sizeof(Heap));
     Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -638,7 +655,7 @@ ID3D12Resource* FRtPass::MakeVertexBuffer(const FLOAT* Src, INT Floats, const TC
 }
 
 void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, const DWORD* Albedo, INT InSurfCount,
-                       const FLOAT* Sky, INT SkyVertexCount)
+                       const FLOAT* Sky, INT SkyVertexCount, FCardWriter* Card)
 {
     if (!bReady || !Device)
         return;
@@ -657,7 +674,7 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
     SkyVertices = 0;
     if (Sky && SkyVertexCount >= 3)
     {
-        ID3D12Resource* const Made = MakeVertexBuffer(Sky, SkyVertexCount / 3 * 9, TEXT("sky walls"));
+        ID3D12Resource* const Made = MakeVertexBuffer(Sky, SkyVertexCount / 3 * 9, TEXT("sky walls"), Card);
         if (Made)
         {
             *SkyVb.Slot() = Made;
@@ -700,37 +717,86 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
                                                   RdxMath::LevelSplitDepth);
     }
 
-    D3D12_HEAP_PROPERTIES Heap;
-    appMemzero(&Heap, sizeof(Heap));
-    Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC Desc;
-    appMemzero(&Desc, sizeof(Desc));
-    Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    Desc.Width            = (UINT64)Pieces * 9 * sizeof(FLOAT);
-    Desc.Height           = 1;
-    Desc.DepthOrArraySize = 1;
-    Desc.MipLevels        = 1;
-    Desc.SampleDesc.Count = 1;
-    Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    FLOAT* Out = nullptr;
-    D3D12_RANGE NoRead = { 0, 0 };
-    if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               __uuidof(ID3D12Resource), LevelVb.VoidSlot())) ||
-        FAILED(LevelVb->Map(0, &NoRead, (void**)&Out)) || !Out)
+    // On the card's own memory where Card can put them there: the pieces through a batch of the CPU's memory, as many
+    // triangles' at a time as it holds - a triangle makes 2^LevelSplitDepth of them at the most.
+    const UINT64          VbBytes = (UINT64)Pieces * 9 * sizeof(FLOAT);
+    ID3D12Resource* const OnCard  = Card ? Card->MakeCardBuffer(VbBytes, TEXT("rays' level")) : nullptr;
+    if (OnCard)
     {
-        LevelVb.Release();
-        RdxLog(TEXT("ray tracing: the level's triangles could not be put on the card (%i) - the rays see no level"), Pieces);
-        return;
+        UBOOL bWritten = 0;
+        if (Edge <= 0.0f)
+            bWritten = Card->WriteCardBuffer(OnCard, 0, Xyz, VbBytes);
+        else
+        {
+            const INT    BatchFloats = 1 << 20;
+            const INT    MostFloats  = (1 << RdxMath::LevelSplitDepth) * 9;
+            FLOAT* const Batch       = (FLOAT*)RdxAllocLarge((SIZE_T)BatchFloats * sizeof(FLOAT));
+            FLOAT*       End         = Batch;
+            UINT64       Sent        = 0;
+            bWritten = Batch ? 1 : 0;
+            for (INT t = 0; t < Triangles && bWritten; t++)
+            {
+                if ((INT)(End - Batch) + MostFloats > BatchFloats)
+                {
+                    const UINT64 Used = (UINT64)(End - Batch) * sizeof(FLOAT);
+                    bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
+                    Sent    += Used;
+                    End      = Batch;
+                }
+                End = RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
+                                             RdxMath::LevelSplitDepth, End);
+            }
+            if (bWritten && End > Batch)
+            {
+                const UINT64 Used = (UINT64)(End - Batch) * sizeof(FLOAT);
+                bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
+                Sent    += Used;
+            }
+            bWritten = bWritten && Sent == VbBytes;
+            RdxFreeLarge(Batch);
+        }
+        if (bWritten)
+            *LevelVb.Slot() = OnCard;
+        else
+            OnCard->Release();
     }
-    if (Edge > 0.0f)
+    if (!LevelVb)
     {
-        FLOAT* At = Out;
-        for (INT t = 0; t < Triangles; t++)
-            At = RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2, RdxMath::LevelSplitDepth, At);
+        D3D12_HEAP_PROPERTIES Heap;
+        appMemzero(&Heap, sizeof(Heap));
+        Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC Desc;
+        appMemzero(&Desc, sizeof(Desc));
+        Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        Desc.Width            = VbBytes;
+        Desc.Height           = 1;
+        Desc.DepthOrArraySize = 1;
+        Desc.MipLevels        = 1;
+        Desc.SampleDesc.Count = 1;
+        Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        FLOAT* Out = nullptr;
+        D3D12_RANGE NoRead = { 0, 0 };
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   __uuidof(ID3D12Resource), LevelVb.VoidSlot())) ||
+            FAILED(LevelVb->Map(0, &NoRead, (void**)&Out)) || !Out)
+        {
+            LevelVb.Release();
+            RdxLog(TEXT("ray tracing: the level's triangles could not be put on the card (%i) - the rays see no level"),
+                   Pieces);
+            return;
+        }
+        if (Edge > 0.0f)
+        {
+            FLOAT* At = Out;
+            for (INT t = 0; t < Triangles; t++)
+                At = RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
+                                            RdxMath::LevelSplitDepth, At);
+        }
+        else
+            appMemcpy(Out, Xyz, Triangles * 9 * (INT)sizeof(FLOAT));
+        LevelVb->Unmap(0, nullptr);
     }
-    else
-        appMemcpy(Out, Xyz, Triangles * 9 * (INT)sizeof(FLOAT));
-    LevelVb->Unmap(0, nullptr);
     LevelVertices = Pieces * 3;
 
     // The level's colours for the RT water: each piece its triangle's surface - SplitTriangle writes a triangle's pieces
@@ -847,7 +913,7 @@ void FRtPass::SetSurfaceLightMap(INT Surf, INT SrvIndex, const FLOAT* Rows, cons
     NoteRecordDirty(Surf);
 }
 
-void FRtPass::SetThin(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf)
+void FRtPass::SetThin(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, FCardWriter* Card)
 {
     if (!bReady || !Device)
         return;
@@ -871,7 +937,7 @@ void FRtPass::SetThin(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf)
     DWORD* const Ids = (DWORD*)appMalloc((SIZE_T)Triangles * sizeof(DWORD), TEXT("RdxRtThinSurf"));
     if (!Ids)
         return;
-    ID3D12Resource* const Made = MakeVertexBuffer(Xyz, Triangles * 9, TEXT("see-through surfaces"));
+    ID3D12Resource* const Made = MakeVertexBuffer(Xyz, Triangles * 9, TEXT("see-through surfaces"), Card);
     if (!Made)
     {
         appFree(Ids);
@@ -959,7 +1025,10 @@ void FRtPass::UploadMaterial(ID3D12GraphicsCommandList* Cmd, INT FrameIndex)
         bMaterialOnCard = 0;
         Heap.Type  = D3D12_HEAP_TYPE_DEFAULT;
         Desc.Width = Whole;
-        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        // Made in the common state, as a buffer is whatever it is asked to be made in (the debug layer's warning
+        // #1328 otherwise): the copy below is the first thing done to it, and that takes it to COPY_DEST on its own -
+        // the state MaterialState says it is in.
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                    __uuidof(ID3D12Resource), LevelMaterial.VoidSlot())))
         {
             RdxLog(TEXT("ray tracing: the level's colours could not be put on the card (%.1f MB)"),
@@ -1022,7 +1091,7 @@ void FRtPass::UploadMaterial(ID3D12GraphicsCommandList* Cmd, INT FrameIndex)
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS FRtPass::PrepareWater(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, const FShadowMaps& Shadow,
-                                                const FLOAT* Eye, INT View, UBOOL bHalf)
+                                                const FLOAT* Eye, INT View, INT Sparse)
 {
     if (!bReady || !Cmd || !Eye || FrameIndex < 0 || FrameIndex >= BACKEND_FRAME_COUNT)
         return 0;
@@ -1037,7 +1106,7 @@ D3D12_GPU_VIRTUAL_ADDRESS FRtPass::PrepareWater(ID3D12GraphicsCommandList* Cmd, 
     E[0] = Eye[0];
     E[1] = Eye[1];
     E[2] = Eye[2];
-    E[3] = bHalf ? 1.0f : 0.0f;
+    E[3] = (FLOAT)Sparse;
     DWORD* const L = (DWORD*)(E + 4);
     L[0] = (DWORD)PieceCount * (DWORD)sizeof(DWORD);
     L[1] = bMaterialOnCard ? (DWORD)SurfCount : 0u;

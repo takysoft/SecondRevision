@@ -22,6 +22,23 @@ float3 RayUnpackWay(uint Packed)
     return normalize(D);
 }
 
+// How alike a pixel's first ray must be to another's for the other's answer to serve it, where a few pixels' rays are
+// traced for their neighbours (Reflections=RTHalf, SolidPass.hlsl's RtAskLed; RTLow, RaySparse.hlsl): the cosine
+// between their ways at least, and their starts no further apart than this share of their distance from the eye and a
+// unit.
+#define RAY_ALIKE_COS 0.99f
+#define RAY_ALIKE_FAR 0.03f
+// ... and the sort of a pixel's block that tells which blocks' answers may serve each other there (RTLow: SolidPass.hlsl's
+// RtAskFlushLow works it out, RaySparse.hlsl compares by it): its length, then its words in their order as the list
+// holds them, a step each.
+uint RaySortStep(uint Sig, uint Word) { return Sig * 0x9E3779B1u + Word; }
+// ... and where in the own list a block the pass kept says where its requests went in the host's list - a byte
+// address: beside its second request, or, where it has one request, in its first one's fourth uint (RaySparse.hlsl).
+uint RaySparseAnswerAt(uint At, uint Count)
+{
+    return (Count > 1u) ? (At + 1u) * RDX_RAY_SLOT_BYTES + 24u : At * RDX_RAY_SLOT_BYTES + 12u;
+}
+
 // The lamps' light on what a mirror ray meets is worked out lamp by lamp, each with a ray of its own to see whether
 // anything stands in its way - and a lamp whose light there would not show in the pixel is left out: one that
 // gives less than RT_LAMP_LEAST of full light where the pixel shows all of the mirror image, and as many times

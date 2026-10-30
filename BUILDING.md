@@ -99,10 +99,12 @@ ready to use; to build them again, the changed files, AMD's licence and the step
 |---|---|
 | `SecondRevision.dll` | the renderer |
 | `SecondRevision.int` | the name the game's settings screen shows |
-| `SecondRevision-leafcards.bin`, `SecondRevision-bark.bin` | the grown trees' leaves and bark |
-| `SecondRevisionHost64\` | the 64-bit companion app, with AMD's, NVIDIA's and Intel's upscaler DLLs and their licences |
-| `SecondRevision-THIRD-PARTY-NOTICES.md` | the licences this renderer is built on |
 | `SecondRevision.settings.ini` | written by the renderer on its first start, with every setting explained |
+| `SecondRevision\Assets\` | what the renderer reads: the trees' leaves and bark, the lamps' and wet floors' lists |
+| `SecondRevision\Host64\` | the 64-bit companion app, with AMD's, NVIDIA's and Intel's upscaler DLLs |
+| `SecondRevision\Legal\` | the licences this renderer and the DLLs beside it are used under |
+
+The shader cache (`SecondRevision.shadercache`) and the logs are written beside the DLL while the game runs.
 
 The renderer never writes the game's own ini files.
 

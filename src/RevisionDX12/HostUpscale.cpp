@@ -127,7 +127,7 @@ void FHostUpscale::Launch()
         Path[0] = 0;
     else
     {
-        const WCHAR* const Tail = L"SecondRevisionHost64\\SecondRevisionHost64.exe";
+        const WCHAR* const Tail = L"SecondRevision\\Host64\\SecondRevisionHost64.exe";
         INT k = Cut + 1;
         for (INT t = 0; Tail[t] && k < MAX_PATH + 63; t++)
             Path[k++] = Tail[t];

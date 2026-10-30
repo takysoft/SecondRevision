@@ -34,8 +34,12 @@ enum { BACKEND_FRAME_COUNT = 3 };
 #include "BeamBounce.h"
 #include "FieldVolume.h"
 #include "HoloShell.h"
+#include "MirrorProbe.h"
+#include "MirrorBody.h"
+#include "WetReflect.h"
+#include "RaySparse.h"
 
-class FBackend : private FTargetSwitch
+class FBackend : private FTargetSwitch, private FCardWriter
 {
 public:
     FBackend();
@@ -45,6 +49,10 @@ public:
     // logs on failure - the engine falls back to another render device in that case.
     UBOOL Init(HWND Window, INT Width, INT Height);
     void  Shutdown();
+    // Where Init's own shader compiles are waited for: the render device's, which answers the window's messages until
+    // Done is signalled, without the engine - so Windows sees the game answering while the start compiles. Set before
+    // Init; none, and the compiles run on the thread that makes the backend, the window answering nothing meanwhile.
+    void (*AnswerWhile)(HWND Window, HANDLE Done) = nullptr;
 
     // Recreates the swap chain buffers for a new size. Safe to call with unchanged
     // dimensions; it will simply flush and rebuild.
@@ -75,6 +83,12 @@ public:
     // Uploads on first sight and returns the descriptor index, or -1 if the
     // texture cannot be represented yet (the caller then skips the geometry).
     INT PrepareTexture(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb, UBOOL bKeepAlpha = 0);
+    // The level's geometry for the shadow maps' world maps let go at once (FShadowMaps::ForgetWorld) - only where the
+    // GPU is surely done with it: after FlushTextures, at a level's change.
+    void ForgetShadowWorld() { Shadow.ForgetWorld(); }
+    // Whether that texture was written in this frame (FTextureCache::WrittenThisFrame).
+    UBOOL TextureWrittenThisFrame(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb) const
+    { return Textures.WrittenThisFrame(Info, PolyFlags, bSrgb); }
 
     // The engine offers a level's textures OUTSIDE any Lock/Unlock pair - measured: 500
     // offers, all of them between frames. Uploads therefore need a command list of their
@@ -189,8 +203,17 @@ public:
     // picture. With the shadows asked for and not able to run nothing gathers their scene: the rays would meet the
     // level alone.
     UBOOL IsRtMirrorRequested() const { return RdxMath::ReflectionsTraced(ReflectionLevel) ? 1 : 0; }
-    // ... with a quarter of the rays asked (Reflections=RTHalf; SolidPass.hlsl, RtAskLed).
-    UBOOL IsRtMirrorHalf() const { return ReflectionLevel == RdxMath::Reflections_RtHalf; }
+    // ... with fewer rays than pixels (SolidPass.hlsl's RtEye.w): 1 a quarter of them asked (Reflections=RTHalf;
+    // RtAskLed), 2 about a ninth of those asked traced (RTLow; RaySparse.hlsl - where its pass could not be made, all
+    // are traced), 0 every one.
+    INT   GetRtMirrorSparse() const
+    {
+        return (ReflectionLevel == RdxMath::Reflections_RtMedium) ? 1
+             : (ReflectionLevel == RdxMath::Reflections_RtLow) ? 2 : 0;
+    }
+    // A measurement: how many lamps cast their shadows in the mirror image at RTLow, for this start (the marker
+    // SecondRevision-rtlow-lamps.txt; RdxMath::RtLowShadowedLamps otherwise).
+    void  RequestRtLowLamps(INT Lamps) { RtLowLamps = Lamps; }
     // ... and running: asked for, the host's list pass there, the shadows running, and the glass layer's two
     // pipelines for the host's rays made. The water's runs, the sludge's mirror layer and the splashes go with it
     // where their own pipelines for the host's rays were made (FSolidPass::MakeHostPair), and draw as without rays
@@ -715,7 +738,14 @@ public:
     INT   PomNotAsked() const { return FPomLibrary::PomNotAsked; }
     INT   FindPomCached(QWORD CacheId, const TCHAR* PathName, INT USize, INT VSize)
     { return Pom.FindCached(CacheId, PathName, USize, VSize); }
+    // By the path alone, where no cache id is at hand (the spherifier's copy of the level, which asks once a texture).
+    INT   FindPom(const TCHAR* PathName, INT USize, INT VSize) { return Pom.Find(PathName, USize, VSize); }
     void  GetPomSize(INT Entry, FLOAT& U, FLOAT& V) const { Pom.GetSize(Entry, U, V); }
+    // A height map of the renderer's own - a grown plant's bark (FPomLibrary::AddOwn, MakeOwnBlob).
+    INT   PomOwn(const char* Key, const BYTE* Blob, INT Bytes, INT W, INT H, FLOAT Depth)
+    { return Pom.AddOwn(Key, Blob, Bytes, W, H, Depth); }
+    static BYTE* PomOwnBlob(const BYTE* Heights, INT W, INT H, INT& Bytes)
+    { return FPomLibrary::MakeOwnBlob(Heights, W, H, Bytes); }
     // The relief the runs that follow are drawn with, and the end of it.
     void  SetPomRun(INT Table, FLOAT Depth, FLOAT Flags, FLOAT InvW, FLOAT InvH)
     { Solid.SetPomRun(Table, Depth, Flags, InvW, InvH); }
@@ -737,14 +767,27 @@ public:
             ReliefMirror[i] = Plane[i];
     }
     void  ClearReliefRun() { Solid.ClearReliefRun(); }
+    // The models rounded: the mesh triangles that follow as patches (FSolidPass::SetMeshRun).
+    void  SetMeshRun(FLOAT Sag, FLOAT Focal, FLOAT CentreX, FLOAT CentreY, FLOAT Most, FLOAT Shape)
+    {
+        Solid.SetMeshRun(Sag, Focal, CentreX, CentreY, Most, Shape);
+    }
+    void  ClearMeshRun() { Solid.ClearMeshRun(); }
+    // And this frame's room for their edges' terms (FSolidPass::MeshEdgeRoom).
+    FLOAT* MeshEdgeRoom(INT Count, INT& First) { return Solid.MeshEdgeRoom(Count, First); }
+    UBOOL CanRoundMeshes(INT Mode) const { return Solid.CanRoundMeshes(Mode); }
     // LampShadows: the lamps the relief is lit by this frame - Count of eight floats each, as the shader reads them: the
     // place in view space and the reach, then the colour and a spare (RdxMath::ReliefLampMax at most).
     void  SetReliefLamps(const FLOAT* Lamps, INT Count);
     // Geometry=Tessellation: the held edges near the relief's polygons, for its rim band - Count of them, each its two
-    // ends in view space (FSolidPass::SetReliefHeld). The block they went into, for the detail texture's run over the
-    // same patches (SetReliefBlock); zero if they did not.
-    UINT64 SetReliefHeld(const FLOAT* Ends, INT Count)
-    { return (UINT64)Solid.SetReliefHeld(ReliefLampCopy, 4 * (1 + 2 * RdxMath::ReliefLampMax), Ends, Count); }
+    // ends in view space - and the spherifier's rows where the patches are rounded (FSolidPass::SetReliefHeld). The
+    // block they went into, for the detail texture's run over the same patches (SetReliefBlock); zero if they did not.
+    UINT64 SetReliefHeld(const FLOAT* Ends, INT Count, const FLOAT* Sphere = nullptr)
+    { return (UINT64)Solid.SetReliefHeld(ReliefLampCopy, 4 * (1 + 2 * RdxMath::ReliefLampMax), Sphere, Ends, Count); }
+    // The spherifier's field for the relief's patches (FSolidPass::SetSphereField), and the number it was given with.
+    void SetSphereField(const DWORD* Words, INT Count, INT Gen) { Solid.SetSphereField(Words, Count, Gen); }
+    void TakeSphereField(DWORD* Words, INT Count, INT Gen) { Solid.TakeSphereField(Words, Count, Gen); }
+    INT  SphereFieldGen() const { return Solid.SphereFieldGen(); }
     void  SetReliefBlock(UINT64 Block) { Solid.SetReliefBlock((D3D12_GPU_VIRTUAL_ADDRESS)Block); }
     void  SetReliefBevel(FLOAT Depths) { Solid.SetReliefBevel(Depths); }
     void  SetReliefSmooth(FLOAT Levels) { Solid.SetReliefSmooth(Levels); }
@@ -770,6 +813,23 @@ public:
     UBOOL CanSludgeMirror() const { return Solid.CanSludgeMirror(); }
     // Whether a pane of the levels' glass can get its mirror layer (FSolidPass::CanGlassMirror).
     UBOOL CanGlassMirror() const { return Solid.CanGlassMirror(); }
+    // The probe gathered from the picture (FMirrorProbe): whether the levels' glass mirrors what it holds this frame -
+    // a mirror image asked for, no rays running for it, and what the probe gathers by there: the shadows' stencil of
+    // surface kinds and their added target, a world drawn with one sample (with MSAA the added target is the world's
+    // only once it is over). Not refused by a failure to make it.
+    UBOOL IsProbeMirrorRunning() const
+    {
+        return RdxMath::ReflectionsHasMirror(ReflectionLevel) && !IsRtMirrorRunning() && bShadows && LightTarget &&
+               AddedTarget && !MsaaOn() && !bProbeRefused;
+    }
+    // A pane the world's view draws, for where the probe stands (FMirrorProbe::NotePane); and where it stands, for the
+    // pane's mirror layer - false while it holds nothing yet.
+    void  NoteProbePane(const FLOAT* Middle, const FLOAT* Normal, FLOAT Area) { MirrorProbe.NotePane(Middle, Normal, Area); }
+    UBOOL GetProbePlace(FLOAT* Centre, FLOAT& Reach) const { return MirrorProbe.GetPlace(Centre, Reach); }
+    // And the pane it stands before, whose plane the own body is mirrored by (FMirrorBody): its normal and middle.
+    UBOOL GetProbePane(FLOAT* Normal, FLOAT* Middle) const { return MirrorProbe.GetPane(Normal, Middle); }
+    // A new level: the probe empty, standing nowhere.
+    void  ForgetMirrorProbe() { MirrorProbe.Forget(); }
     // Whether the level's own mirrors can be traced in the engine's place (FSolidPass::CanRtMirror): the mirror rays
     // run, and the layer that carries their image is there.
     UBOOL CanRtMirror() const { return IsRtMirrorRunning() && Solid.CanRtMirror(); }
@@ -1226,6 +1286,30 @@ public:
     // (MirrorViewDone); a mirror's view past the blocks' count takes none. And the frame's cone - its light at its
     // strongest, three numbers, or null for a frame without it. The cone is the world view's (SetCloudView): from
     // that view's eye, along its axis. Within a frame; a frame begins without one.
+    // Whether the next geometry is a wet floor, and of what kind (RdxMath::EWetKind; FSolidPass::SetWet): 0 not. Within
+    // a frame; whoever sets it sets it back.
+    void  SetSurfaceWet(INT Kind) { Solid.SetWet(Kind); }
+    // The wet floors' water on rays this frame (FSolidPass::AddWetLayer): the layer's numbers, a pane's (RenderDevice's
+    // GlassRunConstants). Once a frame, where the rays run; the late reflection pass then leaves the water to it.
+    void  AddWetLayer(const FLOAT* Consts)
+    {
+        Solid.AddWetLayer(Consts, Textures.GetWhiteIndex());
+        bWetLayerNow = 1;
+    }
+    // The wet floors' measuring view (SecondRevision-wet-view.txt; SolidPass.hlsl's WetScreen.w): 0 none.
+    void  RequestWetView(INT View) { WetShowView = (View > 0 && View < 16) ? View : 0; }
+    // The lamps whose streaks the wet floors give back this frame (WetReflect.hlsl's WetLamp; RdxMath::WetLampMax at
+    // most): two rows of four a lamp - its place in the world view's space and its glass's radius, its glass's colour by
+    // its brightness. Within a frame; a frame begins without any.
+    void  SetWetLamps(const FLOAT* Lamps, INT Count);
+    // How thick the rain falls on the floors this frame (RdxFloorRainThick) and the level's clock its rings run by: the
+    // puddles' rings, the late reflection pass's Rays.yz.
+    void  SetWetRain(FLOAT Thick, FLOAT Clock) { WetRainNow[0] = Thick; WetRainNow[1] = Clock; }
+    // The rain's cover over a level's wet floors (docs/terv-nedves-feluletek.md 8.4): W * H cells, four numbers each -
+    // the open share 0..1, the height of the highest wet floor there, the lower floors' open share 0..1 and the highest
+    // floor near it -, the grid's corner (X, Y) and its cell, in the level's units. Copied on the frame's own list,
+    // within a frame. No cells: no cover, everywhere open.
+    void  SetWetCover(const FLOAT* Cells, INT W, INT H, FLOAT X, FLOAT Y, FLOAT Cell);
     void  SetSurfaceBeam(INT How)
     {
         INT Block = 0;
@@ -1246,7 +1330,10 @@ public:
         FLOAT Colour[3];    // its light at its strongest, as the cone's own (RdxMath::BeamGain)
         UBOOL bEye;         // the flashlight's: the world's view takes the cone itself instead
         UBOOL bSeen;        // the eye sees it, nothing of the level between: its glare, and its ghosts with LensFlare
+        FLOAT WetFloor;     // the wet floor below it, for its light off the water (RenderDevice.cpp's OwnLampWetFloor):
+                            // its height's whole part and how wet it is as the fraction; NoWetFloor where there is none
     };
+    static constexpr FLOAT NoWetFloor = -1.0e30f;
     void  SetOwnLamps(const FOwnLamp* Lamps, INT Count);
     // The world's view in the level for the own lamps, this frame's: its eye, then its axes - right, down, forward -
     // twelve numbers, as the engine's view coordinates have them.
@@ -1313,14 +1400,15 @@ public:
     // EndFrame: the casters one by one (FShadowMaps::AddCaster), then the lights, with the camera's axes in world space
     // (X right, Y down, Z forward: nine values, axis by axis). Nothing of a frame carries over to the next one.
     INT    GetShadowGeneration() const { return ShadowGeneration; }
-    // The level's triangles for the shadow maps, and the ray tracing scene's own - the see-through surfaces left out - with
-    // each of its triangles' surface (RtSurf) and each surface's colour (SurfAlbedo, SurfCount of them), for the RT water,
-    // and the sky walls, for its rays alone (FRtPass::SetLevel).
-    // ThinXyz, ThinSurf: the level's see-through surfaces' triangles and each one's surface, for the mirror rays
-    // alone (FRtPass::SetThin).
-    UBOOL  SetShadowWorld(const FLOAT* Xyz, INT VertexCount, const FLOAT* RtXyz, INT RtVertexCount, const DWORD* RtSurf,
-                          const DWORD* SurfAlbedo, INT SurfCount, const FLOAT* SkyXyz, INT SkyVertexCount,
-                          const FLOAT* ThinXyz, INT ThinVertexCount, const DWORD* ThinSurf);
+    // The level's triangles for the shadow maps (SetShadowMapsWorld), and then the ray tracing scene's own - the see-through
+    // surfaces left out - with each of its triangles' surface (RtSurf) and each surface's colour (SurfAlbedo, SurfCount of
+    // them), for the RT water, and the sky walls, for its rays alone (FRtPass::SetLevel). ThinXyz, ThinSurf: the level's
+    // see-through surfaces' triangles and each one's surface, for the mirror rays alone (FRtPass::SetThin). Two calls, so
+    // that the caller can make the second list of the first one's memory once the maps have it.
+    UBOOL  SetShadowMapsWorld(const FLOAT* Xyz, INT VertexCount);
+    void   SetShadowRtWorld(const FLOAT* RtXyz, INT RtVertexCount, const DWORD* RtSurf, const DWORD* SurfAlbedo,
+                            INT SurfCount, const FLOAT* SkyXyz, INT SkyVertexCount, const FLOAT* ThinXyz,
+                            INT ThinVertexCount, const DWORD* ThinSurf);
     FLOAT* AddShadowCaster(INT VertexCount, FLOAT X, FLOAT Y, FLOAT Z, FLOAT Radius, INT& Index);
     void   SetShadowLights(const FShadowLightFrame* Lights, INT Count, const FLOAT* CameraAxes, const FLOAT* CameraEye);
     // Whether a caster AddShadowCaster or AddShadowArenaCaster placed uses a mask somewhere (FShadowMaps::SetCasterMasked).
@@ -1440,7 +1528,19 @@ private:
     // that goes through the compiler (RdxCompileWatch), from the thread that makes the backend, until its start is
     // done; a start with every shader in the cache's file never shows it.
     void  PresentCompiling();
+    // How many shaders the backend's start compiles where the cache's file gave none (no file, or the cache off): every
+    // one the renderer has, made by Init and WarmShaders whatever the settings - the caption's total from its first
+    // moment. Where a shader comes or goes, the start's end says so in the log and this number follows it.
+    enum { START_SHADERS = 170 };
     static void CompilingWatch(void* Who);
+    // The wait while a shader compiles on its own thread (RdxCompileWatch's Wait): AnswerWhile on the thread that makes
+    // the backend, a plain wait on any other.
+    static void CompilingWait(void* Who, HANDLE Compiling);
+    // Every shader the renderer may ask for, compiled while it starts (Init): see WarmShaders in Backend.cpp.
+    void WarmShaders();
+    // The wet floors' late pass made for the picture's and the depth's formats and the samples now - again where they
+    // moved (DrawWetReflections, WarmShaders). False where it could not be.
+    UBOOL EnsureWetReflect();
     DWORD CompilingThread = 0;
     UBOOL CreateDepthBuffer();
     UBOOL CreateSceneTarget();
@@ -1748,6 +1848,12 @@ private:
     // FTargetSwitch: the water's own depth made writable for a see-through water run - see WaterSurface.
     virtual INT WaterSurfaceView(ID3D12GraphicsCommandList* Cmd, UBOOL& bWrite);
     virtual void WaterSurfaceSettle(ID3D12GraphicsCommandList* Cmd);
+    // FTargetSwitch: the wet floors' mark made writable for a wet floor's run - see WetMark.
+    virtual INT WetMarkView(ID3D12GraphicsCommandList* Cmd);
+    UBOOL EnsureWetMark();
+    // How thick the rain falls on the floors this frame and the clock its rings run by (SetWetRain).
+    FLOAT WetRainNow[2] = { 0.0f, 0.0f };
+    void  WetMarkTo(ID3D12GraphicsCommandList* Cmd, D3D12_RESOURCE_STATES State);
     // The water's own depth made (EnsureWaterSurface), taken to a state (WaterSurfaceTo), and stamped into the world's
     // depth for the upscaler (StampWaterSurface: Dsv is the world's depth, in DEPTH_WRITE).
     UBOOL EnsureWaterSurface();
@@ -2184,10 +2290,14 @@ private:
     // through the second of the reserved view sets when it is field 1. Their own small pass: a root signature, a pipeline,
     // a view heap for reading the other field, and render target views.
     // The water's views in the texture heap's reserved slots: two sets, one per ripple field (StepRipples picks the one the
-    // last step wrote), each the picture, the depth, that ripple field, the texture's own wave field, and the caustics'
-    // net.
-    enum { WaterSetViews = 5, WaterViewPicture = 0, WaterViewDepth = 1, WaterViewRipples = 2, WaterViewWaves = 3,
-           WaterViewNet = 4 };
+    // last step wrote), each the picture, the depth, that ripple field, the texture's own wave field, the caustics' net,
+    // the mirror probe's pyramid (FMirrorProbe) and the own body's picture (FMirrorBody), for the glass's layer - where
+    // the geometry pass's water table has them (FSolidPass::MakeRoot).
+    enum { WaterSetViews = 7, WaterViewPicture = 0, WaterViewDepth = 1, WaterViewRipples = 2, WaterViewWaves = 3,
+           WaterViewNet = 4, WaterViewProbe = 5, WaterViewBody = 6 };
+    static_assert(WaterViewNet == FSolidPass::WATER_VIEW_NET && WaterViewProbe == FSolidPass::WATER_VIEW_PROBE &&
+                  WaterViewBody == FSolidPass::WATER_VIEW_PROBE + 1,
+                  "the water's views must stand where the geometry pass's water table reads them");
     INT   WaterSlot(INT Set, INT View) const { return Textures.GetReservedIndex(Set * WaterSetViews + View); }
     // The texture's own wave field (SetWaterWaves): its GPU copy, an upload buffer per frame slot, and the heights waiting
     // for the next frame's start.
@@ -2200,10 +2310,12 @@ private:
     UBOOL                         bWaveFailed;
     UBOOL EnsureWaveField();
     // The water's lamps (SetWaterLamps): one upload buffer, 1024 bytes for each frame slot - a constant buffer's place is
-    // a multiple of 256, and a slot covers the shader's whole block up to the held edges' count, which a relief run
-    // bound to the relief's slot reads: the lamps' count, RDX_RELIEF_LAMP_MAX lamps of two rows, and that count.
+    // a multiple of 256, and a slot covers the shader's whole block up to the held edges' count and the spherifier's rows
+    // after it (zeros: off), which a relief run bound to the relief's slot reads: the lamps' count,
+    // RDX_RELIEF_LAMP_MAX lamps of two rows, that count, and those rows.
     enum { WaterLampBytes = 1024 };
-    static_assert((2 + 2 * RDX_RELIEF_LAMP_MAX) * 16 <= WaterLampBytes, "a lamp slot must hold the shader's lamp rows");
+    static_assert((2 + FSolidPass::SPHERE_ROWS + 2 * RDX_RELIEF_LAMP_MAX) * 16 <= WaterLampBytes,
+                  "a lamp slot must hold the shader's lamp rows, the count and the spherifier's rows");
     TComRef<ID3D12Resource>       WaterLampBuffer;
     BYTE*                         WaterLampMapped;
     UBOOL                         bWaterLampFailed;
@@ -2297,6 +2409,45 @@ private:
     UBOOL                         bWaterSurfaceLive;      // this frame's water wrote it, for what reads it afterwards
     UBOOL                         bWaterSurfaceCleared;   // this frame's first water run has cleared it
     UBOOL                         bWaterSurfaceViewReal;  // WaterSurfaceUavView is its own view, not a view of nothing
+    // The wet floors' mark (docs/terv-nedves-feluletek.md 8.5; RdxMath::WetMarkPack): R32 twice the scene's width, the
+    // nearest wet floor's depth at each pixel and what the late reflection pass needs of it at the pixel's even column,
+    // its relief's normal at the odd one (RdxMath::WetTiltPack) - written by the wet floors'
+    // runs through a UAV with an atomic maximum (WetMarkView), cleared through a render target view on the frame's
+    // first wet run (bWetMarkCleared), read by the late reflection pass.
+    TComRef<ID3D12Resource>       WetMark;
+    TComRef<ID3D12DescriptorHeap> WetMarkRtvHeap;
+    D3D12_RESOURCE_STATES         WetMarkState;
+    UBOOL                         bWetMarkCleared;
+    UBOOL                         bWetMarkViewReal;       // WetMarkUav is its own view, not a view of nothing
+    UBOOL                         bWetMarkNone = 0;       // both its views are views of nothing (BeginFrame)
+    // The wet floors' measuring view asked for (RequestWetView): 0 none.
+    INT                           WetShowView = 0;
+    // The wet floors' late reflection pass (FWetReflect), made the first frame it is wanted (WetReflectReady: 0 not yet,
+    // 1 made, -1 refused), for the picture's format, the depth's and the sample count it was made with (WetReflectFor:
+    // made again where they moved); the frame's wet block (SetWetBlocks' rows, bWetBlockNow: there is one), which it
+    // reads too; and its drawing, from FBackend::CopyForWater - true where it drew.
+    FWetReflect                   WetReflect;
+    INT                           WetReflectReady = 0;
+    DXGI_FORMAT                   WetReflectFor[2] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
+    INT                           WetReflectSamples = 0;
+    FLOAT                         WetBlockNow[RdxMath::WetBlockFloats] = {};
+    UBOOL                         bWetBlockNow    = 0;
+    // The wet floors' lamps (SetWetLamps): the water's lamps' layout of a slot - the count, then two rows a lamp -, a
+    // buffer of their own, emptied at the frame's start.
+    TComRef<ID3D12Resource>       WetLampBuffer;
+    BYTE*                         WetLampMapped   = nullptr;
+    UBOOL                         bWetLampFailed  = 0;
+    UBOOL EnsureWetLamps();
+    // The rain's cover's place for the wet block (SetWetCover): its grid's corner in X and Y, one over its span in each;
+    // all 0 - no cover - until a level's is made. Its texture and the buffer it was copied from, two of each: a level's
+    // takes the other pair, and the pair let go is two levels old, long done with by the card.
+    FLOAT                         WetCoverNow[4]  = {};
+    TComRef<ID3D12Resource>       WetCoverTex[2];
+    TComRef<ID3D12Resource>       WetCoverUp[2];
+    INT                           WetCoverPair    = 0;
+    UBOOL                         bWetCoverViewSet = 0;   // its view written once at least, a real one or of nothing
+    UBOOL                         bWetLayerNow    = 0;    // AddWetLayer's: the water is the rays' this frame
+    UBOOL DrawWetReflections(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv);
     // With the shadows, what their apply pass needs of the see-through water's pixels (ApplyShadows): the surface's
     // light, the bed's share and where the bed was seen (SolidPass.hlsl's WaterShade, RGBA16 at the scene's size),
     // written by the water beside its own depth; the water's own depth and light at the factor's samples (WaterPack,
@@ -2358,13 +2509,67 @@ private:
     // passed, side by side - a range of the masks' table, whose first view (RtMaskView) is the pixels' heads there.
     enum { RayHeadsUav = BounceMapView + 1, RayAskedUav = BounceMapView + 2, RayAnswersView = BounceMapView + 3,
            RayPassedView = BounceMapView + 4 };
+    // Reflections=RTLow's pass over the list (FRaySparse), on the heads' view above: made the first round it runs
+    // (bSparseTried). The round being asked: 2 where it runs as RTLow - the pass and the own list made - else what
+    // GetRtMirrorSparse says, RT where RTLow cannot run. And the own list's view as last written: for which share, and
+    // whether there was a list.
+    FRaySparse                    RaySparse;
+    UBOOL                         bSparseTried    = 0;
+    INT                           RtSparseNow     = 0;
+    INT                           RtLowLamps      = RdxMath::RtLowShadowedLamps;
+    INT                           RtLowViewSerial = -1;
+    UBOOL                         RtLowViewHas    = 0;
     // The own lamps' table and maps (PrepareOwnLamps), side by side: a range of the mirrors' map's table in the
     // geometry pass's own root signature, and of the masks' table in the rays' (FSolidPass::SetOwnLampViews).
     enum { OwnLampTableView = RayPassedView + 1, OwnLampMapsView = RayPassedView + 2 };
     // What the shadows' apply pass needs of the see-through water's pixels, as the water writes it (WaterShade) - a
     // view of nothing while there is none.
     enum { WaterShadeUav = OwnLampMapsView + 1 };
-    static_assert(WaterShadeUav < FTextureCache::ReservedViews(), "the texture heap reserves too few views");
+    // The mirror probe's passes' table (FMirrorProbe::VIEWS long, in its order): the copies of the picture, the depth and
+    // its stencil, the added target, then the probe's own five buffers.
+    enum { ProbeTableView = WaterShadeUav + 1 };
+    // Reflections=RTLow's own list (FHostRayFeed::GetLow) as its pixels write it - u7 of the water's UAV table, a view
+    // of nothing until the list is made.
+    enum { RayAskedLowUav = ProbeTableView + FMirrorProbe::VIEWS };
+    // ... and the corners the rays are traced against, as the host has them (FHostRayFeed::GetCorners), side by side:
+    // the level's, the frame's bodies', the arena's - a range of the masks' table in the rays' root signature
+    // (t23..t25), for the build that reads the answers. Views of nothing where the share has none.
+    enum { RayCornersView = RayAskedLowUav + 1 };
+    // The wet floors' mark (WetMark) as their runs write it - u4 of the water's UAV table, a view of nothing until it is
+    // made - and as the late reflection pass reads it.
+    enum { WetMarkUav = RayCornersView + 3, WetMarkSrv = RayCornersView + 4 };
+    // The rain's cover over the wet floors (SetWetCover) as the wet floors' runs and the late reflection pass read it -
+    // t27 of the wet runs' UAV table, as far after the water's own depth's view as this is; a view of nothing until a
+    // level's is made.
+    enum { WetCoverSrv = RayCornersView + 5 };
+    static_assert(WetCoverSrv + 1 <= FTextureCache::ReservedViews(), "the texture heap reserves too few views");
+    // The volumetric walk's picture as the late wet pass's second draw reads it (the fires' flames in the wet floors'
+    // mirror, DrawVolumetrics): a view of nothing until the first frame it is drawn, made again where the picture is.
+    enum { WetFlameSrv = WetCoverSrv + 1 };
+    static_assert(WetFlameSrv + 1 <= FTextureCache::ReservedViews(), "the texture heap reserves too few views");
+    // The late wet pass's numbers this frame and whether it drew multisampled, kept for that second draw, and the
+    // walk's picture its view was last made of (compared, never followed); and the own lamps as the pass reads them
+    // (WetReflect.hlsl's WetSpots), this frame's block.
+    FLOAT           WetConstNow[FWetReflect::CONSTANTS];
+    D3D12_GPU_VIRTUAL_ADDRESS WetSpotsNow = 0;
+    UBOOL           bWetDrawnNow = 0, bWetMsaaNow = 0;
+    ID3D12Resource* WetFlameOf   = nullptr;
+    // The probe (UpdateMirrorProbe): made the first frame it runs (bProbeTried; bProbeRefused where that failed);
+    // its table to be written again where what it views was made again; run this frame.
+    FMirrorProbe                  MirrorProbe;
+    FMirrorBody                   MirrorBody;
+    UBOOL                         bProbeTried      = 0;
+    UBOOL                         bProbeRefused    = 0;
+    UBOOL                         bProbeViewsDirty = 1;
+    UBOOL                         bProbeDone       = 0;
+    // The probe made where it is wanted and not yet tried, its pyramid's view put in the water's sets; then its frame's
+    // passes on the copies just made (CopyForWater) - the copies and the added target readable by them for the while.
+    UBOOL EnsureMirrorProbe();
+    UBOOL UpdateMirrorProbe(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv);
+    // The own body's picture for the frame (FMirrorBody), after the probe's passes: drawn where the probe stands before
+    // a pane and the shadows hold the body, cleared otherwise; the scene's targets bound again with Dsv.
+    void  DrawMirrorBody(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv);
+    void  WriteProbeViews();
     TComRef<ID3D12RootSignature>  CausticLayRoot;
     TComRef<ID3D12PipelineState>  CausticLays[2];
     TComRef<ID3D12PipelineState>  CausticMaskPipeline;
@@ -2684,6 +2889,17 @@ private:
     UBOOL                              bUploadOpen;
     UBOOL OpenUploadList();
     void  SubmitUploadList();
+    // FCardWriter: a buffer on the card's own memory, and what goes into it - through CardStaging, mapped for good, a
+    // piece of CARD_STAGING_BYTES at a time, on a list of its own (not the upload list: sending that lets the texture
+    // cache's staging go, which a frame's list may still be copying from), each piece waited for (WaitForGpu).
+    virtual ID3D12Resource* MakeCardBuffer(UINT64 Bytes, const TCHAR* What);
+    virtual UBOOL WriteCardBuffer(ID3D12Resource* Dest, UINT64 At, const void* Data, UINT64 Bytes);
+    void  ReleaseCardWriter();
+    enum { CARD_STAGING_BYTES = 4 << 20 };
+    TComRef<ID3D12Resource>            CardStaging;
+    BYTE*                              CardStagingMapped = nullptr;
+    TComRef<ID3D12CommandAllocator>    CardAllocator;
+    TComRef<ID3D12GraphicsCommandList> CardList;
     UBOOL  bAllowTearing;
     UBOOL  bExclusive;     // we put the swap chain in DXGI's fullscreen state
     // Alt+Tab hides the window: Present then returns DXGI_STATUS_OCCLUDED, and a tearing-enabled present is not

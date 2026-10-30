@@ -46,6 +46,10 @@ public:
     INT Prepare(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb, ID3D12GraphicsCommandList* Cmd,
                 UBOOL bKeepAlpha = 0);
 
+    // Whether the texture Info names - as Prepare is given it - was written in this frame: uploaded, or refreshed for
+    // its bRealtimeChanged. A refresh can be put off, a frame's uploads have their limits; it is asked for again then.
+    UBOOL WrittenThisFrame(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb) const;
+
     // The descriptor index of a colour texture the cache already holds, by its identity alone: nothing is uploaded
     // and nothing refreshed. The plain version, or the masked one where only that was ever drawn; -1 where it holds
     // neither. For the mirror rays, which meet a texture where no draw brought it.
@@ -116,18 +120,22 @@ private:
     // so lookups keep finding empty slots quickly.
     enum { MAX_TEXTURES = 36864, MAX_STAGING_PER_FRAME = 1024, HASH_SIZE = 131072 };
     // The last RESERVED_VIEWS descriptors of the heap are not the cache's own: the backend writes views of its targets
-    // there (the water's two sets of five - FBackend's WaterView* - the splashes' three, SplashView*, the RT water's
+    // there (the water's two sets of seven - FBackend's WaterView* - the splashes' three, SplashView*, the RT water's
     // three: the shadow masks, the far probe and the probe's UAV, RtMaskView... - the relief's covers with the view of
     // nothing read in their place, ReliefCoverView and ReliefCoverNone - the see-through water's own depth as the water
     // writes it, WaterSurfaceUavView - the caustics' mask, CausticMaskView - and the map of the mirrors' views'
-    // depth for the flashlight's light off them, BounceMapView - the rays' list's four, and the own lamps' table and
-    // maps, OwnLampTableView and OwnLampMapsView), because a draw sees only the one
+    // depth for the flashlight's light off them, BounceMapView - the rays' list's four, the own lamps' table and
+    // maps, OwnLampTableView and OwnLampMapsView, the water's shade, WaterShadeUav, the mirror probe's passes'
+    // nine, ProbeTableView, Reflections=RTLow's own list, RayAskedLowUav, the rays' scene's corners, RayCornersView's
+    // three, the wet floors' mark as written and as read, WetMarkUav and WetMarkSrv, and the rain's cover over them,
+    // WetCoverSrv, and the volumetric walk's picture the wet floors' flames are read from, WetFlameSrv), because a draw
+    // sees only the one
     // shader-visible heap that is bound - this one, for the whole geometry pass. A level change never touches them.
     // POM_VIEWS follow them: two to a height map (the height itself and the colour that goes with it), so the relief's
     // maps are addressable from the same bound heap without taking slots a level's textures need. 2048 maps
-    // (FPomLibrary's MAX_ENTRIES), and three more: the shader's table reads five from a map's first, so the last map's
-    // table reaches three past its own.
-    enum { RESERVED_VIEWS = 28, POM_VIEWS = 2 * 2048 + 3,
+    // (FPomLibrary's MAX_ENTRIES), and five more: the shader's table reads seven from a map's first (the water's
+    // table, FSolidPass::MakeRoot), so the last map's table reaches five past its own.
+    enum { RESERVED_VIEWS = 49, POM_VIEWS = 2 * 2048 + 5,
            TEXTURE_SLOTS = MAX_TEXTURES - RESERVED_VIEWS - POM_VIEWS };
 
     struct FEntry
@@ -146,6 +154,10 @@ private:
         INT             Format;
         INT             MipCount;
         DWORD           RefreshSerial; // the frame whose content it holds
+        // A light or fog map's texels as it last went up in a refresh (Refresh): the engine marks such a map changed
+        // whenever it builds it again, and most come out as they were. Null till then; KeptBytes of them.
+        BYTE*           Kept;
+        INT             KeptBytes;
     };
 
     INT Find(QWORD CacheId, QWORD PaletteId, UBOOL bMasked, UBOOL bSrgb) const;
@@ -242,6 +254,7 @@ private:
     INT             FrameMapRefreshes  = 0;
     DOUBLE          FrameRefreshSec    = 0.0;
     DOUBLE          FrameMapRefreshSec = 0.0;
+    INT             FrameRefreshesKept = 0;     // refreshes the texture already held (FEntry::Kept)
 
     // Upload memory: one persistently mapped buffer per frame slot, handed out front to
     // back and emptied once the GPU has finished with that slot. A committed buffer per
@@ -363,6 +376,7 @@ public:
         FrameOwnBufSec = FrameConvertSec = FrameDilateSec = FrameCopySec = 0.0;
         FrameRefreshes = FrameMapRefreshes = 0;
         FrameRefreshSec = FrameMapRefreshSec = 0.0;
+        FrameRefreshesKept = 0;
     }
 
     // Realtime refreshes recorded so far - see Prepare. Reported in the frame census.
@@ -381,4 +395,5 @@ public:
     INT    GetFrameMapRefreshes() const { return FrameMapRefreshes; }
     DOUBLE GetFrameRefreshSec() const   { return FrameRefreshSec; }
     DOUBLE GetFrameMapRefreshSec() const { return FrameMapRefreshSec; }
+    INT    GetFrameRefreshesKept() const { return FrameRefreshesKept; }
 };

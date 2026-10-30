@@ -50,13 +50,34 @@ static FILE*           GLog   = nullptr;
 static Host64::FBlock* GBlock = nullptr;
 static bool            GDebugLayer = false;   // "debug" on the command line: a validation run's, never a player's
 
-// The log beside the executable, begun afresh at every start - the renderer's own log says when the host was started.
+// The log in the game's System folder beside the renderer's own - three cuts up from the executable's path
+// (SecondRevision\Host64\SecondRevisionHost64.exe), where SecondRevision.dll is - begun afresh at every start; the
+// renderer's own log says when the host was started. A host run from anywhere else (a build's folder, a probe) keeps
+// it beside itself.
 static void OpenLog()
 {
     wchar_t Path[MAX_PATH];
     const DWORD N = ::GetModuleFileNameW(nullptr, Path, MAX_PATH);
     if (N == 0 || N >= MAX_PATH - 8)
         return;
+    wchar_t Sys[MAX_PATH];
+    wcscpy_s(Sys, Path);
+    for (int Cut = 0; Cut < 3 && Sys[0]; Cut++)
+    {
+        wchar_t* const Slash = wcsrchr(Sys, L'\\');
+        if (Slash)
+            *Slash = 0;
+        else
+            Sys[0] = 0;
+    }
+    wchar_t Dll[MAX_PATH], Beside[MAX_PATH];
+    if (Sys[0] && swprintf_s(Dll, L"%s\\SecondRevision.dll", Sys) > 0 &&
+        ::GetFileAttributesW(Dll) != INVALID_FILE_ATTRIBUTES &&
+        swprintf_s(Beside, L"%s\\SecondRevisionHost64.log", Sys) > 0)
+    {
+        _wfopen_s(&GLog, Beside, L"w");
+        return;
+    }
     wchar_t* Dot = wcsrchr(Path, L'.');
     if (Dot)
         wcscpy_s(Dot, MAX_PATH - (Dot - Path), L".log");

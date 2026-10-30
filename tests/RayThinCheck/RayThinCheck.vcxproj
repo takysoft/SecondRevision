@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    RayThinCheck.exe - Reflections=RTLow's pass over the rays' list (RaySparse.hlsl) tried on the GPU without the game
+    (docs/terv-nedves-feluletek.md 7.2). A 32-bit program like the renderer; the shader is compiled from the source tree
+    at run time. Needs a GPU, not the game.
+  -->
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{8E4B1D27-6A3C-4F95-A0D8-2C71E5B9F304}</ProjectGuid>
+    <RootNamespace>RayThinCheck</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)'==''">v145</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\tests\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\raythincheck\</IntDir>
+    <TargetName>RayThinCheck</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="RayThinCheck.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\src\RevisionDX12\RenderLimits.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\src\RevisionDX12\RayListSlots.hlsli" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The pass as the renderer's build makes it (RevisionDX12.vcxproj): DXIL by dxc. -->
+    <CustomBuild Include="..\..\src\RevisionDX12\RaySparse.hlsl">
+      <Command>"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T cs_6_0 -E SparseCS -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)RaySparseCS.h" -Vn GRaySparseCS "%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(MSBuildThisFileDirectory)..\..\src\RevisionDX12\RenderLimits.h;$(MSBuildThisFileDirectory)..\..\src\RevisionDX12\RayListSlots.hlsli</AdditionalInputs>
+      <Outputs>$(IntDir)RaySparseCS.h</Outputs>
+      <Message>Shader: RaySparse.hlsl (DXIL)</Message>
+    </CustomBuild>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

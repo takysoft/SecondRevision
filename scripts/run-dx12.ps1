@@ -77,22 +77,33 @@ if (Get-Process -Name Revision -ErrorAction SilentlyContinue) {
 }
 Copy-Item "$root\build\Release\SecondRevision.dll" $sys -Force
 Copy-Item "$root\src\RevisionDX12\SecondRevision.int" $sys -Force
-# The notices travel with the binary: the zlib licence of the renderer this one descends from, and the MIT licence of
-# the FidelityFX code built into it and of AMD's FSR DLLs beside the host, all require it.
-Copy-Item "$root\THIRD-PARTY-NOTICES.md" "$sys\SecondRevision-THIRD-PARTY-NOTICES.md" -Force
+# Our own files in the folder SecondRevision beside the DLL: Assets (what the renderer reads), Host64 (the 64-bit host
+# and its DLLs), Legal (the licences). The DLL, its .int, the settings, the shader cache and the logs stay in System.
+$own     = Join-Path $sys "SecondRevision"
+$assets  = Join-Path $own "Assets"
+$legal   = Join-Path $own "Legal"
+$hostDir = Join-Path $own "Host64"
+foreach ($d in @($assets, $legal, $hostDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+# The licences travel with the binaries: the zlib licence of the renderer this one descends from, and the MIT licence
+# of the FidelityFX code built into it and of AMD's FSR DLLs beside the host, all require it; Intel's terms ask for
+# XeSS's licence and its third-party list to go with libxess.dll in the distribution.
+Copy-Item "$root\LICENSE" "$legal\SecondRevision-LICENSE.txt" -Force
+Copy-Item "$root\THIRD-PARTY-NOTICES.md" "$legal\SecondRevision-THIRD-PARTY-NOTICES.md" -Force
+foreach ($f in @('libxess-LICENSE.txt', 'libxess-third-party-programs.txt')) {
+    Copy-Item "$root\build\Release\$f" $legal -Force
+}
 # EZ-Tree's leaf cards (scripts/make_leaf_cards.py), which the grown trees' leaves are drawn in.
-Copy-Item "$root\assets\SecondRevision-leafcards.bin" $sys -Force
-# The bark photographed (scripts/make_bark.py).
-Copy-Item "$root\assets\SecondRevision-bark.bin" $sys -Force
+Copy-Item "$root\assets\SecondRevision-leafcards.bin" $assets -Force
+# The bark photographed and its relief's height map (scripts/make_bark.py).
+Copy-Item "$root\assets\SecondRevision-bark.bin" $assets -Force
+Copy-Item "$root\assets\SecondRevision-barkheight.bin" $assets -Force
+Copy-Item "$root\assets\SecondRevisionWetSurfaces.txt" $assets -Force
+Copy-Item "$root\assets\SecondRevisionLampSurfaces.txt" $assets -Force
 # The host and the DLLs the upscale and frame generation need, in a folder of their own: they are 64-bit, and nothing in
 # the game's own folder should take them for its own. nvngx_dlss.dll and nvngx_dlssg.dll are NVIDIA's DLSS models - the
-# upscaler's and frame generation's - for AntiAliasing=DLSS; libxess.dll is Intel's XeSS, for AntiAliasing=XeSS, with its
-# licence and its third-party list beside it, as Intel's terms ask.
-$hostDir = Join-Path $sys "SecondRevisionHost64"
-New-Item -ItemType Directory -Force -Path $hostDir | Out-Null
+# upscaler's and frame generation's - for AntiAliasing=DLSS; libxess.dll is Intel's XeSS, for AntiAliasing=XeSS.
 foreach ($f in @('SecondRevisionHost64.exe', 'amd_fidelityfx_loader_dx12.dll', 'amd_fidelityfx_upscaler_dx12.dll',
-                 'amd_fidelityfx_framegeneration_dx12.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll', 'libxess.dll',
-                 'libxess-LICENSE.txt', 'libxess-third-party-programs.txt')) {
+                 'amd_fidelityfx_framegeneration_dx12.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll', 'libxess.dll')) {
     Copy-Item "$root\build\Release\$f" $hostDir -Force
 }
 if ($DlssDev) {

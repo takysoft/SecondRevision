@@ -29,6 +29,11 @@ void  RdxWaterNoteTile(const FSceneNode* Frame, FLOAT X, FLOAT Y, FLOAT XL, FLOA
 // too, a liquid's border or not (the census finds them, RdxMath::FountainFootInPool): its run carries the fountain's
 // foot where the texture's own waves' numbers go - the constants' 24 below zero says so (RdxMath::FountainPoolSheet).
 UBOOL RdxWaterSheet(const FSceneNode* Frame, const FSurfaceInfo& Surface, const FSurfaceFacet& Facet, FLOAT* Consts);
+// The level's surface whose texture mapping a piece of a water's surface is drawn with, or -1 for its own: where one
+// water's surface is made of several of the level's surfaces wearing the same texture laid on differently - a pool's
+// side piece turned against the rest - each piece is drawn as the largest lays the texture on (the census at the level's
+// start), so the texture and its waves go on unbroken over the seams between them.
+INT   RdxWaterLeadOf(const UModel* Model, INT iSurf);
 // The water a point lies in, for a waterfall's colour (RenderDevice, the fall run): the zone there, and if it is water,
 // its hue as the water's own surface takes it (RdxWaterSheet) - the zone's view fog, only its hue, the brightest channel
 // 1. False where the point is not in water.
@@ -55,6 +60,10 @@ INT RdxWaterRippleSources(const FSceneNode* Frame, FLOAT* Out, INT Max);
 // RdxWaterRippleSources whenever it runs, and gone half a second after it last did. For the rings the water's own
 // shader draws (SolidPass.hlsl, WaterRainRings).
 FLOAT RdxWaterRainThick();
+// How thick the game's rain is falling on the floors around the camera, 0 none to 1: its raindrops falling within the
+// ripples' reach of it (RdxMath::FloorRainFullDrops the full rain), evened out over half a second of the level's clock.
+// For the wet floors' puddles' rings (WetReflect.hlsl, RainRingsAt), wherever there is water or not. Once a frame.
+FLOAT RdxFloorRainThick(ULevel* Level, const FVector& Cam);
 // How much of a lamp's glare comes to the camera where a level water surface lies between the two - 1 where none
 // does: the engine asks only the level's solid things whether a lamp is in sight. A surface the level draws
 // see-through by what it lets through at that angle (RdxMath::WaterLampThrough); one it draws solid - the sewer's

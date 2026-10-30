@@ -73,6 +73,10 @@ public:
     void DrawRendererMenu();
     // What the picture runs with, from the preset and the custom set - see RenderDevice.cpp.
     UBOOL ApplyPreset(RdxMath::EPreset P);
+    // The same for a picture of any values: the custom set put back (ShotPairFrame).
+    UBOOL ApplyPicture(const RdxMath::FPresetPicture& S);
+    // Screenshot=On: the pair of pictures Shift with the menu key takes, a step a frame - see RenderDevice.cpp.
+    void ShotPairFrame();
     // The settings file: written whole from its template on a first start (bWhole), else each key's line set to
     // what the renderer has now.
     UBOOL SaveSettings(UBOOL bWhole);
@@ -100,8 +104,12 @@ public:
     UBOOL   EndlessWater;         // the sea on past the level's sky windows, to the horizon
     UBOOL   Fire3D;               // the fires' flame sheets as a body of flame (docs/terv-3d-tuz.md)
     FString Grass3D;              // blades of grass on the level's grass, in the wind: Off, Low, Medium or High
-    UBOOL   Trees3D;              // the game's trees and bushes grown again by code (TreeGen.h)
+    FString Trees3D;              // the game's trees and bushes grown again by code (TreeGen.h): Off, Low, Medium or High
+    UBOOL   Spherifier;           // the level's and the models' round shapes rounded (Spherify.h)
+    INT     SpherifierDistance;   // the most it moves a wall, in the level's units - the settings file's alone
+    INT     SpherifierAngle;      // the sharpest angle between two faces it still rounds, degrees - the file's alone
     UBOOL   Wind;                 // the rain leaning with the level's wind, and the dust in it
+    UBOOL   Puddles;              // the floors outdoors wet in the rain
     UBOOL   FogRooms;             // the level's fog kept in the room it belongs to, laid by the renderer (FFogRooms)
     FString ForceField;          // the game's force fields drawn as arcs of light: Engine, Arcs or 3D
     FString Flashlight;          // the game's flashlight (Original), a cone from the eye in its place (Fixed), and a

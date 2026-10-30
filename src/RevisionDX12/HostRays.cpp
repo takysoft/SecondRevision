@@ -90,6 +90,8 @@ FHostRayFeed::FHostRayFeed()
     FactorW       = FactorH = 0;
     AskW          = AskH = 0;
     bStaticCopied = 0;
+    ArenaCopied   = 0;
+    ArenaCopiedGen = -1;
     ShareSerial   = 0;
     FrameSerial   = 0;
     SceneCopiedAt = -1;
@@ -136,12 +138,16 @@ void FHostRayFeed::Release()
     ListMapped = nullptr;
     HeadsRtvHeap.Release();
     Heads.Release();
+    Low.Release();
+    LowState    = D3D12_RESOURCE_STATE_COMMON;
+    bLowRefused = 0;
     ListBack.Release();
     ListBackAt = -1;
     for (INT f = 0; f < BACKEND_FRAME_COUNT; f++)
     {
         ListBackCount[f]  = 0;
         PassedBackMask[f] = 0;
+        LowBackMask[f]    = 0;
     }
     StaticSerial  = -1;
     FrameBytes    = ArenaBytes = 0;
@@ -151,6 +157,8 @@ void FHostRayFeed::Release()
     WaterRoom     = MaterialRoom = 0;
     PassedRoom    = 0;
     bStaticCopied = 0;
+    ArenaCopied   = 0;
+    ArenaCopiedGen = -1;
     HeadsState    = AskedState = AnswersState = PassedState = D3D12_RESOURCE_STATE_COMMON;
     bRefused      = 0;
 }
@@ -162,6 +170,8 @@ void FHostRayFeed::Abandon()
     Retire();
     StaticSerial  = -1;
     bStaticCopied = 0;
+    ArenaCopied   = 0;
+    ArenaCopiedGen = -1;
     bRefused      = 0;
 }
 
@@ -173,13 +183,13 @@ void FHostRayFeed::Tick()
             Old[i].Release();
 }
 
-// The share's resources into the old ones' places - the shared ones, and this process's own three that go with a
-// share: the frames in flight draw with the pixels' heads and copy out of the list's upload buffer as they copy into
-// what is shared, and none of it may be let go under them. False: no room there - older shares still wait - and
-// nothing is moved.
+// The share's resources into the old ones' places - the shared ones, and this process's own that go with a share:
+// the frames in flight draw with the pixels' heads and RTLow's own list, and copy out of the list's upload buffer as
+// they copy into what is shared, and none of it may be let go under them. False: no room there - older shares still
+// wait - and nothing is moved.
 UBOOL FHostRayFeed::Retire()
 {
-    INT Held = (Heads ? 1 : 0) + (HeadsRtvHeap ? 1 : 0) + (ListUpload ? 1 : 0), Free = 0;
+    INT Held = (Heads ? 1 : 0) + (HeadsRtvHeap ? 1 : 0) + (ListUpload ? 1 : 0) + (Low ? 1 : 0), Free = 0;
     for (INT r = 0; r < Host64::Ray_Count; r++)
         Held += Shared[r] ? 1 : 0;
     for (INT i = 0; i < OLD_ROOM; i++)
@@ -220,9 +230,39 @@ UBOOL FHostRayFeed::Retire()
         Keep(ListUpload.Get());
         ListUpload.Release();
     }
-    ListRoom   = 0;
-    PassedRoom = 0;
-    HeadsState = AskedState = AnswersState = PassedState = D3D12_RESOURCE_STATE_COMMON;
+    if (Low)
+    {
+        Keep(Low.Get());
+        Low.Release();
+    }
+    ListRoom    = 0;
+    PassedRoom  = 0;
+    HeadsState  = AskedState = AnswersState = PassedState = LowState = D3D12_RESOURCE_STATE_COMMON;
+    bLowRefused = 0;
+    return 1;
+}
+
+UBOOL FHostRayFeed::EnsureLow(ID3D12Device* Device)
+{
+    if (Low)
+        return 1;
+    if (!Device || !HasList() || bLowRefused)
+        return 0;
+    D3D12_HEAP_PROPERTIES Own;
+    appMemzero(&Own, sizeof(Own));
+    Own.Type = D3D12_HEAP_TYPE_DEFAULT;
+    const D3D12_RESOURCE_DESC Desc = RayListDesc((UINT64)ListRoom * RDX_RAY_SLOT_BYTES);
+    if (FAILED(Device->CreateCommittedResource(&Own, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               __uuidof(ID3D12Resource), Low.VoidSlot())))
+    {
+        Low.Release();
+        bLowRefused = 1;
+        RdxLog(TEXT("rays (RTLow): the card refused the own list (%.0f MB) - every ray asked is traced, as at RT"),
+               (DOUBLE)Desc.Width / (1024.0 * 1024.0));
+        return 0;
+    }
+    LowState = D3D12_RESOURCE_STATE_COMMON;
+    RdxLog(TEXT("rays (RTLow): the own list made - %i slots, %.0f MB"), ListRoom, (DOUBLE)Desc.Width / (1024.0 * 1024.0));
     return 1;
 }
 
@@ -353,7 +393,7 @@ UBOOL FHostRayFeed::MakeShare(ID3D12Device* Device, FHost64Link& Link, const FRt
     // shaders write, and the answers', which the host's pass writes - the same length, a slot a ray. The pixels'
     // heads are this side's alone. The share before took its own with it (Retire); should any of them still be
     // here, no share is made over it - making one would let it go under the frames in flight.
-    if (Heads || HeadsRtvHeap || ListUpload)
+    if (Heads || HeadsRtvHeap || ListUpload || Low)
         return 0;
     ListMapped = nullptr;
     ListRoom   = 0;
@@ -467,6 +507,8 @@ UBOOL FHostRayFeed::MakeShare(ID3D12Device* Device, FHost64Link& Link, const FRt
     AskW          = Views.AskW;
     AskH          = Views.AskH;
     bStaticCopied = 0;
+    ArenaCopied   = 0;
+    ArenaCopiedGen = -1;
     SceneCopiedAt = -1;
     SceneHandedAt = -1;
     bRefused      = 0;
@@ -497,8 +539,10 @@ void FHostRayFeed::CopyScene(ID3D12GraphicsCommandList* Cmd, const FRtPass& Rt, 
                                       (UINT64)StaticVertices[k] * 12);
         bStaticCopied = 1;
     }
-    // The arena all of it as far as it is in use, every time: a body's texture places there may be written after its
-    // positions.
+    // The frame's bodies all of them, every time: a body's texture places there may be written after its positions.
+    // The arena only as far as it is new to this share: a shape goes into it once, its positions and its texture
+    // places together where its room is handed out (FShadowMaps::ArenaAlloc), and nothing in it changes until the
+    // arena is emptied - a new ArenaGen, and then all of it again.
     const UINT64 FrameUsed = Min<UINT64>((UINT64)Shadow.GetFrameVertices() * 12, FrameBytes);
     const UINT64 ArenaUsed = Min<UINT64>((UINT64)Shadow.GetArenaVertices() * 12, ArenaBytes);
     if (FrameUsed && Shadow.GetCasterBuffer(0, 0) && Shadow.GetCasterBuffer(0, 1))
@@ -506,10 +550,17 @@ void FHostRayFeed::CopyScene(ID3D12GraphicsCommandList* Cmd, const FRtPass& Rt, 
         Cmd->CopyBufferRegion(Shared[Host64::Ray_FrameXyz].Get(), 0, Shadow.GetCasterBuffer(0, 0), 0, FrameUsed);
         Cmd->CopyBufferRegion(Shared[Host64::Ray_FrameUvw].Get(), 0, Shadow.GetCasterBuffer(0, 1), 0, FrameUsed);
     }
-    if (ArenaUsed && Shared[Host64::Ray_ArenaXyz])
+    if (ArenaCopiedGen != Shadow.GetArenaGen() || ArenaCopied > ArenaUsed)
     {
-        Cmd->CopyBufferRegion(Shared[Host64::Ray_ArenaXyz].Get(), 0, Shadow.GetCasterBuffer(1, 0), 0, ArenaUsed);
-        Cmd->CopyBufferRegion(Shared[Host64::Ray_ArenaUvw].Get(), 0, Shadow.GetCasterBuffer(1, 1), 0, ArenaUsed);
+        ArenaCopied    = 0;
+        ArenaCopiedGen = Shadow.GetArenaGen();
+    }
+    if (ArenaUsed > ArenaCopied && Shared[Host64::Ray_ArenaXyz])
+    {
+        const UINT64 At = ArenaCopied, New = ArenaUsed - ArenaCopied;
+        Cmd->CopyBufferRegion(Shared[Host64::Ray_ArenaXyz].Get(), At, Shadow.GetCasterBuffer(1, 0), At, New);
+        Cmd->CopyBufferRegion(Shared[Host64::Ray_ArenaUvw].Get(), At, Shadow.GetCasterBuffer(1, 1), At, New);
+        ArenaCopied = ArenaUsed;
     }
 }
 
@@ -608,34 +659,45 @@ UBOOL FHostRayFeed::Feed(ID3D12GraphicsCommandList* Cmd, FHost64Link& Link, cons
     return 1;
 }
 
-UBOOL FHostRayFeed::BeginAsk(ID3D12GraphicsCommandList* Cmd)
+UBOOL FHostRayFeed::BeginAsk(ID3D12GraphicsCommandList* Cmd, UBOOL bLow)
 {
-    if (!Cmd || !HasList() || !HeadsRtvHeap || !ListMapped)
+    if (!Cmd || !HasList() || !HeadsRtvHeap || !ListMapped || (bLow && !Low))
         return 0;
     // The answers of the hand-over before, if this side still reads them: back as they change hands.
     ListReadable(Cmd, 0);
     ID3D12Resource* const Asked = GetRequests();
-    D3D12_RESOURCE_BARRIER B[2];
+    D3D12_RESOURCE_BARRIER B[3];
     RayBarrier(B[0], Heads.Get(), HeadsState, D3D12_RESOURCE_STATE_RENDER_TARGET);
     RayBarrier(B[1], Asked, AskedState, D3D12_RESOURCE_STATE_COPY_DEST);
-    Cmd->ResourceBarrier(2, B);
-    // No block at any pixel, and the count back at its start.
+    if (bLow)
+        RayBarrier(B[2], Low.Get(), LowState, D3D12_RESOURCE_STATE_COPY_DEST);
+    Cmd->ResourceBarrier(bLow ? 3 : 2, B);
+    // No block at any pixel, and the count back at its start - the own list's too, which the pixels write into.
     static const FLOAT None[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     Cmd->ClearRenderTargetView(HeadsRtvHeap->GetCPUDescriptorHandleForHeapStart(), None, 0, nullptr);
     Cmd->CopyBufferRegion(Asked, 0, ListUpload.Get(), ListStartAt, RDX_RAY_SLOT_BYTES);
+    if (bLow)
+        Cmd->CopyBufferRegion(Low.Get(), 0, ListUpload.Get(), ListStartAt, RDX_RAY_SLOT_BYTES);
     RayBarrier(B[0], Heads.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     RayBarrier(B[1], Asked, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    Cmd->ResourceBarrier(2, B);
+    if (bLow)
+        RayBarrier(B[2], Low.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    Cmd->ResourceBarrier(bLow ? 3 : 2, B);
     HeadsState = AskedState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (bLow)
+        LowState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     return 1;
 }
 
 UBOOL FHostRayFeed::FeedList(ID3D12GraphicsCommandList* Cmd, FHost64Link& Link, const FRtPass& Rt, FShadowMaps& Shadow,
-                             INT FrameIndex, INT Bodies, INT OwnBody)
+                             INT FrameIndex, INT Bodies, INT OwnBody, UBOOL bLow)
 {
     if (!Cmd || !HasList())
         return 0;
+    bLow = (bLow && Low) ? 1 : 0;
     // The requests as they change hands and the heads readable, whatever comes of the rest: BeginAsk took them out.
+    // RTLow's own list stays this side's: the pass that read it is done, the build that reads the answers finds its
+    // blocks in it - readable once the count is read back below.
     D3D12_RESOURCE_BARRIER B[2];
     RayBarrier(B[0], Heads.Get(), HeadsState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     RayBarrier(B[1], GetRequests(), AskedState, D3D12_RESOURCE_STATE_COMMON);
@@ -646,17 +708,37 @@ UBOOL FHostRayFeed::FeedList(ID3D12GraphicsCommandList* Cmd, FHost64Link& Link, 
     ListBackAt = -1;
     if (!Frame || Bodies > BodyRoom || !ListMapped || FrameIndex < 0 || FrameIndex >= BACKEND_FRAME_COUNT)
         return 0;
-    // How many slots the hand-over took, for NoteListTaken a few frames on.
+    // How many slots the hand-over took, for NoteListTaken a few frames on. Where the pixels wrote into the own list
+    // (RTLow) that one's count - what the buffers have to hold - with the host's beside it, in its third uint: of the
+    // requests asked, the ones the host traces.
     if (ListBack && ListBackCount[FrameIndex] < LIST_BACK_MOST)
     {
         ListBackAt = ListBackCount[FrameIndex]++;
         RayBarrier(B[0], GetRequests(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Cmd->ResourceBarrier(1, B);
+        if (bLow)
+        {
+            RayBarrier(B[1], Low.Get(), LowState, D3D12_RESOURCE_STATE_COPY_DEST);
+            Cmd->ResourceBarrier(1, &B[1]);
+            Cmd->CopyBufferRegion(Low.Get(), 8, GetRequests(), 0, 4);
+            RayBarrier(B[1], Low.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Cmd->ResourceBarrier(1, &B[1]);
+            LowState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            LowBackMask[FrameIndex] |= 1u << ListBackAt;
+        }
+        else
+            LowBackMask[FrameIndex] &= ~(1u << ListBackAt);
         Cmd->CopyBufferRegion(ListBack.Get(),
                               (UINT64)RDX_RAY_SLOT_BYTES * 2 * (LIST_BACK_MOST * FrameIndex + ListBackAt),
-                              GetRequests(), 0, RDX_RAY_SLOT_BYTES);
+                              bLow ? Low.Get() : GetRequests(), 0, RDX_RAY_SLOT_BYTES);
         RayBarrier(B[0], GetRequests(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Cmd->ResourceBarrier(1, B);
+    }
+    if (bLow)
+    {
+        RayBarrier(B[1], Low.Get(), LowState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Cmd->ResourceBarrier(1, &B[1]);
+        LowState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
     CopyScene(Cmd, Rt, Shadow);
     if (ID3D12Resource* const Masks = Shared[Host64::Ray_Masks].Get())
@@ -784,8 +866,10 @@ void FHostRayFeed::NoteListTaken(INT FrameIndex)
         return;
     const INT  Handovers = ListBackCount[FrameIndex];
     const UINT PassedOf  = PassedBackMask[FrameIndex];
+    const UINT LowOf     = LowBackMask[FrameIndex];
     ListBackCount[FrameIndex]  = 0;
     PassedBackMask[FrameIndex] = 0;
+    LowBackMask[FrameIndex]    = 0;
     const SIZE_T      At   = (SIZE_T)RDX_RAY_SLOT_BYTES * 2 * LIST_BACK_MOST * FrameIndex;
     const D3D12_RANGE Read = { At, At + (SIZE_T)RDX_RAY_SLOT_BYTES * 2 * Handovers };
     const D3D12_RANGE None = { 0, 0 };
@@ -796,17 +880,21 @@ void FHostRayFeed::NoteListTaken(INT FrameIndex)
     // of them is what the buffers have to hold, and the frame's together go to the log. A count that is no count -
     // the buffer's first use, a hand-over that never asked - is none.
     DWORD Taken = 0, Past = 0;
-    INT64 Asked = 0, Passed = 0;
+    INT64 Asked = 0, Passed = 0, Traced = 0;
     for (INT k = 0; k < Handovers; k++)
     {
         const BYTE* const Two = Back + Read.Begin + (SIZE_T)RDX_RAY_SLOT_BYTES * 2 * k;
         const DWORD T = *(const DWORD*)Two;
         const DWORD P = (PassedOf & (1u << k)) ? *(const DWORD*)(Two + RDX_RAY_SLOT_BYTES) : 0u;
+        // RTLow's: the host's count beside the own list's (FeedList).
+        const DWORD H = (LowOf & (1u << k)) ? ((const DWORD*)Two)[2] : T;
         if (T >= 1 && T <= 0x40000000u)
         {
             Taken  = Max(Taken, T);
             Asked += (INT64)T - 1;
             Counts.Each[k] += (INT64)T - 1;
+            if (H >= 1 && H <= T)
+                Traced += (INT64)H - 1;
         }
         if (P >= 1 && P <= 0x40000000u)
         {
@@ -819,6 +907,7 @@ void FHostRayFeed::NoteListTaken(INT FrameIndex)
     Counts.Handovers += Handovers;
     Counts.Asked     += Asked;
     Counts.Passed    += Passed;
+    Counts.Traced    += Traced;
     Counts.AskedMost  = Max(Counts.AskedMost, (INT)Min<INT64>(Asked, 0x7FFFFFFF));
     Counts.PassedMost = Max(Counts.PassedMost, (INT)Min<INT64>(Passed, 0x7FFFFFFF));
     const INT64 Pixels = (INT64)AskW * AskH;

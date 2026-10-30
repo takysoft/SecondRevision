@@ -132,9 +132,22 @@ enum EKind
 {
     Kind_Tree1, Kind_Tree2, Kind_Tree3, Kind_Tree4, Kind_Bush1, Kind_Bush2, Kind_Bush3,
     Kind_Small,         // a small tree of the level's own, Revision's crossed foliage sheets, grown again
+    Kind_Rose,          // the long-stemmed flowers of a bed in the level's sheets, grown again as a shrub rose
+    Kind_RoseYellow,    // the bed's yellow ones: the same shrub rose, its petals yellow (DrawRoseYellowPetals)
+    Kind_Lily,          // the bed's orange lilies (pflanzentex149): leafy stems, a flower of six petals at each top
+    Kind_Pink,          // the bed's pale pink flowers (pflanzentex148): long thin stems among grassy leaves
+    Kind_Fern,          // a bed's fern (pflanzentex143, 145, 146): fronds arching out from its foot
     Kind_Count
 };
-inline bool IsBush(EKind Kind) { return Kind >= Kind_Bush1 && Kind <= Kind_Bush3; }
+// A shrub rose: canes from its foot, its leaves of five leaflets each, its flowers at the canes' ends (RoseLeaves).
+inline bool IsRose(EKind Kind) { return Kind == Kind_Rose || Kind == Kind_RoseYellow; }
+// A bed's flower or fern grown stem by stem (StemPlant), not into a crown - its leaves and petals in a sheet of their own
+// (DrawStemSheet).
+inline bool IsStemPlant(EKind Kind) { return Kind == Kind_Lily || Kind == Kind_Pink || Kind == Kind_Fern; }
+inline bool IsBush(EKind Kind)
+{
+    return (Kind >= Kind_Bush1 && Kind <= Kind_Bush3) || IsRose(Kind) || IsStemPlant(Kind);
+}
 
 struct FShape
 {
@@ -195,6 +208,15 @@ inline FShape ShapeOf(EKind Kind, float Height, float Radius)
         case Kind_Small:    // a small tree in a bed: a slim trunk, a light round crown
             S.CrownBase = 0.35f; S.Widest = 0.50f; S.Lobes = 0.20f; S.Up = 0.30f; S.Lean = 0.06f;
             break;
+        case Kind_Rose:     // a shrub rose: canes leaning out from its foot, a low round head, uneven
+        case Kind_RoseYellow:
+            S.CrownBase = 0.08f; S.Widest = 0.55f; S.Lobes = 0.30f; S.Up = 0.55f; S.Lean = 0.35f;
+            break;
+        case Kind_Lily:     // stems from one foot, laid one by one (StemPlant): no crown to fill
+        case Kind_Pink:
+        case Kind_Fern:
+            S.CrownBase = 0.05f; S.Widest = 0.60f; S.Lobes = 0.0f; S.Up = 0.50f; S.Lean = 0.20f;
+            break;
         default:            // a low, spreading one
             S.CrownBase = 0.03f; S.Widest = 0.40f; S.Lobes = 0.26f; S.Up = 0.10f; S.Lean = 0.45f;
             break;
@@ -216,6 +238,12 @@ inline FShape ShapeOf(EKind Kind, float Height, float Radius)
     S.Points   = Points;
     S.LeafSize  = bBush ? S.Height * 0.065f : S.Height * 0.022f;
     S.LeafEvery = 7.0f;
+    // A rose's leaflet is small, five of them to a leaf (RoseLeaves), and its leaves sparser than a bush's.
+    if (IsRose(Kind))
+    {
+        S.LeafSize  = S.Height * 0.05f;
+        S.LeafEvery = 3.0f;
+    }
     // A trimmed hedge's leaves are small, as the cutting makes them (SkinLeaves lays them).
     if (S.Box > 0.0f)
         S.LeafSize *= 0.8f;
@@ -300,13 +328,42 @@ struct FLeaf
     float Droop;        // how far its tip hangs, of its length: 0 .. 0.4
 };
 
+// A shrub rose's flower (RoseLeaves): its head one sheet wound round its axis from the outermost petal in, the petals
+// lobes of it (FlowerHeadsOf) - drawn as the wood is, it moves as one with the twig it ends.
+struct FFlower
+{
+    FVec  At;           // its heart: the twig's end
+    FVec  Up;           // the way it opens to
+    FVec  Across;       // a way across it, at right angles to Up
+    float Size;         // a petal's length
+    float Spin;         // where its sheet starts round the axis, radians
+    int   Node;         // the twig it ends
+    int   Picture;      // the leaf sheet's petal picture it takes its colour from, 6 or 7
+    bool  bBud;         // a bud: its petals closed
+};
+
 struct FPlant
 {
-    FShape       Shape;
-    FOutline     Outline;
-    TList<FNode> Nodes;
-    TList<FLeaf> Leaves;
+    FShape         Shape;
+    FOutline       Outline;
+    TList<FNode>   Nodes;
+    TList<FLeaf>   Leaves;
+    TList<FFlower> Flowers;
 };
+
+// A rose's head (FlowerHeadsOf): one sheet swept round the flower's axis from its outermost petal (K = 0) to its
+// innermost (K = 1), Turns times round, the petals lobes along it - RosePerTurn a turn, each as long as the flower's
+// petal in its middle and three quarters of that at its edges, the rim scalloped. Across the sheet a petal runs from
+// the heart (S = 0) out to its rim (S = 1), leaning out from the axis by Lean at the outermost petal and less by the
+// turn towards the heart (by e to the minus LeanFall over the whole), the innermost upright; it is bowed out as a cup,
+// by RoseCup of its length at its middle, the less the more upright it stands. A turn further in leans less, so it lies
+// nearer the axis at every height: the sheet never goes through itself. A bud: fewer turns, all of them near upright.
+static const float RoseTurns = 7.0f, RosePerTurn = 3.6f, RoseLean = 0.95f, RoseLeanFall = 2.5f, RoseCup = 0.5f;
+static const float BudTurns = 3.0f, BudLean = 0.3f, BudLeanFall = 1.2f;
+// The head's grid: steps along the sheet a petal, and across it from the heart to the rim.
+enum { RosePetalSteps = 6, RoseAcrossSteps = 6 };
+// A rose's leaves along a twig, on average (RoseLeaves) - fewer than a bush's two.
+static const float RoseLeavesAlong = 1.2f;
 
 // How much of its parent's girth a fork's thickest child keeps at least, a step (FShape::Step) on.
 static const float LeaderKeeps = 0.88f;
@@ -456,6 +513,288 @@ inline bool SkinLeaves(const FShape& S, FRandom& R, FPlant& Out, const FGrid& Gr
     return true;
 }
 
+// A shrub rose's leaves and flowers (IsRose), on the thin twigs as a tree's leaves are. Each side twig is a leaf's stalk:
+// two pairs of leaflets along it and one at its end, all five in one plane, turned to the sky. At the end of a twig high
+// in the head, a flower more often than not, now and then a bud (FFlower; its head made by FlowerHeadsOf). The leaflets
+// are the leaf sheet's pictures 4 and 5 (DrawLeaves), the flowers take their colour from its petals, 6 and 7; a rose's
+// blades are as wide as long (the renderer's width share), its leaflets narrower within their pictures.
+inline bool RoseLeaves(const FShape& S, FRandom& R, FPlant& Out, FGrid& Grid)
+{
+    const float Base  = S.CrownBase * S.Height;
+    const int   Grown = Out.Nodes.Num;
+    // The leaves as they are drawn, made after the flowers are known: a leaf any leaflet of which lies in a flower's
+    // head - within the head's reach of where it sits and no lower than it, by the leaflet's own size - is left out (a
+    // flower's twig puts out its own leaves at its tip, right in the head). Its stalk stays, bare: a stalk is drawn
+    // under its leaves by no wood of its own (Build), but the twig it grows from is drawn on to its tip only for a
+    // child there - without it, the twig under a flower would end short of it. The draws stay in their order.
+    struct FStalk
+    {
+        int   Parent, Branch;
+        FVec  End;
+        FLeaf Leaflets[5];
+    };
+    TList<FStalk> Stalks;
+    for (int i = 0; i < Grown; i++)
+    {
+        const FNode N = Out.Nodes[i];
+        if (N.Radius > S.Twig * 3.5f || N.At.Z < Base * 0.85f || N.Parent < 0)
+            continue;
+        const FVec Twig = Unit(N.At - Out.Nodes[N.Parent].At, Vec(0.0f, 0.0f, 1.0f));
+        const FVec Away = Unit(Vec(N.At.X, N.At.Y, 0.0f), R.Direction());
+        if (N.Children == 0 && N.At.Z > S.Height * 0.55f && R.Unit() < 0.6f)
+        {
+            FFlower F;
+            F.bBud    = R.Unit() < 0.25f;
+            F.Size    = S.LeafSize * (F.bBud ? 1.1f : 2.4f) * R.Range(0.85f, 1.15f);
+            F.Up      = Unit(Twig + Vec(0.0f, 0.0f, 0.6f), Twig);
+            F.Across  = Unit(Cross(F.Up, Away), Unit(Cross(F.Up, Vec(1.0f, 0.0f, 0.0f)), Vec(0.0f, 1.0f, 0.0f)));
+            F.At      = N.At;
+            F.Spin    = R.Range(0.0f, 6.2831853f);
+            F.Node    = i;
+            F.Picture = 6 + (int)(R.Next() & 1u);
+            if (!Out.Flowers.Add(F))
+                return false;
+        }
+        // The leaves: side twigs, LeafEvery at a twig's tip and RoseLeavesAlong along it, out towards the head's
+        // outside.
+        float Count = (N.Children == 0) ? S.LeafEvery : RoseLeavesAlong;
+        while (Count > 0.0f)
+        {
+            if (Count < 1.0f && R.Unit() > Count)
+                break;
+            Count -= 1.0f;
+            const FVec  Dir  = Unit(Twig * 0.5f + Away * 0.7f + Vec(0.0f, 0.0f, 0.2f) + R.Direction() * 0.5f, Twig);
+            const float Long = S.LeafSize * R.Range(2.0f, 2.6f);
+            FStalk      St;
+            St.Parent = i;
+            St.Branch = Out.Nodes[i].Branch;
+            St.End    = N.At + Dir * Long;
+            int        Made   = 0;
+            const FVec Across = Unit(Cross(Dir, Vec(0.0f, 0.0f, 1.0f)), Away);
+            for (int k = 0; k <= 2; k++)
+            {
+                const bool  bEnd = (k == 2);
+                const float T    = bEnd ? 1.0f : 0.35f + 0.3f * (float)k;
+                for (int Hand = (bEnd ? 0 : -1); Hand <= (bEnd ? 0 : 1); Hand += 2)
+                {
+                    FLeaf L;
+                    L.At      = N.At + Dir * (Long * T);
+                    L.Along   = bEnd ? Unit(Dir + R.Direction() * 0.1f, Dir)
+                                     : Unit(Across * (float)Hand + Dir * 0.45f + R.Direction() * 0.1f, Dir);
+                    FVec Face = Vec(0.0f, 0.0f, 1.0f) + R.Direction() * 0.3f;
+                    Face      = Face - L.Along * Dot(Face, L.Along);
+                    L.Face    = Unit(Face, Unit(Cross(L.Along, Vec(1.0f, 0.0f, 0.0f)), Vec(0.0f, 1.0f, 0.0f)));
+                    L.Size    = S.LeafSize * (bEnd ? 1.15f : 1.0f) * R.Range(0.85f, 1.1f);
+                    L.Picture = 4 + (int)(R.Next() & 1u);
+                    L.Node    = -1;
+                    L.Hue     = R.Range(0.0f, 0.15f);
+                    L.Phase   = R.Unit();
+                    L.Fold    = R.Range(0.12f, 0.25f);
+                    L.Droop   = R.Range(0.04f, 0.15f);
+                    St.Leaflets[Made++] = L;
+                }
+            }
+            if (!Stalks.Add(St))
+                return false;
+        }
+    }
+    for (int s = 0; s < Stalks.Num; s++)
+    {
+        const FStalk& St    = Stalks[s];
+        bool          bHead = false;
+        for (int k = 0; k < 5 && !bHead; k++)
+            for (int f = 0; f < Out.Flowers.Num && !bHead; f++)
+            {
+                const FFlower& F    = Out.Flowers[f];
+                const FVec     Off  = St.Leaflets[k].At - F.At;
+                const float    Near = F.Size + St.Leaflets[k].Size;
+                bHead = Dot(Off, Off) < Near * Near && Dot(Off, F.Up) > -St.Leaflets[k].Size;
+            }
+        const int Side = AddNode(Out, Grid, St.End, St.Parent);
+        if (Side < 0)
+            return false;
+        Out.Nodes[Side].Radius = S.Twig * 1.1f;
+        Out.Nodes[Side].Branch = St.Branch;
+        for (int k = 0; k < 5 && !bHead; k++)
+        {
+            FLeaf L = St.Leaflets[k];
+            L.Node  = Side;
+            if (!Out.Leaves.Add(L))
+                return false;
+        }
+    }
+    return true;
+}
+
+// A stem of a plant grown stem by stem (StemPlant): from Foot along Dir (of length one), bowed towards Bend - Bow of its
+// length off the straight line at its tip -, in Count segments, its radius from Thick at its foot to Thin at its tip; its
+// nodes' numbers into Nodes (Count + 1), its foot a root and its whole the beat of its own sway. Thin at least a drawn
+// twig's (Build draws a node with no child from 1.25 twigs on), so the stem reaches its flower. False if memory ran out.
+inline bool AddStem(FPlant& Out, FGrid& Grid, FVec Foot, FVec Dir, FVec Bend, float Length, float Bow, int Count,
+                    float Thick, float Thin, int* Nodes)
+{
+    int Last = -1;
+    for (int k = 0; k <= Count; k++)
+    {
+        const float T = (float)k / (float)Count;
+        const int   n = AddNode(Out, Grid, Foot + Dir * (Length * T) + Bend * (Length * Bow * T * T), Last);
+        if (n < 0)
+            return false;
+        Out.Nodes[n].Radius = Thick + (Thin - Thick) * T;
+        Out.Nodes[n].Branch = (Last < 0) ? n : Out.Nodes[Last].Branch;
+        Nodes[k]            = n;
+        Last                = n;
+    }
+    return true;
+}
+// A blade (a leaf, a frond's leaflet or a petal) of a plant grown stem by stem, at At on node Node, leaning off the way
+// Way by Lean radians towards Out (square to Way), Size long; its face looks back at Way's side - a petal's in at the
+// flower's axis, a leaf's up and in at its stem -, so its fold cups it that way and its droop turns its tip out and down;
+// or, given Look, as near that way as its length lets it - a frond's leaflet lies in the frond, its face up.
+inline bool AddBlade(FPlant& Out, FRandom& R, FVec At, FVec Way, FVec Out1, float Lean, float Size, int Picture, int Node,
+                     float Hue, float Fold, float Droop, const FVec* Look = nullptr)
+{
+    FLeaf L;
+    L.At      = At;
+    L.Along   = Unit(Way * cosf(Lean) + Out1 * sinf(Lean), Way);
+    L.Face    = Look ? Unit(*Look - L.Along * Dot(*Look, L.Along), Way)
+                     : Unit(Way * sinf(Lean) - Out1 * cosf(Lean), Way);
+    L.Size    = Size;
+    L.Picture = Picture;
+    L.Node    = Node;
+    L.Hue     = Hue;
+    L.Phase   = R.Unit();
+    L.Fold    = Fold;
+    L.Droop   = Droop;
+    return Out.Leaves.Add(L);
+}
+// Two ways square to Up, and to each other.
+inline void AcrossOf(FVec Up, FVec& A, FVec& B)
+{
+    A = Unit(Cross(Up, (fabsf(Up.Z) < 0.9f) ? Vec(0.0f, 0.0f, 1.0f) : Vec(1.0f, 0.0f, 0.0f)), Vec(1.0f, 0.0f, 0.0f));
+    B = Cross(Up, A);
+}
+// A flower at the top of a stem (StemPlant): Count petals round its axis Up, each leaning out from it by Open radians -
+// a lily's six, a trumpet, their tips turned back; a pink's five, open as a cup -, the stem's last node theirs.
+inline bool AddFlower(FPlant& Out, FRandom& R, FVec At, FVec Up, int Count, float Open, float Size, int Picture,
+                      int Node, float Fold, float Droop)
+{
+    FVec A, B;
+    AcrossOf(Up, A, B);
+    const float Spin = R.Range(0.0f, 6.2831853f);
+    for (int k = 0; k < Count; k++)
+    {
+        const float Turn = Spin + 6.2831853f * ((float)k + R.Range(-0.08f, 0.08f)) / (float)Count;
+        if (!AddBlade(Out, R, At, Up, A * cosf(Turn) + B * sinf(Turn), Open * R.Range(0.9f, 1.1f),
+                      Size * R.Range(0.9f, 1.1f), Picture, Node, 0.0f, Fold, Droop))
+            return false;
+    }
+    return true;
+}
+
+// A bed's flower or fern of the level's own sheets, grown again stem by stem (IsStemPlant) into the shape's height and
+// half-width - the stems laid as they grow, each its own sway's beat, their leaves along them (DrawStemSheet's
+// pictures; the petals 6 and 7, IsPetal, so a far plant keeps its flowers whole):
+// - a lily (Kind_Lily): two to four leafy stems from one foot, leaning out a little, their leaves lance-shaped round
+//   them a golden angle apart, up and out; at each top a flower of six petals as a trumpet, its petals' tips turned
+//   back, facing out and up;
+// - a pink (Kind_Pink): two or three long thin stems, grassy leaves arching from their lower part, at each top a
+//   flower of five petals open as a cup;
+// - a fern (Kind_Fern): seven to eleven fronds from the foot all round, each rising and arching out to its tip - its
+//   leaflets in pairs along it from a little way up, longest a third of the way, short at the tip, a little forward.
+inline bool StemPlant(const FShape& S, FRandom& R, FPlant& Out, FGrid& Grid)
+{
+    const float H = S.Height, W = S.Radius;
+    int         Nodes[17];
+    if (S.Kind == Kind_Fern)
+    {
+        const int Fronds = 7 + (int)(R.Next() % 5u);
+        const float Spin = R.Range(0.0f, 6.2831853f);
+        for (int f = 0; f < Fronds; f++)
+        {
+            const float Turn = Spin + 6.2831853f * ((float)f + R.Range(-0.3f, 0.3f)) / (float)Fronds;
+            const FVec  Away = Vec(cosf(Turn), sinf(Turn), 0.0f);
+            // Its tip out by a share of the half-width and up by one of the height, bowed down by a quarter of its
+            // length: the length and the way out of the foot that put it there.
+            const float Reach = W * R.Range(0.7f, 1.1f), Rise = H * R.Range(0.55f, 0.95f), Bow = 0.35f;
+            const float Len   = (2.0f * Bow * Rise + sqrtf(4.0f * Bow * Bow * Rise * Rise +
+                                                         4.0f * (1.0f - Bow * Bow) * (Rise * Rise + Reach * Reach))) /
+                                (2.0f * (1.0f - Bow * Bow));
+            const FVec Dir  = Unit(Away * Reach + Vec(0.0f, 0.0f, Rise + Bow * Len), Vec(0.0f, 0.0f, 1.0f));
+            const FVec Down = Vec(0.0f, 0.0f, -1.0f);
+            if (!AddStem(Out, Grid, Away * (W * 0.04f), Dir, Down, Len, Bow, 12, S.Twig * 1.6f, S.Twig * 1.3f, Nodes))
+                return false;
+            const int Pairs = 14 + (int)(R.Next() % 5u);
+            for (int k = 0; k < Pairs; k++)
+            {
+                const float T    = 0.14f + 0.84f * ((float)k + 0.5f) / (float)Pairs;
+                const FVec  At   = Away * (W * 0.04f) + Dir * (Len * T) + Down * (Len * Bow * T * T);
+                const FVec  Way  = Unit(Dir + Down * (2.0f * Bow * T), Dir);
+                const FVec  Side = Unit(Cross(Way, Vec(0.0f, 0.0f, 1.0f)), Vec(-Away.Y, Away.X, 0.0f));
+                const float Long = Len * 0.13f * ((T < 0.33f) ? 0.5f + 0.5f * T / 0.33f
+                                                               : 1.0f - 0.8f * powf((T - 0.33f) / 0.67f, 1.4f));
+                const int   Node = Nodes[(int)(T * 12.0f)];
+                // The frond's own plane's face, up.
+                FVec Up = Cross(Way, Side);
+                Up      = (Up.Z < 0.0f) ? Up * -1.0f : Up;
+                for (int Hand = -1; Hand <= 1; Hand += 2)
+                {
+                    // Out to its side and a little forward: leaning off the way along the frond by most of a right
+                    // angle, in the frond's plane.
+                    if (!AddBlade(Out, R, At, Way, Side * (float)Hand, R.Range(0.95f, 1.15f), Long * R.Range(0.9f, 1.1f),
+                                  3 + (int)(R.Next() % 3u), Node, R.Range(0.0f, 0.2f), R.Range(0.05f, 0.15f),
+                                  R.Range(0.04f, 0.12f), &Up))
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+    const bool bLily  = (S.Kind == Kind_Lily);
+    const int  Stems  = bLily ? 2 + (int)(R.Next() % 3u) : 2 + (int)(R.Next() % 2u);
+    const float Spin  = R.Range(0.0f, 6.2831853f);
+    for (int t = 0; t < Stems; t++)
+    {
+        const float Turn = Spin + 6.2831853f * ((float)t + R.Range(-0.25f, 0.25f)) / (float)Stems;
+        const FVec  Away = Vec(cosf(Turn), sinf(Turn), 0.0f);
+        const FVec  Foot = Away * (W * R.Range(0.0f, bLily ? 0.2f : 0.15f));
+        const FVec  Dir  = Unit(Vec(0.0f, 0.0f, 1.0f) + Away * R.Range(0.05f, bLily ? 0.2f : 0.15f), Away);
+        const float Len  = H * R.Range(0.75f, 1.0f);
+        const float Bow  = R.Range(0.03f, 0.08f);
+        if (!AddStem(Out, Grid, Foot, Dir, Away, Len, Bow, 8, S.Twig * (bLily ? 2.0f : 1.5f),
+                     S.Twig * (bLily ? 1.5f : 1.3f), Nodes))
+            return false;
+        auto WayAt = [&](float T) { return Unit(Dir + Away * (2.0f * Bow * T), Dir); };
+        auto At    = [&](float T) { return Foot + Dir * (Len * T) + Away * (Len * Bow * T * T); };
+        // Its leaves.
+        const int   Leaves = bLily ? 8 + (int)(R.Next() % 4u) : 3 + (int)(R.Next() % 3u);
+        float       Round  = R.Range(0.0f, 6.2831853f);
+        for (int l = 0; l < Leaves; l++)
+        {
+            const float T   = bLily ? 0.12f + 0.7f * ((float)l + R.Range(0.0f, 0.6f)) / (float)Leaves
+                                    : 0.02f + 0.4f * ((float)l + R.Range(0.0f, 0.6f)) / (float)Leaves;
+            const FVec  Way = WayAt(T);
+            FVec        A, B;
+            AcrossOf(Way, A, B);
+            Round += 2.39996f;
+            const FVec Out1 = A * cosf(Round) + B * sinf(Round);
+            const int  Node = Nodes[(int)(T * 8.0f)];
+            if (bLily ? !AddBlade(Out, R, At(T), Way, Out1, R.Range(0.6f, 0.95f), H * 0.2f * (1.0f - 0.35f * T) *
+                                  R.Range(0.85f, 1.1f), (int)(R.Next() & 1u), Node, R.Range(0.0f, 0.2f),
+                                  R.Range(0.25f, 0.4f), R.Range(0.1f, 0.25f))
+                      : !AddBlade(Out, R, At(T), Way, Out1, R.Range(0.25f, 0.5f), H * R.Range(0.28f, 0.42f), 2, Node,
+                                  R.Range(0.05f, 0.35f), R.Range(0.1f, 0.2f), R.Range(0.25f, 0.4f)))
+                return false;
+        }
+        // Its flower, facing out and up.
+        const FVec Up = Unit(WayAt(1.0f) * (bLily ? 0.7f : 0.85f) + Away * (bLily ? 0.7f : 0.4f), Dir);
+        if (bLily ? !AddFlower(Out, R, At(1.0f), Up, 6, 0.7f, H * 0.13f, 6, Nodes[8], 0.3f, 0.3f)
+                  : !AddFlower(Out, R, At(1.0f), Up, 5, 1.15f, H * 0.075f, 7, Nodes[8], 0.2f, 0.12f))
+            return false;
+    }
+    return true;
+}
+
 inline bool Grow(const FShape& S, unsigned int Seed, FPlant& Out, FGrid& Grid)
 {
     FRandom R(Seed);
@@ -463,7 +802,10 @@ inline bool Grow(const FShape& S, unsigned int Seed, FPlant& Out, FGrid& Grid)
     Out.Outline = OutlineOf(S, R);
     Out.Nodes.Clear();
     Out.Leaves.Clear();
+    Out.Flowers.Clear();
     Grid.Reset(S.Reach);
+    if (IsStemPlant(S.Kind))
+        return StemPlant(S, R, Out, Grid);
 
     // The points: evenly in the crown.
     TList<FVec> Points;
@@ -668,6 +1010,8 @@ inline bool Grow(const FShape& S, unsigned int Seed, FPlant& Out, FGrid& Grid)
     // green, its own flutter, its own fold and hang.
     if (S.Box > 0.0f)
         return SkinLeaves(S, R, Out, Grid);
+    if (IsRose(S.Kind))
+        return RoseLeaves(S, R, Out, Grid);
     const int Grown = Out.Nodes.Num;
     for (int i = 0; i < Grown; i++)
     {
@@ -747,7 +1091,7 @@ struct FLeafInstance
     float          Size;           // its length
     short          Face[4];        // its blade's normal (x y z, 32767 a whole); w unused
     short          Along[4];       // from its foot to its tip (x y z); w unused
-    unsigned char  Picture;        // which of the four pictures (low 2 bits), how far its tip hangs (high 6, 63 = 0.4)
+    unsigned char  Picture;        // which of the eight pictures (low 3 bits), how far its tip hangs (high 5, 31 = 0.4)
     unsigned char  Hue;            // 0 its picture's own green .. 255 a spring yellow-green
     unsigned char  Phase;          // its own flutter's phase, 0 .. 255
     unsigned char  Fold;           // how far its halves rise, 255 = half the blade's width
@@ -769,7 +1113,21 @@ struct FMesh
     TList<FVertex>       Bark;
     TList<unsigned int>  BarkIndex;
     TList<FLeafInstance> Leaf;
+    // The flowers' heads (FlowerHeadsOf): drawn as the bark is, in the leaf sheet's petal pictures, both of their sides.
+    TList<FVertex>       Petal;
+    TList<unsigned int>  PetalIndex;
 };
+
+// A flower's petal among a plant's leaves: pictures 6 and 7 of the leaves' sheet, a shrub rose's (RoseLeaves).
+inline bool IsPetal(int Picture) { return (Picture & 7) >= 6; }
+// How many of a mesh's leaves are petals - the first so many of them (LeafInstancesOf lays them before the rest).
+inline int PetalsOf(const FMesh& M)
+{
+    int n = 0;
+    while (n < M.Leaf.Num && IsPetal(M.Leaf[n].Picture))
+        n++;
+    return n;
+}
 
 // A float as a half (IEEE 754 binary16, rounded to the nearest, the largest finite one at most), and back.
 inline unsigned short HalfOf(float F)
@@ -822,7 +1180,7 @@ inline short Snorm16(float V)
 // A corner of a leaf's blade, at rest, in the plant's own space - what the vertex shader does before the wind
 // (TreeShader.h's VSLeaf): along it the length from the foot, across it half the length wide, each half rising from the
 // midrib by the fold, and the whole hanging by the droop towards its tip; the normal of its half there, and its place on
-// the leaves' sheet (four pictures side by side, each a leaf from its foot at the bottom to its tip at the top).
+// the leaves' sheet (eight pictures side by side, each a leaf from its foot at the bottom to its tip at the top).
 // Width: the blade's width as a share of its length - a leaf's half, an EZ-Tree card's whole (GLight.z in the shader).
 inline void LeafCorner(const FLeafInstance& I, int Corner, FVec& Pos, FVec& Normal, float& U, float& V,
                        float WidthShare = 0.5f)
@@ -832,7 +1190,7 @@ inline void LeafCorner(const FLeafInstance& I, int Corner, FVec& Pos, FVec& Norm
     const FVec  Side  = Cross(Face, Along);
     const float Width = I.Size * WidthShare;
     const float Fold  = (float)I.Fold / 255.0f * 0.5f;
-    const float Droop = (float)(I.Picture >> 2) / 63.0f * 0.4f;
+    const float Droop = (float)(I.Picture >> 3) / 31.0f * 0.4f;
     const int   C     = Corner % 3, Row = Corner / 3;
     const float Uu    = (float)(C - 1) * 0.5f, T = (float)Row / 3.0f;
     const float Hand  = (float)(C - 1);
@@ -841,7 +1199,7 @@ inline void LeafCorner(const FLeafInstance& I, int Corner, FVec& Pos, FVec& Norm
     const FVec DU = Side * Width + Face * (2.0f * Hand * Fold * Width);
     const FVec DT = Along * I.Size - Face * (2.0f * Droop * T * I.Size);
     Normal = Unit(Cross(DT, DU), Face);
-    U      = ((float)(I.Picture & 3) + Uu + 0.5f) * 0.25f;
+    U      = ((float)(I.Picture & 7) + Uu + 0.5f) * 0.125f;
     V      = 1.0f - T;
 }
 
@@ -971,6 +1329,9 @@ inline bool SwayOf(const FPlant& P, TList<FSway>& Out)
 // for that. In the plant's own space, each part with the bend and the beat its drawing sways it by (TreeShader.h's
 // Swayed).
 enum { ShadowWoodMost = 160, ShadowLeavesMost = 320, ShadowLeavesAll = 2000, ShadowLeafGrowMost = 4 };
+// A shrub rose's flowers in its shadow's shape (ShadowFlowers): at most so many, each of so many corners - and with the
+// wood, the most corners a plant's shadow shape has.
+enum { ShadowFlowerMost = 64, ShadowFlowerCorners = 8, ShadowCornersMost = ShadowWoodMost * 6 + ShadowFlowerMost * 8 };
 struct FShadowCorner
 {
     float X, Y, Z;
@@ -1066,6 +1427,55 @@ inline bool ShadowWood(const FPlant& P, TList<FShadowCorner>& Corners, TList<uns
     return true;
 }
 
+// Its flowers (FPlant::Flowers), the first ShadowFlowerMost, for its shadow: each head a closed bowl of
+// ShadowFlowerCorners corners - its heart, a ring round its outermost petals' tips, and a top over its innermost - its
+// faces those from the heart to the ring and from the ring to the top, all swaying as its twig's end does. Appended to
+// Corners after the wood (ShadowWood); Index counted from the corner From, where the wood's start.
+inline bool ShadowFlowers(const FPlant& P, TList<FShadowCorner>& Corners, TList<unsigned int>& Index, unsigned int From)
+{
+    if (P.Flowers.Num == 0)
+        return true;
+    TList<FSway> Sway;
+    if (!SwayOf(P, Sway))
+        return false;
+    const int Ring = ShadowFlowerCorners - 2;
+    for (int f = 0; f < P.Flowers.Num && f < ShadowFlowerMost; f++)
+    {
+        const FFlower& F    = P.Flowers[f];
+        const float    Lean = F.bBud ? BudLean : RoseLean;
+        const float    Out  = F.Size * sinf(Lean), Up = F.Size * cosf(Lean), Top = F.Size;
+        const FVec     B    = Cross(F.Up, F.Across);
+        const unsigned int Base = (unsigned int)Corners.Num - From;
+        for (int c = 0; c < ShadowFlowerCorners; c++)
+        {
+            FVec Pos = F.At;
+            if (c == Ring + 1)
+                Pos = F.At + F.Up * Top;
+            else if (c > 0)
+            {
+                const float A = 6.2831853f * (float)(c - 1) / (float)Ring;
+                Pos           = F.At + (F.Across * cosf(A) + B * sinf(A)) * Out + F.Up * Up;
+            }
+            FShadowCorner Cn;
+            Cn.X    = Pos.X;
+            Cn.Y    = Pos.Y;
+            Cn.Z    = Pos.Z;
+            Cn.Sway = Sway[F.Node];
+            if (!Corners.Add(Cn))
+                return false;
+        }
+        for (int c = 0; c < Ring; c++)
+        {
+            const unsigned int R0 = Base + 1u + (unsigned int)c, R1 = Base + 1u + (unsigned int)((c + 1) % Ring);
+            const unsigned int Apex = Base + (unsigned int)(Ring + 1);
+            if (!Index.Add(Base) || !Index.Add(R1) || !Index.Add(R0) || !Index.Add(R0) || !Index.Add(R1) ||
+                !Index.Add(Apex))
+                return false;
+        }
+    }
+    return true;
+}
+
 // A trimmed hedge's (FShape::Box): a box - its four sides and its top, none of it letting light through - round its
 // leaves' feet, half a leaf in from them: the leaves outside it, lit, are its skin. Its top's corners sway as its
 // highest leaf does, its foot's not at all. Appended as ShadowWood's are.
@@ -1117,22 +1527,24 @@ inline bool ShadowBox(const FMesh& M, TList<FShadowCorner>& Corners, TList<unsig
 // Its leaves: the first ShadowLeavesMost of the mesh's - the share a far plant draws (its order is the leaves' own,
 // thinned evenly), each larger by as much as the share is less of the whole, so the crown covers as much - each blade
 // flat (LeafCorner's corners 0, 2, 9 and 11, LeafFrame's flat two triangles). A crown of many small leaves (the own
-// way's) takes more of them, so that none grows past ShadowLeafGrowMost times its size - ShadowLeavesAll at most.
-// Width: as LeafCorner's.
+// way's) takes more of them, so that none grows past ShadowLeafGrowMost times its size - ShadowLeavesAll at most. A
+// flower's petals (PetalsOf) all before them, each at its own size. Width: as LeafCorner's.
 inline bool ShadowLeaves(const FMesh& M, float Width, TList<FShadowLeaf>& Out)
 {
-    const int All   = M.Leaf.Num;
+    const int Fixed = PetalsOf(M);
+    const int All   = M.Leaf.Num - Fixed;
     const int Most  = ShadowLeafGrowMost * ShadowLeafGrowMost;
     int       Want  = (All + Most - 1) / Most;
     Want            = (Want < ShadowLeavesMost) ? ShadowLeavesMost : ((Want > ShadowLeavesAll) ? ShadowLeavesAll : Want);
     const int Count = (All < Want) ? All : Want;
-    if (Count <= 0)
+    if (Fixed + Count <= 0)
         return true;
-    const float Grow = sqrtf((float)All / (float)Count);
+    const float Grow = (Count > 0) ? sqrtf((float)All / (float)Count) : 1.0f;
     static const int Picks[4] = { 0, 2, 9, 11 };
-    for (int l = 0; l < Count; l++)
+    for (int l = 0; l < Fixed + Count; l++)
     {
         const FLeafInstance& I = M.Leaf[l];
+        const float          G = (l < Fixed) ? 1.0f : Grow;
         FShadowLeaf S;
         S.X    = I.X;
         S.Y    = I.Y;
@@ -1143,9 +1555,9 @@ inline bool ShadowLeaves(const FMesh& M, float Width, TList<FShadowLeaf>& Out)
             FVec  Pos, Nrm;
             float U = 0.0f, V = 0.0f;
             LeafCorner(I, Picks[k], Pos, Nrm, U, V, Width);
-            S.Corner[k][0] = (Pos.X - I.X) * Grow;
-            S.Corner[k][1] = (Pos.Y - I.Y) * Grow;
-            S.Corner[k][2] = (Pos.Z - I.Z) * Grow;
+            S.Corner[k][0] = (Pos.X - I.X) * G;
+            S.Corner[k][1] = (Pos.Y - I.Y) * G;
+            S.Corner[k][2] = (Pos.Z - I.Z) * G;
             S.U[k] = U;
             S.V[k] = V;
         }
@@ -1339,7 +1751,8 @@ inline float OpenTowards(const unsigned char Open[4], FVec D)
 // thick wood - from ReliefFrom on - is carved: rings ReliefStep apart along it and as many round, each point drawn in
 // from its radius down into the bark's crevices (BarkHeight) as deep as the wood is thick, ReliefDepth of it, and
 // turned by the bark's slope there. Leaves: an instance each of the blade's frame (LeafCorner). Every point carries how
-// open the plant is round it (FOpenness).
+// open the plant is round it (FOpenness). Plain (bPlain): no wood carved and no leaves; and with Least, only the wood
+// at least that thick - the bark a far plant draws at the trees' lower levels (Trees3D).
 static const float ReliefFrom = 5.0f, ReliefStep = 1.6f, ReliefDepth = 0.09f, SideStarts = 0.85f, TipShare = 0.35f;
 // How far along its first tube a fork's other child's first ring may be lifted onto its wood's bark (Build's Lift).
 static const float LiftMost = 0.6f;
@@ -1354,13 +1767,14 @@ inline float RunStart(float Own, float Parent, bool bLeader)
 inline float BarkHeight(float U, float V);
 inline void  BarkSlope(float U, float V, float& PerU, float& PerV);
 // The leaves as the vertex shader reads them (FLeafInstance), in a shuffled order: any first share of them is the whole
-// crown, thinned evenly - a far plant draws only so many, each larger.
+// crown, thinned evenly - a far plant draws only so many, each larger. A flower's petals before them all (PetalsOf):
+// a far plant draws every one of those at its own size, the flowers whole, and thins only the leaves after them.
 inline bool LeafInstancesOf(const FPlant& P, const FOpenness& Openness, FMesh& Out)
 {
     if (!Out.Leaf.Reserve(P.Leaves.Num))
         return false;
-    TList<int> Order;
-    if (!Order.Reserve(P.Leaves.Num))
+    TList<int> Order, Laid;
+    if (!Order.Reserve(P.Leaves.Num) || !Laid.Reserve(P.Leaves.Num))
         return false;
     for (int i = 0; i < P.Leaves.Num; i++)
         Order.Add(i);
@@ -1372,12 +1786,18 @@ inline bool LeafInstancesOf(const FPlant& P, const FOpenness& Openness, FMesh& O
         Order[i]     = Order[j];
         Order[j]     = Kp;
     }
+    for (int o = 0; o < P.Leaves.Num; o++)
+        if (IsPetal(P.Leaves[Order[o]].Picture))
+            Laid.Add(Order[o]);
+    for (int o = 0; o < P.Leaves.Num; o++)
+        if (!IsPetal(P.Leaves[Order[o]].Picture))
+            Laid.Add(Order[o]);
     TList<FSway> Sway;
     if (!SwayOf(P, Sway))
         return false;
     for (int o = 0; o < P.Leaves.Num; o++)
     {
-        const FLeaf& L = P.Leaves[Order[o]];
+        const FLeaf& L = P.Leaves[Laid[o]];
         FLeafInstance I;
         I.X        = L.At.X;
         I.Y        = L.At.Y;
@@ -1392,9 +1812,9 @@ inline bool LeafInstancesOf(const FPlant& P, const FOpenness& Openness, FMesh& O
         I.Along[1] = Snorm16(L.Along.Y);
         I.Along[2] = Snorm16(L.Along.Z);
         I.Along[3] = 0;
-        int Hang   = (int)(L.Droop / 0.4f * 63.0f + 0.5f);
-        Hang       = (Hang < 0) ? 0 : ((Hang > 63) ? 63 : Hang);
-        I.Picture  = (unsigned char)((L.Picture & 3) | (Hang << 2));
+        int Hang   = (int)(L.Droop / 0.4f * 31.0f + 0.5f);
+        Hang       = (Hang < 0) ? 0 : ((Hang > 31) ? 31 : Hang);
+        I.Picture  = (unsigned char)((L.Picture & 7) | (Hang << 3));
         I.Hue      = Byte(L.Hue);
         I.Phase    = Byte(L.Phase);
         I.Fold     = Byte(L.Fold / 0.5f);
@@ -1414,7 +1834,8 @@ inline bool LeafInstancesOf(const FPlant& P, const FOpenness& Openness, FMesh& O
 // along it at its level's angle, spread evenly up it and round it, each starting on its axis, inside its wood; a branch
 // of the last level bears leaves - two crossed cards of a twig's picture each - and so does each branch's end there.
 // Its meshing is its own as well: a tube of rings, one ring a section, turned as the section is. The numbers are its
-// presets'. It grows with Y up; the plant takes it with Z up, scaled to the height the game's model has.
+// presets'. It grows with Y up; the plant takes it with Z up, scaled to the height the game's model has. With Least,
+// only the branches at least that thick where they start are meshed, and no leaves - a far plant's bark (Trees3D).
 // ---------------------------------------------------------------------------------------------------------------
 
 struct FEzPreset
@@ -1469,8 +1890,8 @@ inline const FEzPreset& EzPresetOf(EKind Kind)
         default:         return BushTwo;
     }
 }
-// Whether a kind grows by EZ-Tree: all but the box hedge, which is trimmed (FShape::Box).
-inline bool EzGrows(EKind Kind) { return Kind != Kind_Bush1; }
+// Whether a kind grows by EZ-Tree: all but the box hedge, which is trimmed (FShape::Box), and the shrub roses.
+inline bool EzGrows(EKind Kind) { return Kind != Kind_Bush1 && !IsRose(Kind) && !IsStemPlant(Kind); }
 
 // EZ-Tree's random numbers: a multiply-with-carry pair of its own seeding.
 struct FEzRng
@@ -1625,7 +2046,7 @@ inline bool EzSpread(FEzRng& R, int Count, float StartMin, float AngleDeg, const
 
 // A tree grown by EZ-Tree's way (EzPresetOf the shape's kind), into Out's nodes - one a section, each on the one before
 // it, a branch's first on its parent's section - and leaves, and Mesh's bark and leaves. The plant scaled to S.Height.
-inline bool GrowEz(const FShape& S, unsigned int Seed, FPlant& Out, FMesh& Mesh, float BarkWorld)
+inline bool GrowEz(const FShape& S, unsigned int Seed, FPlant& Out, FMesh& Mesh, float BarkWorld, float Least = 0.0f)
 {
     const FEzPreset& E = EzPresetOf(S.Kind);
     FEzRng           R(Seed);
@@ -1634,9 +2055,12 @@ inline bool GrowEz(const FShape& S, unsigned int Seed, FPlant& Out, FMesh& Mesh,
     Out.Outline = None;
     Out.Nodes.Clear();
     Out.Leaves.Clear();
+    Out.Flowers.Clear();
     Mesh.Bark.Clear();
     Mesh.BarkIndex.Clear();
     Mesh.Leaf.Clear();
+    Mesh.Petal.Clear();
+    Mesh.PetalIndex.Clear();
 
     // The skeleton, in EZ-Tree's own space and units: every branch's sections, and the leaves.
     TList<FEzSection> Sec;
@@ -1809,7 +2233,7 @@ inline bool GrowEz(const FShape& S, unsigned int Seed, FPlant& Out, FMesh& Mesh,
     {
         const int First = DoneFirst[b];
         const int End   = (b + 1 < Done.Num) ? DoneFirst[b + 1] : Sec.Num;
-        if (End - First < 2)
+        if (End - First < 2 || Sec[First].Radius * Scale < Least)
             continue;
         int Segs = Done[b].Segments * 2;
         Segs     = (Segs < 6) ? 6 : ((Segs > 16) ? 16 : Segs);
@@ -1853,15 +2277,117 @@ inline bool GrowEz(const FShape& S, unsigned int Seed, FPlant& Out, FMesh& Mesh,
                     return false;
             }
     }
-    return LeafInstancesOf(Out, Openness, Mesh);
+    return (Least > 0.0f) ? true : LeafInstancesOf(Out, Openness, Mesh);
 }
 
-inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
+// The flowers' heads (FFlower) into Out's Petal and PetalIndex: each a grid along its sheet and across it, every point
+// swaying as its twig's end does - the head moves as one -, lit by how open the plant is at its heart, its colour from
+// the middle of its petal picture, pale at the heart and its red out to the rim. Laid twice, once a side: the second
+// wound the other way, its normals turned (a plant's faces are drawn from their front alone).
+inline bool FlowerHeadsOf(const FPlant& P, const FOpenness& Openness, const TList<FSway>& Sway, FMesh& Out)
+{
+    TList<FVec>  Grid;
+    TList<FVec>  Normal;
+    TList<float> PhiOf;
+    for (int f = 0; f < P.Flowers.Num; f++)
+    {
+        const FFlower& F      = P.Flowers[f];
+        const float    Turns  = F.bBud ? BudTurns : RoseTurns;
+        const float    Lean   = F.bBud ? BudLean : RoseLean;
+        const float    Fall   = F.bBud ? BudLeanFall : RoseLeanFall;
+        const int      Along  = (int)(Turns * RosePerTurn * (float)RosePetalSteps) + 1;
+        const int      Across = RoseAcrossSteps + 1;
+        const float    Petal  = 6.2831853f / RosePerTurn;
+        const FVec     B      = Cross(F.Up, F.Across);
+        Grid.Clear();
+        Normal.Clear();
+        PhiOf.Clear();
+        if (!Grid.Reserve(Along * Across) || !Normal.Reserve(Along * Across) || !PhiOf.Reserve(Along))
+            return false;
+        for (int i = 0; i < Along; i++)
+        {
+            const float K    = (float)i / (float)(Along - 1);
+            const float Th   = F.Spin + K * Turns * 6.2831853f;
+            const float Phi  = Th / Petal - floorf(Th / Petal);
+            const float Edge = 1.0f - 2.0f * Phi;
+            const float Lobe = 1.0f - Edge * Edge * Edge * Edge * 0.25f;
+            const float Tilt = Lean * expf(-Fall * K);
+            const FVec  Way  = F.Across * cosf(Th) + B * sinf(Th);
+            PhiOf.Add(Phi);
+            for (int j = 0; j < Across; j++)
+            {
+                const float S   = (float)j / (float)(Across - 1);
+                const float Cup = RoseCup * 4.0f * (S * S - S) * (S * S - S) * sinf(Tilt);
+                const float Len = F.Size * Lobe;
+                const float Rad = Len * (S * sinf(Tilt) + Cup * cosf(Tilt));
+                const float Hgt = Len * (S * cosf(Tilt) - Cup * sinf(Tilt));
+                Grid.Add(F.At + Way * Rad + F.Up * Hgt);
+            }
+        }
+        // The normals: along the sheet by across it, from the neighbours either side; the heart's from the row beside.
+        for (int i = 0; i < Along; i++)
+            for (int j = 0; j < Across; j++)
+            {
+                const int  i0 = (i > 0) ? i - 1 : i, i1 = (i + 1 < Along) ? i + 1 : i;
+                const int  jj = (j > 0) ? j : 1;
+                const int  j0 = jj - 1, j1 = (jj + 1 < Across) ? jj + 1 : jj;
+                const FVec Th = Grid[i1 * Across + jj] - Grid[i0 * Across + jj];
+                const FVec Sv = Grid[i * Across + j1] - Grid[i * Across + j0];
+                Normal.Add(Unit(Cross(Th, Sv), F.Up));
+            }
+        unsigned short Wind[8];
+        PackSway(Sway[F.Node], Wind);
+        float Open[4];
+        OpenAt(Openness, F.At, Open);
+        const unsigned int Base = (unsigned int)Out.Petal.Num, Side = (unsigned int)(Along * Across);
+        for (int Back = 0; Back < 2; Back++)
+            for (int i = 0; i < Along; i++)
+                for (int j = 0; j < Across; j++)
+                {
+                    const FVec& Q = Grid[i * Across + j];
+                    const FVec  N = Normal[i * Across + j] * (Back ? -1.0f : 1.0f);
+                    FVertex     V;
+                    V.X  = Q.X;
+                    V.Y  = Q.Y;
+                    V.Z  = Q.Z;
+                    V.NX = N.X;
+                    V.NY = N.Y;
+                    V.NZ = N.Z;
+                    V.U  = ((float)F.Picture + 0.5f + (PhiOf[i] - 0.5f) * 0.12f) / 8.0f;
+                    V.V  = 1.0f - (0.05f + 0.85f * (float)j / (float)(Across - 1));
+                    memcpy(V.Wind, Wind, sizeof(Wind));
+                    PackOpen(Open, V.Open);
+                    if (!Out.Petal.Add(V))
+                        return false;
+                }
+        for (int i = 0; i + 1 < Along; i++)
+            for (int j = 0; j + 1 < Across; j++)
+            {
+                const unsigned int A = Base + (unsigned int)(i * Across + j), Bn = A + (unsigned int)Across;
+                const unsigned int C = A + 1u, D = Bn + 1u;
+                const unsigned int Front[6] = { A, Bn, C, C, Bn, D };
+                const unsigned int Rear[6]  = { A + Side, C + Side, Bn + Side, C + Side, D + Side, Bn + Side };
+                for (int t = 0; t < 6; t++)
+                    if (!Out.PetalIndex.Add(Front[t]))
+                        return false;
+                for (int t = 0; t < 6; t++)
+                    if (!Out.PetalIndex.Add(Rear[t]))
+                        return false;
+            }
+    }
+    return true;
+}
+
+inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld, bool bPlain = false, float Least = 0.0f)
 {
     Out.Bark.Clear();
     Out.Leaf.Clear();
     Out.BarkIndex.Clear();
+    Out.Petal.Clear();
+    Out.PetalIndex.Clear();
     const FShape& S = P.Shape;
+    // Plain: no wood carved - every run a smooth tube - and the bark alone.
+    const float CarveFrom = bPlain ? 3.0e38f : ReliefFrom;
     FOpenness Openness;
     if (!MakeOpenness(P, Openness))
         return false;
@@ -1896,7 +2422,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
         const FNode& N  = P.Nodes[i];
         const int    Pa = N.Parent;
         On[i] = Pa >= 0 && Thickest[Pa] == i && N.Radius >= 0.25f * Begun[Pa] &&
-                !(Begun[Pa] >= ReliefFrom && N.Radius < ReliefFrom);
+                !(Begun[Pa] >= CarveFrom && N.Radius < CarveFrom);
         if (On[i])
         {
             Begun[i] = Begun[Pa];
@@ -1909,11 +2435,14 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
         // Round in whole repeats, so the bark meets itself.
         const float Repeats = floorf(6.2831853f * R0 / BarkWorld + 0.5f);
         Round[i]            = (Repeats < 1.0f) ? 1.0f : Repeats;
-        int Count = (R0 >= ReliefFrom) ? (int)(Round[i] * BarkWorld / ReliefStep + 0.5f) : (int)(R0 * 2.0f) + 5;
-        Sides[i]  = (R0 >= ReliefFrom) ? ((Count > 160) ? 160 : Count) : ((Count > 10) ? 10 : Count);
+        int Count = (R0 >= CarveFrom) ? (int)(Round[i] * BarkWorld / ReliefStep + 0.5f) : (int)(R0 * 2.0f) + 5;
+        Sides[i]  = (R0 >= CarveFrom) ? ((Count > 160) ? 160 : Count) : ((Count > 10) ? 10 : Count);
     }
     // The finest twigs are under the leaves: none of their own. Which nodes a drawn tube of their own run goes on from.
-    auto Drawn = [&](int i) { return !(P.Nodes[i].Radius < S.Twig * 1.25f && P.Nodes[i].Children == 0); };
+    auto Drawn = [&](int i)
+    {
+        return !(P.Nodes[i].Radius < S.Twig * 1.25f && P.Nodes[i].Children == 0) && P.Nodes[i].Radius >= Least;
+    };
     TList<bool> GoesOn;
     if (!GoesOn.Reserve(P.Nodes.Num))
         return false;
@@ -2051,7 +2580,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
         BendTo.Add(-1);
         const int Pa = P.Nodes[n].Parent;
         const int C  = (RunsOn[n] >= 0 && Drawn(RunsOn[n])) ? RunsOn[n] : Joins[n];
-        if (C < 0 || Pa < 0 || Hidden[n] || !Drawn(n) || !(Begun[n] >= ReliefFrom || P.Nodes[n].Radius >= 1.5f))
+        if (C < 0 || Pa < 0 || Hidden[n] || !Drawn(n) || !(Begun[n] >= CarveFrom || P.Nodes[n].Radius >= 1.5f))
             continue;
         const FVec  In  = P.Nodes[n].At - P.Nodes[Pa].At, Ow = P.Nodes[C].At - P.Nodes[n].At;
         const float Lin = Length(In), Lout = Length(Ow);
@@ -2100,7 +2629,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
         // A run joined onto the end of the one it goes on from (Joins) as wide as that end - and where that end is carved,
         // its first ring carved as that end ring is (JoinCarved, below), so the two rings lie on each other.
         const bool  bJoin       = !On[i] && Joins[N.Parent] == i;
-        const bool  bJoinCarved = bJoin && Begun[N.Parent] >= ReliefFrom;
+        const bool  bJoinCarved = bJoin && Begun[N.Parent] >= CarveFrom;
         float       R0          = (On[i] || bJoin) ? Pa.Radius : RunStart(N.Radius, Pa.Radius, Thickest[N.Parent] == i);
         // Where its run ends - no drawn wood of the run goes on from the node (GoesOn) - the wood narrows to a third of
         // its girth, as a branch's end does, rather than ending as thick as it was, cut off; unless the wood goes on
@@ -2140,7 +2669,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
             const int   Nx     = (RunsOn[F] >= 0 && Drawn(RunsOn[F])) ? RunsOn[F] : Joins[F];
             auto        Within = [&](int n)
             {
-                return ((Begun[n] >= ReliefFrom) ? 1.0f - ReliefDepth : 1.0f) * cosf(3.14159265f / (float)Sides[n]);
+                return ((Begun[n] >= CarveFrom) ? 1.0f - ReliefDepth : 1.0f) * cosf(3.14159265f / (float)Sides[n]);
             };
             const float In0 = Within(F), In1 = (Nx >= 0) ? Within(Nx) : In0;
             FVec        Line[16];
@@ -2263,7 +2792,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
         // this node; the rings between, between the two.
         const FSway Sway0 = Sway[bSeam ? Fork[i] : N.Parent], Sway1 = Sway[i];
         // The rings: the two ends, and on carved wood as many between as ReliefStep goes into the tube's length.
-        const bool  bCarved = Begun[i] >= ReliefFrom;
+        const bool  bCarved = Begun[i] >= CarveFrom;
         int         Rings   = bCarved ? (int)ceilf(Long / ReliefStep) : 1;
         Rings               = (Rings < 1) ? 1 : Rings;
         // Its two ends on the bends (Bend): from the joint's middle at its start, and to the next one's at its end - not
@@ -2452,7 +2981,7 @@ inline bool Build(const FPlant& P, FMesh& Out, float BarkWorld)
             }
         }
     }
-    return LeafInstancesOf(P, Openness, Out);
+    return bPlain ? true : (FlowerHeadsOf(P, Openness, Sway, Out) && LeafInstancesOf(P, Openness, Out));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2658,10 +3187,249 @@ inline void DrawBark(unsigned char* Rgba, int Width, int Height)
 // drawn out to a point, its edge finely toothed. A pale midrib, thinner to the tip; side veins leaving it out and a
 // little up, arching up near the edge and running along it towards the next; between them a fine net of veins. A fresh
 // spring green, each picture its own, darker towards the edge. Alpha 1 on the leaf, 0 off it, a texel's soft edge.
+// A shrub rose's picture on the leaf sheet, in cell Picture of Cell texels across (RoseLeaves): 4 and 5 a leaflet - a
+// short stalk, an oval blade a little over half as wide as long, its edge toothed, dark glossy green with a paler midrib
+// and side veins; 6 and 7 a petal - a narrow claw at its foot, widening to a rounded top with a shallow notch in its
+// middle, pale yellow-white at the foot going over into deep red (6) or a pinker red (7) - a yellow rose's (bYellow)
+// into a deep golden yellow or a paler one, as bright against the game's own yellow flower (pflanzentex152) as the red
+// against its red - its fine veins fanning out from the foot. Each from its foot at the bottom to its tip at the top, as
+// wide as the cell where it is widest; in cell At of the sheet, the picture's own where none is said.
+inline void DrawRosePicture(unsigned char* Rgba, int Width, int Height, int Cell, int Picture, int At = -1,
+                            bool bYellow = false)
+{
+    const bool  bPetal = Picture >= 6;
+    const float Red[2][3] = { { 0.52f, 0.02f, 0.05f }, { 0.74f, 0.10f, 0.18f } };
+    const float Yellow[2][3] = { { 0.85f, 0.66f, 0.18f }, { 0.96f, 0.82f, 0.32f } };
+    const float PerX = (float)Cell * 0.5f;
+    for (int y = 0; y < Height; y++)
+        for (int x = 0; x < Cell; x++)
+        {
+            const float Px = ((float)x + 0.5f) / (float)Cell;
+            const float T  = 1.0f - ((float)y + 0.5f) / (float)Height;
+            const float Ax = fabsf((Px - 0.5f) * 2.0f);
+            float       H  = 0.0f;
+            if (bPetal)
+            {
+                // The outline: the claw, widening to its widest some way up, the top round, a shallow dip in its
+                // middle.
+                const float Tm = 0.62f;
+                if (T > 0.0f && T < Tm)
+                    H = 0.96f * powf(T / Tm, 0.55f);
+                else if (T >= Tm && T < 1.0f)
+                {
+                    const float U = (T - Tm) / (1.0f - Tm);
+                    H             = 0.96f * sqrtf((U < 1.0f) ? 1.0f - U * U : 0.0f);
+                }
+                H *= (T < 0.12f) ? 0.35f + 0.65f * T / 0.12f : 1.0f;
+                if (Ax < 0.3f && T > 1.0f - 0.05f * (1.0f - (Ax / 0.3f) * (Ax / 0.3f)))
+                    H = 0.0f;
+            }
+            else
+            {
+                const float Sb = (T - 0.06f) / 0.94f;
+                if (T < 0.07f)
+                    H = 0.035f;
+                else if (Sb < 1.0f)
+                {
+                    H = 0.64f * powf(sinf(3.14159265f * powf(Sb, 0.8f)), 0.75f);
+                    const float Tooth = Sb * 17.0f + (float)Picture * 0.31f;
+                    H *= 1.0f - 0.09f * (Tooth - floorf(Tooth));
+                }
+            }
+            float A = (H - Ax) * PerX + 0.5f;
+            A       = (A < 0.0f) ? 0.0f : ((A > 1.0f) ? 1.0f : A);
+            float Cr = 0.0f, Cg = 0.0f, Cb = 0.0f;
+            if (A > 0.0f && bPetal)
+            {
+                const float* const C    = bYellow ? Yellow[Picture - 6] : Red[Picture - 6];
+                float              Body = (T - 0.04f) / 0.3f;
+                Body                    = (Body < 0.0f) ? 0.0f : ((Body > 1.0f) ? 1.0f : Body);
+                Body                    = Body * Body * (3.0f - 2.0f * Body);
+                const float Edge = Ax / ((H > 1e-3f) ? H : 1e-3f);
+                const float Lit  = 1.04f - 0.18f * Edge * Edge;
+                // The veins: fine lines fanning out from the foot, a little paler.
+                const float Fan  = atan2f((Px - 0.5f) * 2.0f, T + 0.15f) * 22.0f + (float)Picture;
+                const float Vein = 1.0f + 0.07f * cosf(6.2831853f * Fan) * (1.0f - Body * 0.5f);
+                Cr = (0.95f + (C[0] - 0.95f) * Body) * Lit * Vein;
+                Cg = (0.86f + (C[1] - 0.86f) * Body) * Lit * Vein;
+                Cb = (0.60f + (C[2] - 0.60f) * Body) * Lit * Vein;
+            }
+            else if (A > 0.0f)
+            {
+                const float Sb   = (T - 0.06f) / 0.94f;
+                const float Edge = Ax / ((H > 1e-3f) ? H : 1e-3f);
+                const float Lit  = 1.05f - 0.25f * Edge * Edge;
+                float       Rib  = (0.02f - Ax) * PerX + 0.5f;
+                Rib              = (Rib < 0.0f) ? 0.0f : ((Rib > 1.0f) ? 1.0f : Rib);
+                // The side veins: up and out from the midrib, seven a side.
+                const float Up   = (Sb - Ax * 0.55f) * 7.0f + (float)Picture * 0.2f;
+                float       Vein = 1.0f - fabsf(Up - floorf(Up) - 0.5f) * 2.0f;
+                Vein             = (Vein > 0.8f) ? (Vein - 0.8f) * 5.0f * 0.5f : 0.0f;
+                const float Pale = (Rib > Vein) ? Rib : Vein;
+                const float Gr   = 0.96f + 0.08f * Fractal(Px, T, 64, 128, 2, 211u + (unsigned int)Picture);
+                Cr = (0.10f + 0.20f * Pale) * Lit * Gr;
+                Cg = (0.27f + 0.22f * Pale) * Lit * Gr;
+                Cb = (0.07f + 0.08f * Pale) * Lit * Gr;
+            }
+            unsigned char* const P = Rgba + 4 * (y * Width + ((At >= 0) ? At : Picture) * Cell + x);
+            P[0] = Byte(Cr);
+            P[1] = Byte(Cg);
+            P[2] = Byte(Cb);
+            P[3] = Byte(A);
+        }
+}
+
+// A yellow shrub rose's petals (Kind_RoseYellow): pictures 6 and 7 of the leaves' sheet yellow, side by side in a sheet
+// of their own, two cells across - the leaves' sheet has no room left, and a second whole one would be a waste of the
+// address space for two pictures. Its flowers' heads read it in place of the sheet's petals (U four times as wide).
+inline void DrawRoseYellowPetals(unsigned char* Rgba, int Width, int Height)
+{
+    memset(Rgba, 0, (size_t)Width * (size_t)Height * 4u);
+    DrawRosePicture(Rgba, Width, Height, Width / 2, 6, 0, true);
+    DrawRosePicture(Rgba, Width, Height, Width / 2, 7, 1, true);
+}
+
+// A picture of the sheet of the plants grown stem by stem (StemPlant, DrawStemSheet), in cell Picture of Cell texels
+// across, from its foot at the bottom to its tip at the top - its width a share of its length, on a blade as wide as long
+// (the renderer's width share): 0 and 1 a lily's leaf, lance-shaped, a fifth as wide as long, deep green with its veins
+// running along it (1 a little yellower); 2 a pink's grassy leaf, narrow, tapering to a point, its midrib pale; 3, 4 and
+// 5 a fern's leaflet, lance-shaped with shallow lobes, three greens; 6 a lily's petal, pointed, orange with a yellow
+// throat, a pale line up its middle and dark speckles low on it; 7 a pink's petal, round-topped and scalloped, pale pink
+// going paler at its foot, its veins fanning out.
+inline void DrawStemPicture(unsigned char* Rgba, int Width, int Height, int Cell, int Picture)
+{
+    const float PerX = (float)Cell * 0.5f;
+    for (int y = 0; y < Height; y++)
+        for (int x = 0; x < Cell; x++)
+        {
+            const float Px = ((float)x + 0.5f) / (float)Cell;
+            const float T  = 1.0f - ((float)y + 0.5f) / (float)Height;
+            const float Ax = fabsf((Px - 0.5f) * 2.0f);
+            float       H  = 0.0f;
+            if (Picture <= 1)
+                H = (T > 0.0f && T < 1.0f) ? 0.2f * powf(sinf(3.14159265f * powf(T, 0.8f)), 0.85f) : 0.0f;
+            else if (Picture == 2)
+                H = (T > 0.0f && T < 1.0f) ? ((T < 0.8f) ? 0.07f * (1.0f - 0.3f * T) : 0.056f * (1.0f - T) / 0.2f)
+                                           : 0.0f;
+            else if (Picture <= 5)
+            {
+                H = (T > 0.0f && T < 1.0f) ? 0.24f * powf(sinf(3.14159265f * powf(T, 0.75f)), 0.8f) : 0.0f;
+                const float Lobe = T * 9.0f + (float)Picture * 0.37f;
+                H *= 1.0f - 0.12f * (Lobe - floorf(Lobe));
+            }
+            else if (Picture == 6)
+                H = (T > 0.0f && T < 1.0f) ? 0.38f * powf(sinf(3.14159265f * powf(T, 0.9f)), 0.9f) : 0.0f;
+            else
+            {
+                const float Tm = 0.62f;
+                if (T > 0.0f && T < Tm)
+                    H = 0.9f * powf(T / Tm, 0.6f);
+                else if (T >= Tm && T < 1.0f)
+                {
+                    const float U = (T - Tm) / (1.0f - Tm);
+                    H             = 0.9f * sqrtf((U < 1.0f) ? 1.0f - U * U : 0.0f);
+                }
+                H *= (T < 0.12f) ? 0.3f + 0.7f * T / 0.12f : 1.0f;
+                // Its scalloped top: a few shallow notches.
+                const float Notch = atan2f((Px - 0.5f) * 2.0f, T) * 3.0f;
+                H *= 1.0f - 0.06f * (T > 0.8f ? 1.0f : 0.0f) * (0.5f + 0.5f * cosf(6.2831853f * Notch));
+            }
+            float A = (H - Ax) * PerX + 0.5f;
+            A       = (A < 0.0f) ? 0.0f : ((A > 1.0f) ? 1.0f : A);
+            float       Cr = 0.0f, Cg = 0.0f, Cb = 0.0f;
+            const float Edge = Ax / ((H > 1e-3f) ? H : 1e-3f);
+            const float Gr   = 0.95f + 0.1f * Fractal(Px, T, 32, 128, 2, 401u + (unsigned int)Picture);
+            if (A > 0.0f && Picture <= 5)
+            {
+                const float Lit = 1.05f - 0.25f * Edge * Edge;
+                float       Rib = (0.03f - Ax) * PerX * 0.6f + 0.5f;
+                Rib             = (Rib < 0.0f) ? 0.0f : ((Rib > 1.0f) ? 1.0f : Rib);
+                // A lily's and a grass's veins run along the blade; a fern's leaflet has its midrib alone.
+                const float Vein = (Picture <= 2) ? 0.5f + 0.5f * cosf(Edge * 3.14159265f * 7.0f) : 0.0f;
+                const float Pale = (Rib > 0.15f * Vein) ? Rib : 0.15f * Vein;
+                const float Base[6][3] = { { 0.08f, 0.24f, 0.06f }, { 0.11f, 0.27f, 0.06f }, { 0.15f, 0.33f, 0.09f },
+                                           { 0.09f, 0.28f, 0.07f }, { 0.12f, 0.32f, 0.08f }, { 0.10f, 0.30f, 0.10f } };
+                const float* const C = Base[Picture];
+                Cr = (C[0] + 0.18f * Pale) * Lit * Gr;
+                Cg = (C[1] + 0.2f * Pale) * Lit * Gr;
+                Cb = (C[2] + 0.07f * Pale) * Lit * Gr;
+            }
+            else if (A > 0.0f && Picture == 6)
+            {
+                const float Lit    = 1.05f - 0.2f * Edge * Edge;
+                float       Throat = 1.0f - T / 0.35f;
+                Throat             = (Throat < 0.0f) ? 0.0f : Throat;
+                Cr = 0.97f;
+                Cg = 0.47f + 0.3f * Throat;
+                Cb = 0.12f + 0.1f * Throat;
+                // The pale line up its middle, and the dark speckles low on it, a few a side.
+                const float Line = (Ax < 0.08f) ? 0.25f * (1.0f - Ax / 0.08f) * (1.0f - T) : 0.0f;
+                Cg += Line * 0.4f;
+                Cb += Line * 0.3f;
+                const float Sx = Px * 9.0f, Sy = T * 18.0f;
+                const unsigned int Spot = Hash((unsigned int)floorf(Sx) * 73u + (unsigned int)floorf(Sy) * 977u + 5u);
+                const float Fx = Sx - floorf(Sx) - 0.5f, Fy = Sy - floorf(Sy) - 0.5f;
+                if (T > 0.1f && T < 0.5f && (Spot & 3u) == 0u && Fx * Fx + Fy * Fy < 0.06f)
+                {
+                    Cr = 0.38f;
+                    Cg = 0.09f;
+                    Cb = 0.04f;
+                }
+                Cr *= Lit * Gr;
+                Cg *= Lit * Gr;
+                Cb *= Lit * Gr;
+            }
+            else if (A > 0.0f)
+            {
+                float Body = (T - 0.04f) / 0.35f;
+                Body       = (Body < 0.0f) ? 0.0f : ((Body > 1.0f) ? 1.0f : Body);
+                Body       = Body * Body * (3.0f - 2.0f * Body);
+                const float Lit  = 1.04f - 0.18f * Edge * Edge;
+                const float Fan  = atan2f((Px - 0.5f) * 2.0f, T + 0.15f) * 20.0f;
+                const float Vein = 1.0f + 0.06f * cosf(6.2831853f * Fan) * (1.0f - Body * 0.5f);
+                Cr = (0.98f + (0.93f - 0.98f) * Body) * Lit * Vein;
+                Cg = (0.90f + (0.62f - 0.90f) * Body) * Lit * Vein;
+                Cb = (0.86f + (0.72f - 0.86f) * Body) * Lit * Vein;
+            }
+            unsigned char* const P = Rgba + 4 * (y * Width + Picture * Cell + x);
+            P[0] = Byte(Cr);
+            P[1] = Byte(Cg);
+            P[2] = Byte(Cb);
+            P[3] = Byte(A);
+        }
+}
+// The sheet itself: the eight pictures side by side (DrawStemPicture), each an eighth of its width.
+inline void DrawStemSheet(unsigned char* Rgba, int Width, int Height)
+{
+    memset(Rgba, 0, (size_t)Width * (size_t)Height * 4u);
+    for (int Picture = 0; Picture < 8; Picture++)
+        DrawStemPicture(Rgba, Width, Height, Width / 8, Picture);
+}
+// The wood of a plant grown stem by stem (StemPlant) in place of the bark: a green stem's skin, round it (U) and along
+// it (V) in repeats as the bark's - a soft green, fine streaks along it, a little paler here and there.
+inline void DrawStemSkin(unsigned char* Rgba, int Width, int Height)
+{
+    for (int y = 0; y < Height; y++)
+        for (int x = 0; x < Width; x++)
+        {
+            const float U = ((float)x + 0.5f) / (float)Width, V = ((float)y + 0.5f) / (float)Height;
+            const float Streak = 0.5f + 0.5f * sinf(6.2831853f * (U * 12.0f + 0.3f * sinf(6.2831853f * V * 2.0f)));
+            const float Gr     = 0.92f + 0.16f * Fractal(U, V, 8, 32, 3, 977u);
+            unsigned char* const P = Rgba + 4 * (y * Width + x);
+            P[0] = Byte((0.17f + 0.04f * Streak) * Gr);
+            P[1] = Byte((0.33f + 0.06f * Streak) * Gr);
+            P[2] = Byte((0.10f + 0.02f * Streak) * Gr);
+            P[3] = 255;
+        }
+}
+
 inline void DrawLeaves(unsigned char* Rgba, int Width, int Height)
 {
     memset(Rgba, 0, (size_t)Width * (size_t)Height * 4u);
-    const int   Cell = Width / 4;
+    // Eight pictures side by side: four leaves of the trees, then the shrub rose's two leaflets and two petals.
+    const int   Cell = Width / 8;
+    for (int Picture = 4; Picture < 8; Picture++)
+        DrawRosePicture(Rgba, Width, Height, Cell, Picture);
     const float Greens[4][3] = { { 0.20f, 0.44f, 0.11f }, { 0.15f, 0.36f, 0.10f },
                                  { 0.27f, 0.47f, 0.12f }, { 0.19f, 0.41f, 0.12f } };
     for (int Picture = 0; Picture < 4; Picture++)

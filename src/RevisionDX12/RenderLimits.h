@@ -25,6 +25,15 @@
 // The RT water's far probe (FRtPass::UpdateFar) keeps what the picture shows this many units off or further - the sky, a
 // skyline at the level's edge; the water's mirror rays read it for what they meet as far off (SolidPass.hlsl).
 #define RDX_RT_FAR_MIN 4096.0f
+// The probe gathered from the picture (FMirrorProbe, MirrorProbe.hlsl; docs/tukrozodes-szonda-terv.md): texels a face of
+// its finest level, the levels of its pyramid, how many levels up a hole takes its colour from, and the mirror rays'
+// march through it - even steps, then halvings of the step that crossed. The shaders hold the same numbers in a block
+// of their own (scripts/check_shaders.py compares them).
+#define RDX_PROBE_SIDE_VALUE     128
+#define RDX_PROBE_LEVELS_VALUE   8
+#define RDX_PROBE_FILL_UP_VALUE  4
+#define RDX_PROBE_STEPS_VALUE    8
+#define RDX_PROBE_HALVINGS_VALUE 8
 // A level surface's record for the mirror rays (FRtPass::SetLevel, SolidPass.hlsl's LevelMaterial), in bytes -
 // thirty-two numbers: its texture's average colour; its light; its texture's place in the texture heap plus one (0:
 // not known yet); a spare; the two rows that put a place of the level on the texture (RdxMath::RtSurfaceRows); how

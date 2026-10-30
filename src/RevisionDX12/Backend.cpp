@@ -224,6 +224,9 @@ FBackend::FBackend()
     bWaterSurfaceLive     = 0;
     bWaterSurfaceCleared  = 0;
     bWaterSurfaceViewReal = 0;
+    WetMarkState          = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bWetMarkCleared       = 0;
+    bWetMarkViewReal      = 0;
     RippleCurrent   = 0;
     bRippleCleared  = 0;
     bRippleFailed   = 0;
@@ -1375,6 +1378,14 @@ void FBackend::CompilingWatch(void* Who)
         ((FBackend*)Who)->PresentCompiling();
 }
 
+void FBackend::CompilingWait(void* Who, HANDLE Compiling)
+{
+    FBackend* const B = (FBackend*)Who;
+    if (B && B->AnswerWhile && B->OutputWindow && ::GetCurrentThreadId() == B->CompilingThread)
+        B->AnswerWhile(B->OutputWindow, Compiling);
+    ::WaitForSingleObject(Compiling, INFINITE);
+}
+
 // Drawn with nothing but clears of rectangles of the back buffer: at the start there is no pipeline to draw with yet -
 // making them is what the wait is for. Not in frame generation's mode, as the black picture is not (PresentBlack).
 void FBackend::PresentCompiling()
@@ -1382,16 +1393,24 @@ void FBackend::PresentCompiling()
     if (bFgMode || !SwapChain || !CommandList || !Allocators[FrameIndex] || !RtvHeap ||
         ::GetCurrentThreadId() != CompilingThread || Width < 320 || Height < 200)
         return;
-    // About how many shaders the backend's start asks for with every pass on: what the bar is full at.
     // RECTS_A_CLEAR: how many rectangles one clear is handed. The call itself takes any number, but a driver keeps
     // its own copy of them in a fixed array on its stack - NVIDIA's 32-bit one has room for 32 - and writes past its
     // end for a longer list: the process then ends inside the driver (a fail-fast no handler sees), with no line in
     // any log. Half of what that driver holds.
-    enum { EXPECTED = 35, RECTS_MAX = 800, RECTS_A_CLEAR = 16 };
-    const INT Done  = RdxStartupShaders();
-    const INT Total = Max(Done + 1, (INT)EXPECTED);
+    enum { RECTS_MAX = 800, RECTS_A_CLEAR = 16 };
+    // The text names the shader about to compile (Now). Where the cache's file gave nothing the start compiles every
+    // shader the renderer has: their number is known (START_SHADERS), and the bar shows the ones done. Where it gave
+    // some - a new renderer over the file of an older one - only the shaders that changed compile, and how many is not
+    // known before: the count alone, with no bar.
+    const INT   Done   = RdxStartupShaders();
+    const INT   Now    = Done + 1;
+    const UBOOL bWhole = RdxShaderCacheRead() == 0;
+    const INT   Total  = Max(Now, (INT)START_SHADERS);
     char Text[64];
-    _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i / %i", Done, Total);
+    if (bWhole)
+        _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i / %i", Now, Total);
+    else
+        _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i", Now);
     INT Chars = 0;
     while (Text[Chars])
         Chars++;
@@ -1463,9 +1482,12 @@ void FBackend::PresentCompiling()
     // The caption's rectangles a few to a clear, never the whole list in one (RECTS_A_CLEAR).
     for (INT First = 0; First < Count; First += RECTS_A_CLEAR)
         CommandList->ClearRenderTargetView(Rtv, Pale, (UINT)Min(Count - First, (INT)RECTS_A_CLEAR), Rects + First);
-    CommandList->ClearRenderTargetView(Rtv, Dim, 4, Rim);
-    if (Fill.right > Fill.left && Fill.bottom > Fill.top)
-        CommandList->ClearRenderTargetView(Rtv, Pale, 1, &Fill);
+    if (bWhole)
+    {
+        CommandList->ClearRenderTargetView(Rtv, Dim, 4, Rim);
+        if (Fill.right > Fill.left && Fill.bottom > Fill.top)
+            CommandList->ClearRenderTargetView(Rtv, Pale, 1, &Fill);
+    }
     Barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     Barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     CommandList->ResourceBarrier(1, &Barrier);
@@ -1849,21 +1871,31 @@ void FBackend::RequestShadowQuality(INT Quality)
     bRtShadowSetting = RdxMath::IsRtShadowQuality(Q) ? 1 : 0;
 }
 
-UBOOL FBackend::SetShadowWorld(const FLOAT* Xyz, INT VertexCount, const FLOAT* RtXyz, INT RtVertexCount, const DWORD* RtSurf,
-                              const DWORD* SurfAlbedo, INT SurfCount, const FLOAT* SkyXyz, INT SkyVertexCount,
-                              const FLOAT* ThinXyz, INT ThinVertexCount, const DWORD* ThinSurf)
+UBOOL FBackend::SetShadowMapsWorld(const FLOAT* Xyz, INT VertexCount)
 {
     if (!bShadows || !Shadow.IsReady())
         return 0;
+    // Where the rays go through the host, the GPU is done with the frames under way before either list is let go, as
+    // it is when the rays' list follows (SetShadowRtWorld).
+    if (Rt.IsHosted() && Rt.IsReady())
+        WaitForGpu();
+    return Shadow.SetWorld(Device.Get(), Xyz, VertexCount, this);
+}
+
+void FBackend::SetShadowRtWorld(const FLOAT* RtXyz, INT RtVertexCount, const DWORD* RtSurf, const DWORD* SurfAlbedo,
+                                INT SurfCount, const FLOAT* SkyXyz, INT SkyVertexCount, const FLOAT* ThinXyz,
+                                INT ThinVertexCount, const DWORD* ThinSurf)
+{
+    if (!bShadows || !Shadow.IsReady())
+        return;
     // The rays' own copy, split for them (FRtPass::SetLevel), kept for the host's structures. The GPU finishes what
     // it was given first: a frame still under way may be copying the level's buffers that are let go here.
     if (Rt.IsHosted() && Rt.IsReady())
     {
         WaitForGpu();
-        Rt.SetThin(ThinXyz, ThinVertexCount, ThinSurf);
-        Rt.SetLevel(RtXyz, RtVertexCount, RtSurf, SurfAlbedo, SurfCount, SkyXyz, SkyVertexCount);
+        Rt.SetThin(ThinXyz, ThinVertexCount, ThinSurf, this);
+        Rt.SetLevel(RtXyz, RtVertexCount, RtSurf, SurfAlbedo, SurfCount, SkyXyz, SkyVertexCount, this);
     }
-    return Shadow.SetWorld(Device.Get(), Xyz, VertexCount);
 }
 
 FLOAT* FBackend::AddShadowCaster(INT VertexCount, FLOAT X, FLOAT Y, FLOAT Z, FLOAT Radius, INT& Index)
@@ -2699,6 +2731,8 @@ void FBackend::PrepareOwnLamps()
         const RdxMath::FVec3 At  = { OwnLamps[i].At[0], OwnLamps[i].At[1], OwnLamps[i].At[2] };
         const RdxMath::FVec3 Aim = { OwnLamps[i].Aim[0], OwnLamps[i].Aim[1], OwnLamps[i].Aim[2] };
         RdxMath::OwnLampRowsLamp(OwnRowsNow, i, At, Aim, OwnLamps[i].Colour, OwnLamps[i].bEye != 0, Spots[i].Matrix);
+        // Its place's spare: the wet floor below it, for its light off the water (SolidPass.hlsl's OwnBounce).
+        OwnRowsNow[4 * (RDX_OWN_HEAD_ROWS + i * RDX_OWN_LAMP_ROWS) + 3] = OwnLamps[i].WetFloor;
     }
     OwnRowsLamps = OwnLampCount;
     UploadOwnTable();
@@ -4436,6 +4470,52 @@ void FBackend::DrawVolumetrics(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIP
     ID3D12DescriptorHeap* Back[1] = { Textures.GetHeap() };
     if (Back[0])
         Cmd->SetDescriptorHeaps(1, Back);
+    // The fires' flames in the wet floors' mirror (WetReflect.hlsl's PSWetFlames): the late wet pass drawn again, now
+    // that this walk has this frame's flames, its picture read where each wet pixel's mirrored ray meets a flame.
+    if (bWetDrawnNow && !bWetMsaaNow && NFires > 0 && Volume.Wrote() && Volume.Target() && WetReflectReady > 0 &&
+        WetLampBuffer && WetSpotsNow && Back[0] && (WaterDepthState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+    {
+        ID3D12Resource* const Flames = Volume.Target();
+        D3D12_RESOURCE_BARRIER B;
+        appMemzero(&B, sizeof(B));
+        B.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        B.Transition.pResource   = Flames;
+        B.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        B.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        B.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        Cmd->ResourceBarrier(1, &B);
+        if (WetFlameOf != Flames)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC Sd;
+            appMemzero(&Sd, sizeof(Sd));
+            Sd.Format                  = Flames->GetDesc().Format;
+            Sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+            Sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            Sd.Texture2D.MipLevels     = 1;
+            Device->CreateShaderResourceView(Flames, &Sd, Textures.GetCpuHandle(Textures.GetReservedIndex(WetFlameSrv)));
+            WetFlameOf = Flames;
+        }
+        // Over the picture alone, as the walk's own result is laid on: the shadows' targets are past their use by now.
+        D3D12_CPU_DESCRIPTOR_HANDLE Rtv = RtvStart;
+        Rtv.ptr += BACKEND_FRAME_COUNT * RtvStride;      // the scene target's view (BindSceneTargets)
+        Cmd->OMSetRenderTargets(1, &Rtv, FALSE, nullptr);
+        WetReflect.Draw(Cmd, Textures.GetHeap(), WetConstNow, Textures.GetGpuHandle(Textures.GetReservedIndex(WetFlameSrv)),
+                        Textures.GetGpuHandle(WaterSlot(0, WaterViewDepth)),
+                        Textures.GetGpuHandle(Textures.GetReservedIndex(WetMarkSrv)),
+                        Textures.GetGpuHandle(Textures.GetReservedIndex(WetCoverSrv)),
+                        WetLampBuffer->GetGPUVirtualAddress() + (UINT64)FrameIndex * RdxMath::WetLampBytes, WetSpotsNow,
+                        0, 0, 1);
+        B.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        B.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        Cmd->ResourceBarrier(1, &B);
+    }
+    // Now and then, whether the fires' flames went over the wet floors, and what held them back where they did not.
+    static INT FlameAsked = 0;
+    if ((FlameAsked++ % 600) == 0)
+        RdxLog(TEXT("wet floors: the fires' flames in their mirror - wet pass drawn %i, multisampled %i, %i flame bodies, ")
+               TEXT("walked %i, the pass ready %i, the depth copy readable %i"), bWetDrawnNow, bWetMsaaNow, NFires,
+               Volume.Wrote() ? 1 : 0, WetReflectReady, (WaterDepthState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) ? 1 : 0);
+    bWetDrawnNow = 0;
     // Whatever runs next set its own targets before this; it has to set them again.
     BindSceneTargets(Cmd, Dsv);
 }
@@ -5422,12 +5502,14 @@ void FBackend::ReadGpuTime(UINT Slot)
     if (RayFeed.TakeListCounts(Listed))
     {
         const UINT Timed = Host.GetLink().WorkListTimed();
-        RDX_LOGF("rays' list (%i frames with hand-overs, %.2f a frame): %.0f requests a frame (%i at the most), %.0f "
+        RDX_LOGF("rays' list (%i frames with hand-overs, %.2f a frame): %.0f requests a frame (%i at the most), of "
+                 "them %.0f traced by the host, %.0f "
                  "see-through surfaces passed (%i at the most); the host's own GPU time %.3f ms a hand-over of the "
                  "list (%u timed since the last line), %.3f ms for one of its other rays; the requests by the "
                  "frame's hand-overs in their order: %.0f, %.0f, %.0f, %.0f, %.0f",
                  Listed.Frames, (DOUBLE)Listed.Handovers / (DOUBLE)Listed.Frames,
                  (DOUBLE)Listed.Asked / (DOUBLE)Listed.Frames, Listed.AskedMost,
+                 (DOUBLE)Listed.Traced / (DOUBLE)Listed.Frames,
                  (DOUBLE)Listed.Passed / (DOUBLE)Listed.Frames, Listed.PassedMost,
                  (DOUBLE)Host.GetLink().WorkListUs() / 1000.0, Timed - ListTimedLast,
                  (DOUBLE)Host.GetLink().WorkRayUs() / 1000.0,
@@ -5546,10 +5628,18 @@ UBOOL FBackend::SetReflections(INT Level)
     ReflectionLevel = Clamp(Level, 0, (INT)RdxMath::Reflections_Count - 1);
     if (ReflectionLevel != Was)
         RdxLog(TEXT("reflections: %s"),
-               (ReflectionLevel == RdxMath::Reflections_RtHalf)
+               (ReflectionLevel == RdxMath::Reflections_RtMedium)
                    ? TEXT("from rays, a quarter of them - of each two by two pixels one traces for the others where ")
                      TEXT("their rays are alike")
-               : (ReflectionLevel == RdxMath::Reflections_Rt) ? TEXT("from rays")
+               : (ReflectionLevel == RdxMath::Reflections_RtLow)
+                   ? TEXT("from rays, about a ninth of them - of each three by three pixels one is traced for the ")
+                     TEXT("others where their rays are alike")
+               : (ReflectionLevel == RdxMath::Reflections_RtHigh) ? TEXT("from rays")
+               : (ReflectionLevel == RdxMath::Reflections_Low)
+                   ? TEXT("the wet floors' water and the lamps' streaks, the water's and the glass's far image ")
+                     TEXT("(the sky, a skyline) alone - nothing near mirrored")
+               : (ReflectionLevel == RdxMath::Reflections_Medium)
+                   ? TEXT("from the picture, the wet floors' image coarser")
                : (ReflectionLevel ? TEXT("from the picture") : TEXT("none of ours")));
     // On, the glass's layer reads copies of a depth that can be read: made so here, where it was not.
     return (ReflectionLevel > 0 && !Was) ? EnsureDepthReadable() : 1;
@@ -5669,6 +5759,14 @@ UBOOL FBackend::EnsureWaterTargets()
         for (INT Set = 0; Set < 2; Set++)
             Device->CreateShaderResourceView(nullptr, &Srv, Textures.GetCpuHandle(WaterSlot(Set, WaterViewNet)));
     }
+    // And the mirror probe's pyramid after it - a view of nothing until the probe is made (EnsureMirrorProbe) - and the
+    // probe's own table, which views these copies, to be written again.
+    for (INT Set = 0; Set < 2; Set++)
+    {
+        MirrorProbe.WriteLevelsView(Device.Get(), Textures.GetCpuHandle(WaterSlot(Set, WaterViewProbe)));
+        FMirrorBody::WriteView(Device.Get(), MirrorBody.GetPicture(), Textures.GetCpuHandle(WaterSlot(Set, WaterViewBody)));
+    }
+    bProbeViewsDirty = 1;
     RdxViewsChanged();          // the smoke's walk reads the depth's copy through a view of its own (ViewGeneration.h)
     RdxLog(TEXT("water: the copies of the picture and the depth made, %ix%i"), SceneWidth, SceneHeight);
     return 1;
@@ -5778,9 +5876,46 @@ UBOOL FBackend::BeginRayAsk(ID3D12GraphicsCommandList* Cmd, FRtWaterBind& Bind,
                                           ? (UINT)RayFeed.GetPassedRoom() * (RDX_RAY_SLOT_BYTES / 4) : 1;
         Device->CreateShaderResourceView(RayFeed.GetPassed(), &Srv,
                                          Textures.GetCpuHandle(Textures.GetReservedIndex(RayPassedView)));
+        for (INT k = 0; k < 3; k++)
+        {
+            ID3D12Resource* const Corners = RayFeed.GetCorners(k);
+            Srv.Buffer.NumElements = Corners ? (UINT)(RayFeed.GetCornerBytes(k) / 4) : 1;
+            Device->CreateShaderResourceView(Corners, &Srv,
+                                             Textures.GetCpuHandle(Textures.GetReservedIndex(RayCornersView + k)));
+        }
         RtHitsViewSerial = RayFeed.GetShareSerial();
     }
-    Bind.Table         = Rt.PrepareWater(Cmd, (INT)FrameIndex, Shadow, CamEye, RtWaterView, IsRtMirrorHalf());
+    // Reflections=RTLow: its pass and its own list, made where they are not yet - where either cannot be, the round
+    // runs as RT, every ray asked traced. The own list's view (u7 of the water's UAV table) is a view of nothing until
+    // then.
+    RtSparseNow = GetRtMirrorSparse();
+    if (RtSparseNow == 2)
+    {
+        if (!bSparseTried)
+        {
+            bSparseTried = 1;
+            RaySparse.Init(Device.Get());
+        }
+        if (!RaySparse.IsReady() || !RayFeed.EnsureLow(Device.Get()))
+            RtSparseNow = 0;
+    }
+    if (RtLowViewSerial != RayFeed.GetShareSerial() || RtLowViewHas != (RayFeed.GetLow() ? 1 : 0))
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC Uav;
+        appMemzero(&Uav, sizeof(Uav));
+        Uav.Format             = DXGI_FORMAT_R32_TYPELESS;
+        Uav.ViewDimension      = D3D12_UAV_DIMENSION_BUFFER;
+        Uav.Buffer.NumElements = RayFeed.GetLow() ? (UINT)RayFeed.GetListRoom() * (RDX_RAY_SLOT_BYTES / 4) : 1;
+        Uav.Buffer.Flags       = D3D12_BUFFER_UAV_FLAG_RAW;
+        Device->CreateUnorderedAccessView(RayFeed.GetLow(), nullptr, &Uav,
+                                          Textures.GetCpuHandle(Textures.GetReservedIndex(RayAskedLowUav)));
+        RtLowViewSerial = RayFeed.GetShareSerial();
+        RtLowViewHas    = RayFeed.GetLow() ? 1 : 0;
+    }
+    // The table's mode (RtEye.w): RTLow's carries the lamps that cast shadows in its mirror image beside it.
+    Bind.Table         = Rt.PrepareWater(Cmd, (INT)FrameIndex, Shadow, CamEye, RtWaterView,
+                                         (RtSparseNow == 2) ? 2 + Clamp(RtLowLamps, 0, (INT)RdxMath::RtLowLampsMost)
+                                                            : RtSparseNow);
     // Nothing is traced here: the scene's place in the signature takes an address, and the table's is one - until
     // the answers are there, when the requests take that place (EndMirrorAsk).
     Bind.Scene         = Bind.Table;
@@ -5791,7 +5926,7 @@ UBOOL FBackend::BeginRayAsk(ID3D12GraphicsCommandList* Cmd, FRtWaterBind& Bind,
     Bind.Asked         = Textures.GetGpuHandle(Textures.GetReservedIndex(WaterSurfaceUavView));
     if (!(Bind.Table && Bind.FrameUvw && Bind.LevelMaterial) || (bWorld && !UpdateRtFar(Cmd, Bind)))
         return 0;
-    if (!RayFeed.BeginAsk(Cmd))
+    if (!RayFeed.BeginAsk(Cmd, RtSparseNow == 2))
         return 0;
     GpuTime(Cmd, RoundPoint(0));
     // No target: what the asking draws write, they write into the list. The depth as the layers' own drawing has it:
@@ -5817,8 +5952,13 @@ UBOOL FBackend::BeginRayAsk(ID3D12GraphicsCommandList* Cmd, FRtWaterBind& Bind,
 UBOOL FBackend::EndMirrorAsk(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv, FRtWaterBind& Bind)
 {
     GpuTime(Cmd, RoundPoint(1));
+    // Reflections=RTLow: of the rays asked, the ones the host is to trace, into its list (FRaySparse) - timed with the
+    // copies for it.
+    if (RtSparseNow == 2)
+        RaySparse.Run(Cmd, Textures.GetHeap(), Textures.GetGpuHandle(Textures.GetReservedIndex(RayHeadsUav)),
+                      SceneWidth, SceneHeight, CamEye, RayFeed.GetHeads(), RayFeed.GetLow(), RayFeed.GetRequests());
     UBOOL bTraced = RayFeed.FeedList(Cmd, Host.GetLink(), Rt, Shadow, (INT)FrameIndex, RtHostBodies,
-                                     Rt.GetOwnBody((INT)FrameIndex));
+                                     Rt.GetOwnBody((INT)FrameIndex), RtSparseNow == 2);
     GpuTime(Cmd, RoundPoint(2));
     if (bTraced)
         NoteFrameSubmit(1);
@@ -5829,7 +5969,8 @@ UBOOL FBackend::EndMirrorAsk(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTO
     {
         RayFeed.NotePassed(Cmd, (INT)FrameIndex);
         RayFeed.ListReadable(Cmd, 1);
-        Bind.Scene = RayFeed.GetRequests()->GetGPUVirtualAddress();
+        // RTLow's pixels find their blocks in the own list, which says where in the host's their answers are.
+        Bind.Scene = ((RtSparseNow == 2) ? RayFeed.GetLow() : RayFeed.GetRequests())->GetGPUVirtualAddress();
     }
     const D3D12_VIEWPORT Whole = { 0.0f, 0.0f, (FLOAT)SceneWidth, (FLOAT)SceneHeight, 0.0f, 1.0f };
     const D3D12_RECT     All   = { 0, 0, SceneWidth, SceneHeight };
@@ -5891,6 +6032,160 @@ UBOOL FBackend::UpdateRtFar(ID3D12GraphicsCommandList* Cmd, FRtWaterBind& Bind)
     Bind.Far     = Textures.GetGpuHandle(Textures.GetReservedIndex(RtFarView));
     RtMirrorIdle = 0;
     return 1;
+}
+
+UBOOL FBackend::EnsureMirrorProbe()
+{
+    if (MirrorProbe.IsReady())
+        return 1;
+    if (bProbeTried || !Device || !Textures.GetHeap())
+        return 0;
+    bProbeTried = 1;
+    if (!MirrorProbe.Init(Device.Get()))
+    {
+        bProbeRefused = 1;
+        return 0;
+    }
+    // The own body in the pane beside it: where it cannot be made, the panes show none, and nothing else changes.
+    MirrorBody.Init(Device.Get());
+    // The glass's layer reads its pyramid from the water's sets from now on.
+    for (INT Set = 0; Set < 2; Set++)
+        MirrorProbe.WriteLevelsView(Device.Get(), Textures.GetCpuHandle(WaterSlot(Set, WaterViewProbe)));
+    bProbeViewsDirty = 1;
+    return 1;
+}
+
+// The probe's passes' table (FMirrorProbe's VIEW_* order): the copies of the picture and the depth - the depth's own
+// float and, in its second plane, the shadows' stencil of surface kinds - and the added target, then the probe's own.
+void FBackend::WriteProbeViews()
+{
+    const D3D12_CPU_DESCRIPTOR_HANDLE First = Textures.GetCpuHandle(Textures.GetReservedIndex(ProbeTableView));
+    const UINT Step = Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto At = [&](INT View)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE H = First;
+        H.ptr += (SIZE_T)View * Step;
+        return H;
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC Srv;
+    appMemzero(&Srv, sizeof(Srv));
+    Srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    Srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    Srv.Texture2D.MipLevels     = 1;
+    Srv.Format                  = Colours.Draw;
+    Device->CreateShaderResourceView(WaterColor.Get(), &Srv, At(FMirrorProbe::VIEW_PICTURE));
+    Srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    Device->CreateShaderResourceView(WaterDepth.Get(), &Srv, At(FMirrorProbe::VIEW_DEPTH));
+    Srv.Format               = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    Srv.Texture2D.PlaneSlice = 1;
+    Device->CreateShaderResourceView(WaterDepth.Get(), &Srv, At(FMirrorProbe::VIEW_KINDS));
+    Srv.Format               = Colours.Draw;
+    Srv.Texture2D.PlaneSlice = 0;
+    Device->CreateShaderResourceView(AddedTarget.Get(), &Srv, At(FMirrorProbe::VIEW_ADDED));
+    MirrorProbe.WriteOwnViews(First, Step);
+    bProbeViewsDirty = 0;
+}
+
+// The probe's frame (CopyForWater, right after the copies): the copies and the added target - the geometry pass's third
+// target, bound for its draws - readable by the passes for the while, and back as the pass has them.
+UBOOL FBackend::UpdateMirrorProbe(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv)
+{
+    if (bProbeDone || !IsProbeMirrorRunning() || !bCamSet || !WaterColor || !WaterDepth || !AddedTarget ||
+        WaterDepthState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE || !EnsureMirrorProbe())
+        return 0;
+    if (bProbeViewsDirty)
+        WriteProbeViews();
+    D3D12_RESOURCE_BARRIER B[3];
+    appMemzero(B, sizeof(B));
+    for (INT i = 0; i < 3; i++)
+    {
+        B[i].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        B[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        B[i].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        B[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    B[0].Transition.pResource   = WaterColor.Get();
+    B[1].Transition.pResource   = WaterDepth.Get();
+    B[2].Transition.pResource   = AddedTarget.Get();
+    B[2].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    B[2].Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Cmd->ResourceBarrier(3, B);
+    ID3D12DescriptorHeap* Heaps[1] = { Textures.GetHeap() };
+    Cmd->SetDescriptorHeaps(1, Heaps);
+    static const FLOAT Whole[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    MirrorProbe.Update(Cmd, Textures.GetGpuHandle(Textures.GetReservedIndex(ProbeTableView)), CamEye, CamAxes,
+                       bShadowViewSet ? ShadowTanX : ViewTanX, bShadowViewSet ? ShadowTanY : ViewTanY,
+                       bShadowViewSet ? ShadowViewRect : Whole, (UINT)SceneWidth, (UINT)SceneHeight);
+    for (INT i = 0; i < 3; i++)
+    {
+        const D3D12_RESOURCE_STATES Was = B[i].Transition.StateBefore;
+        B[i].Transition.StateBefore = B[i].Transition.StateAfter;
+        B[i].Transition.StateAfter  = Was;
+    }
+    Cmd->ResourceBarrier(3, B);
+    bProbeDone = 1;
+    DrawMirrorBody(Cmd, Dsv);
+    static INT Told = 0;
+    if ((Told++ % 600) == 0)
+        RdxLog(TEXT("mirror probe: its passes run after the water's copies (%i frames so far)"), Told);
+    return 1;
+}
+
+void FBackend::DrawMirrorBody(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv)
+{
+    UBOOL bMade = 0;
+    if (!MirrorBody.IsReady() || !MirrorBody.EnsureTargets(SceneWidth, SceneHeight, bMade))
+        return;
+    // A picture made anew: the glass's layer reads it from the water's sets from now on.
+    if (bMade)
+        for (INT Set = 0; Set < 2; Set++)
+            FMirrorBody::WriteView(Device.Get(), MirrorBody.GetPicture(),
+                                   Textures.GetCpuHandle(WaterSlot(Set, WaterViewBody)));
+    // The body: the caster the shadows marked as the own body, where the probe stands before a pane.
+    FLOAT                Normal[3] = { 0.0f, 0.0f, 0.0f }, Middle[3] = { 0.0f, 0.0f, 0.0f };
+    FMirrorBody::FBody   Body;
+    appMemzero(&Body, sizeof(Body));
+    const FMirrorBody::FBody* Use = nullptr;
+    if (Shadow.IsReady() && MirrorProbe.GetPane(Normal, Middle))
+        for (INT i = 0; i < Shadow.GetCasterCount() && !Use; i++)
+        {
+            D3D12_VERTEX_BUFFER_VIEW Vb;
+            INT First = 0, Count = 0;
+            const FShadowMaps::FCasterRt* const Rt = Shadow.GetCasterRt(i);
+            if (!Shadow.IsCasterOwnBody(i) || !Rt || !Shadow.GetCasterGeometry(i, Vb, First, Count) || Count < 3)
+                continue;
+            const UBOOL           bArena = Shadow.IsCasterInArena(i);
+            ID3D12Resource* const Xyz    = Shadow.GetCasterBuffer(bArena, 0);
+            ID3D12Resource* const Uvw    = Shadow.GetCasterBuffer(bArena, 1);
+            if (!Xyz || !Uvw)
+                continue;
+            appMemzero(&Body, sizeof(Body));
+            Body.Positions  = Xyz->GetGPUVirtualAddress();
+            Body.Places     = Uvw->GetGPUVirtualAddress();
+            Body.First      = First;
+            Body.Count      = Count;
+            Body.bEngineLit = (Rt->Colour & RdxMath::RtAlbedoEngineLit) ? 1 : 0;
+            Body.Average    = Rt->Colour;
+            for (INT w = 0; w < 6; w++)
+                Body.Cube[w] = Rt->Cube[w];
+            for (INT k = 0; k < 15 && k < RdxMath::RtCasterKeys; k++)
+                Body.Skins[k] = Rt->Texture[k];
+            Use = &Body;
+        }
+    const FLOAT Plane[4] = { Normal[0], Normal[1], Normal[2],
+                             Normal[0] * Middle[0] + Normal[1] * Middle[1] + Normal[2] * Middle[2] };
+    MirrorBody.Draw(Cmd, Textures.GetHeap(), Use, Plane, CamEye, CamAxes, ViewTanX, ViewTanY, JitterClip,
+                    GetLightBoost());
+    const D3D12_VIEWPORT Whole = { 0.0f, 0.0f, (FLOAT)SceneWidth, (FLOAT)SceneHeight, 0.0f, 1.0f };
+    const D3D12_RECT     All   = { 0, 0, SceneWidth, SceneHeight };
+    Cmd->RSSetViewports(1, &Whole);
+    Cmd->RSSetScissorRects(1, &All);
+    BindSceneTargets(Cmd, Dsv);
+    static INT Told = 0;
+    if ((Told++ % 600) == 0)
+        RdxLog(TEXT("mirror body: %s (%i frames so far)"),
+               Use ? TEXT("the own body drawn mirrored by the probe's pane") : TEXT("no body to draw this frame"), Told);
 }
 
 // FTargetSwitch: the frame's panes of glass go into the mirrors' map (FSolidPass::Flush, before the world's runs).
@@ -6012,6 +6307,15 @@ UBOOL FBackend::CopyForWater(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTO
         }
         Cmd->ResourceBarrier(2, B);
     }
+
+    // The mirror probe's passes, on the copies just made: once a frame, at the frame's own copy - one made again for a
+    // fall's sheet holds no more of the level's surfaces, only more laid over them.
+    if (bWantPicture && !bExtraCopy)
+        UpdateMirrorProbe(Cmd, Dsv);
+    // The wet floors' late reflections, on the same copies, after the probe has gathered from them - so it never gathers
+    // them back - and once a frame: a copy made again finds them on the picture already.
+    if (bWantPicture && !bExtraCopy)
+        DrawWetReflections(Cmd, Dsv);
 
     // The depth resolve and the caustics bound targets of their own.
     if (bMsaa || bLaid)
@@ -6243,6 +6547,7 @@ UBOOL FBackend::CreateLightTarget()
     }
     RdxLog(TEXT("shadows: light and added targets %ix%i%s"), SceneWidth, SceneHeight,
            HasOutputTarget() ? TEXT(", plus one output-sized pair for the HUD") : TEXT(""));
+    bProbeViewsDirty = 1;       // the mirror probe's passes view the added target
     return 1;
 }
 
@@ -6294,6 +6599,11 @@ UBOOL FBackend::CreateSceneTarget()
     bWaterSurfaceLive     = 0;
     bWaterSurfaceCleared  = 0;
     bWaterSurfaceViewReal = 0;
+    WetMark.Release();          // and the wet floors' mark (EnsureWetMark), its views with it
+    WetMarkState          = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bWetMarkCleared       = 0;
+    bWetMarkViewReal      = 0;
+    bWetMarkNone          = 0;
     WaterShade.Release();       // and the water's shade for the shadows beside it (EnsureWaterShade)
     WaterShadeState        = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bWaterShadeLive        = 0;
@@ -6677,6 +6987,112 @@ void FBackend::SubmitUploadList()
     WaitUploadSum += UploadWait;
     WaitUploadMax  = Max(WaitUploadMax, UploadWait);
     Textures.ReleaseCurrentStaging();
+}
+
+ID3D12Resource* FBackend::MakeCardBuffer(UINT64 Bytes, const TCHAR* What)
+{
+    if (!Device || Bytes == 0)
+        return nullptr;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC Desc;
+    appMemzero(&Desc, sizeof(Desc));
+    Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    Desc.Width            = Bytes;
+    Desc.Height           = 1;
+    Desc.DepthOrArraySize = 1;
+    Desc.MipLevels        = 1;
+    Desc.Format           = DXGI_FORMAT_UNKNOWN;
+    Desc.SampleDesc.Count = 1;
+    Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* Made = nullptr;
+    const HRESULT   Hr   = Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                           __uuidof(ID3D12Resource), (void**)&Made);
+    if (FAILED(Hr) || !Made)
+    {
+        RdxLog(TEXT("card buffer: the %s could not be made on the card's own memory (%I64u KB, 0x%08X)"), What,
+               Bytes >> 10, (INT)Hr);
+        return nullptr;
+    }
+    return Made;
+}
+
+UBOOL FBackend::WriteCardBuffer(ID3D12Resource* Dest, UINT64 At, const void* Data, UINT64 Bytes)
+{
+    if (!Device || !Queue || !Dest || (!Data && Bytes))
+        return 0;
+    if (!CardStaging)
+    {
+        D3D12_HEAP_PROPERTIES Heap;
+        appMemzero(&Heap, sizeof(Heap));
+        Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC Desc;
+        appMemzero(&Desc, sizeof(Desc));
+        Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        Desc.Width            = (UINT64)CARD_STAGING_BYTES;
+        Desc.Height           = 1;
+        Desc.DepthOrArraySize = 1;
+        Desc.MipLevels        = 1;
+        Desc.Format           = DXGI_FORMAT_UNKNOWN;
+        Desc.SampleDesc.Count = 1;
+        Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const D3D12_RANGE NoRead = { 0, 0 };
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   __uuidof(ID3D12Resource), CardStaging.VoidSlot())) ||
+            FAILED(CardStaging->Map(0, &NoRead, (void**)&CardStagingMapped)) || !CardStagingMapped)
+        {
+            CardStaging.Release();
+            CardStagingMapped = nullptr;
+            RdxLog(TEXT("card buffer: no staging buffer to write through"));
+            return 0;
+        }
+    }
+    if (!CardAllocator && FAILED(Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                __uuidof(ID3D12CommandAllocator),
+                                                                CardAllocator.VoidSlot())))
+        return 0;
+    if (!CardList)
+    {
+        // Made recording; closed at once, so that every piece below begins the same way.
+        if (FAILED(Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, CardAllocator.Get(), nullptr,
+                                             __uuidof(ID3D12GraphicsCommandList), CardList.VoidSlot())) ||
+            FAILED(CardList->Close()))
+        {
+            CardList.Release();
+            return 0;
+        }
+    }
+    const BYTE* const From = (const BYTE*)Data;
+    for (UINT64 Done = 0; Done < Bytes;)
+    {
+        const UINT64 Piece = Min<UINT64>(Bytes - Done, (UINT64)CARD_STAGING_BYTES);
+        appMemcpy(CardStagingMapped, From + Done, (INT)Piece);
+        if (FAILED(CardAllocator->Reset()) || FAILED(CardList->Reset(CardAllocator.Get(), nullptr)))
+            return 0;
+        CardList->CopyBufferRegion(Dest, At + Done, CardStaging.Get(), 0, Piece);
+        if (FAILED(CardList->Close()))
+            return 0;
+        ID3D12CommandList* Lists[1] = { CardList.Get() };
+        Queue->ExecuteCommandLists(1, Lists);
+        // The staging buffer is the next piece's, and the allocator the next list's: the card is done with this one
+        // first.
+        WaitForGpu();
+        Done += Piece;
+    }
+    return 1;
+}
+
+void FBackend::ReleaseCardWriter()
+{
+    CardList.Release();
+    CardAllocator.Release();
+    if (CardStaging && CardStagingMapped)
+        CardStaging->Unmap(0, nullptr);
+    CardStaging.Release();
+    CardStagingMapped = nullptr;
 }
 
 INT FBackend::PrepareTexturePrecache(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb)
@@ -8269,11 +8685,31 @@ UBOOL FBackend::Init(HWND Window, INT InWidth, INT InHeight)
     RdxStartupMark(TEXT("backend: the swap chain"));
     if (!CreateFrameResources())  return 0;
     PresentBlack();
+    // The game's window to the front before the shaders are compiled: until then the engine's own start dialog is in
+    // front of it - a small window, so the taskbar shows over the game - and once that dialog closes Windows hands the
+    // front to whatever program was there before, not to the game. The front is still this process's now, so Windows
+    // lets it be passed on. The dialog is then laid back over the game's window without taking the front, so it is
+    // seen as before until it closes.
+    const HWND Front = ::GetForegroundWindow();
+    if (Window && Front && Front != Window)
+    {
+        DWORD FrontProcess = 0;
+        ::GetWindowThreadProcessId(Front, &FrontProcess);
+        if (FrontProcess == ::GetCurrentProcessId())
+        {
+            const BOOL bMoved = ::SetForegroundWindow(Window);
+            if (bMoved)
+                ::SetWindowPos(Front, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            RDX_LOGF("the window: brought to the front over the start's own window (%s)",
+                     bMoved ? TEXT("done, that window laid back over it") : TEXT("refused"));
+        }
+    }
     RdxStartupMark(TEXT("backend: the frame resources, a black picture"));
-    // From here to the start's end, whichever way it ends: the caption before every shader that is compiled.
+    // From here to the start's end, whichever way it ends: the caption before every shader that is compiled, and the
+    // compile itself on a thread of its own while this one answers the window (CompilingWait).
     struct FCompilingWatch
     {
-        FCompilingWatch(FBackend* Who) { RdxCompileWatch(&FBackend::CompilingWatch, Who); }
+        FCompilingWatch(FBackend* Who) { RdxCompileWatch(&FBackend::CompilingWatch, Who, &FBackend::CompilingWait); }
         ~FCompilingWatch() { RdxCompileWatch(nullptr, nullptr); }
     };
     CompilingThread = ::GetCurrentThreadId();
@@ -8350,10 +8786,13 @@ UBOOL FBackend::Init(HWND Window, INT InWidth, INT InHeight)
         Sm.HighestShaderModel = D3D_SHADER_MODEL_6_5;
         Solid.SetRtHosted(SUCCEEDED(Device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &Sm, sizeof(Sm))) &&
                           Sm.HighestShaderModel >= D3D_SHADER_MODEL_6_5);
-        Solid.SetRayListViews(RayAnswersView - RtMaskView, RayHeadsUav - WaterSurfaceUavView);
+        Solid.SetRayListViews(RayAnswersView - RtMaskView, RayHeadsUav - WaterSurfaceUavView,
+                              RayAskedLowUav - WaterSurfaceUavView, RayCornersView - RtMaskView);
         Solid.SetOwnLampViews(OwnLampTableView - RtMaskView, OwnLampTableView - BounceMapView);
     }
     Solid.SetWaterShadeView(WaterShadeUav - WaterSurfaceUavView);
+    Solid.SetWetMarkView(WetMarkUav - WaterSurfaceUavView, WetMarkSrv - RtMaskView, WetCoverSrv - WaterSurfaceUavView);
+    Solid.SetCardWriter(this);
     if (!Solid.Init(Device.Get(), bShadows)) return 0;
     RdxStartupMark(TEXT("backend: the solid pass (its pipelines)"));
     if (!Final.Init(Device.Get())) return 0;
@@ -8390,6 +8829,14 @@ UBOOL FBackend::Init(HWND Window, INT InWidth, INT InHeight)
     RdxStartupMark(TEXT("backend: the texture cache"));
     Pom.Init(Device.Get());     // the relief's height maps; a set that is not on disk simply has none
     RdxStartupMark(TEXT("backend: the relief's height maps"));
+    WarmShaders();
+    RdxStartupMark(TEXT("backend: every other shader (WarmShaders)"));
+    // The caption's total against what the start compiled: where the cache's file gave nothing the two are the same,
+    // unless a shader came or went since START_SHADERS was set.
+    if (RdxShaderCacheRead() == 0 && RdxStartupShaders() != START_SHADERS)
+        RDX_LOGF("shaders: the start compiled %i with nothing from the cache's file, its caption counted on %i "
+                 "(START_SHADERS) - that number is to follow it", RdxStartupShaders(), (INT)START_SHADERS);
+    RdxShaderWarmDone();
     Textures.SetCheckParallel(bValidation);
     Textures.SetGpuConvert(bGpuConvert);
 
@@ -9288,7 +9735,10 @@ UBOOL FBackend::SetShadowQuality(INT Quality)
     if (bShadows == bWas && (!bShadows || (Shadow.IsReady() && RdxMath::ShadowMapsSame(ShadowPreset, OldPreset) &&
                                            ShadowPreset.bFullResolution == OldPreset.bFullResolution)))
         return 1;
+    // How long each part takes, for the log: the change stops the game while it runs.
+    const DOUBLE T0 = appSeconds();
     WaitForGpu();                 // the maps are still in the GPU's hands until this returns
+    const DOUBLE T1 = appSeconds();
     // From here on the maps are made again (or dropped), and the arena and the masks with them. The generation tells
     // RenderDevice that what it placed in them is gone: it hands the level over again and forgets its shapes, exactly as
     // after a device made again (GetShadowGeneration).
@@ -9307,16 +9757,21 @@ UBOOL FBackend::SetShadowQuality(INT Quality)
     }
     else
         Shadow.Shutdown();
+    const DOUBLE T2 = appSeconds();
     // The Resize below makes the buffers in the new format: the pipelines first (RebuildForDepthFormat).
     if (bShadows != bWas && !RebuildForDepthFormat())
         return 0;
+    const DOUBLE T3 = appSeconds();
     if (!Resize(Width, Height))
         return 0;
     if (bShadows && !EnsureShadowTarget())
         return 0;
-    RDX_LOGF("shadows: quality changed while running - %i lights, actor cube %i, level cube %i, %i taps, factor %s",
+    const DOUBLE T4 = appSeconds();
+    RDX_LOGF("shadows: quality changed while running - %i lights, actor cube %i, level cube %i, %i taps, factor %s; in "
+             "%.0f ms (the GPU's last frames %.0f, the maps %.0f, the pipelines %.0f, the targets %.0f)",
              ShadowPreset.MaxLights, ShadowPreset.ActorMapSize, ShadowPreset.WorldMapSize, ShadowPreset.FilterTaps,
-             ShadowPreset.bFullResolution ? TEXT("full") : TEXT("half"));
+             ShadowPreset.bFullResolution ? TEXT("full") : TEXT("half"), (T4 - T0) * 1000.0, (T1 - T0) * 1000.0,
+             (T2 - T1) * 1000.0, (T3 - T2) * 1000.0, (T4 - T3) * 1000.0);
     return 1;
 }
 
@@ -9677,6 +10132,7 @@ void FBackend::Shutdown()
         UploadAllocator = nullptr;
     }
     bUploadOpen = 0;
+    ReleaseCardWriter();
 
     for (UINT i = 0; i < BACKEND_FRAME_COUNT; i++)
     {
@@ -9721,6 +10177,9 @@ void FBackend::Shutdown()
     WaterLampBuffer.Release();
     WaterLampMapped  = nullptr;
     bWaterLampFailed = 0;
+    WetLampBuffer.Release();
+    WetLampMapped  = nullptr;
+    bWetLampFailed = 0;
     ReliefLampBuffer.Release();
     ReliefLampMapped  = nullptr;
     bReliefLampFailed = 0;
@@ -9736,6 +10195,12 @@ void FBackend::Shutdown()
     bWaterSurfaceCleared  = 0;
     bWaterSurfaceViewReal = 0;
     WaterSurfaceRtvHeap.Release();
+    WetMark.Release();
+    WetMarkState          = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bWetMarkCleared       = 0;
+    bWetMarkViewReal      = 0;
+    bWetMarkNone          = 0;
+    WetMarkRtvHeap.Release();
     WaterShade.Release();
     WaterShadeState        = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bWaterShadeLive        = 0;
@@ -9845,6 +10310,15 @@ void FBackend::Shutdown()
     Queue.Release();
     InfoQueue.Release();
     Rt.Shutdown();
+    MirrorProbe.Shutdown();
+    MirrorBody.Shutdown();
+    WetReflect.Shutdown();
+    WetReflectReady = 0;
+    RaySparse.Shutdown();
+    bSparseTried     = 0;
+    bProbeTried      = 0;
+    bProbeRefused    = 0;
+    bProbeViewsDirty = 1;
     Device5.Release();
     Device.Release();
     Factory.Release();
@@ -9928,6 +10402,11 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
                    Solid.GetSoftFade(), (INT)bWaterWanted, CloudCardsSeen, CloudsRecent, CopyAsked, CopyRefused);
     }
     bDepthCopyDone = 0;
+    // Where the mirror probe stands this frame, from the panes the last one drew and where its camera was; its passes
+    // not run yet.
+    if (bCamSet && IsProbeMirrorRunning())
+        MirrorProbe.BeginFrame(CamEye);
+    bProbeDone = 0;
     // The frame's mirrors' views, and all that was gathered for their walks.
     MirrorEndCount    = 0;
     MirrorTriCount    = 0;
@@ -10082,6 +10561,8 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
     ShadowSkipCount = 0;
     bBeamOn         = 0;
     Solid.SetBeamLit(0);
+    Solid.SetWet(0);
+    bWetLayerNow    = 0;
     bRtSceneTried   = 0;
     bRtSceneBuilt   = 0;
     RtHostBodies    = -1;
@@ -10145,6 +10626,7 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
     bReactiveInit = 0;
     bWaterSurfaceLive = 0;
     bWaterSurfaceCleared = 0;
+    bWetMarkCleared = 0;
     bWaterShadeLive = 0;
     Solid.SetSplashViews(Textures.GetReservedIndex(SplashViewDepth), Textures.GetReservedIndex(SplashViewThick));
     // The relief's covers' view, and the view of nothing read in its place (ReliefCover): written once, before any covers
@@ -10165,6 +10647,36 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
     }
     Solid.SetCoverViews(bReliefCoverNone ? Textures.GetReservedIndex(ReliefCoverView) : -1,
                         bReliefCoverNone ? Textures.GetReservedIndex(ReliefCoverNone) : -1);
+    // The wet floors' mark's two views: views of nothing until the mark is made (EnsureWetMark), and again once it is
+    // let go - the wet floors' layer on rays reads the one in every frame it runs.
+    if (!bWetMarkViewReal && !bWetMarkNone && Textures.GetHeap())
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC Ud;
+        appMemzero(&Ud, sizeof(Ud));
+        Ud.Format        = DXGI_FORMAT_R32_UINT;
+        Ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        Device->CreateUnorderedAccessView(nullptr, nullptr, &Ud, Textures.GetCpuHandle(Textures.GetReservedIndex(WetMarkUav)));
+        D3D12_SHADER_RESOURCE_VIEW_DESC Sd;
+        appMemzero(&Sd, sizeof(Sd));
+        Sd.Format                  = DXGI_FORMAT_R32_UINT;
+        Sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        Sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        Sd.Texture2D.MipLevels     = 1;
+        Device->CreateShaderResourceView(nullptr, &Sd, Textures.GetCpuHandle(Textures.GetReservedIndex(WetMarkSrv)));
+        bWetMarkNone = 1;
+    }
+    // The rain's cover's view: of nothing until a level's cover is made (SetWetCover) - the wet runs' table holds it.
+    if (!bWetCoverViewSet && Textures.GetHeap())
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC Sd;
+        appMemzero(&Sd, sizeof(Sd));
+        Sd.Format                  = DXGI_FORMAT_R32G32_FLOAT;
+        Sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        Sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        Sd.Texture2D.MipLevels     = 1;
+        Device->CreateShaderResourceView(nullptr, &Sd, Textures.GetCpuHandle(Textures.GetReservedIndex(WetCoverSrv)));
+        bWetCoverViewSet = 1;
+    }
     // The mirrors' map's view (FBeamBounce): a view of nothing until there is a map - no mirror anywhere.
     if (!bBounceNone && Textures.GetHeap())
     {
@@ -10213,6 +10725,9 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
     }
     else
         Solid.SetReliefLamps(0);
+    // The wet floors' lamps for this slot, emptied until SetWetLamps fills them during the frame.
+    if (EnsureWetLamps())
+        appMemzero(WetLampMapped + FrameIndex * RdxMath::WetLampBytes, 16);
     // The shadow maps' casters and lights are this frame's only - RenderDevice.cpp hands them over before EndFrame.
     if (bShadows)
         Shadow.BeginFrame((INT)FrameIndex);
@@ -11043,6 +11558,51 @@ void FBackend::EndFrame(UBOOL Present)
         Solid.SetBeam((INT)FrameIndex, bCone ? Block : nullptr, bCone ? Thin : nullptr, Mirrors, MirrorCount,
                       bOwn ? OwnRowsNow : nullptr, Views);
         appMemcpy(BeamBlockNow, Block, sizeof(BeamBlockNow));
+        // The wet floors' blocks (SolidPass.hlsl's WetConsts): where the world's view stands in the level, its centre in
+        // the target's pixels with this frame's jitter in it - the world is drawn that far off - its projection and the
+        // measuring view asked for, then the look's numbers; one for each kind - stone, metal, wood. None without the
+        // view.
+        if (bCamSet && CloudFocal > 1.0f)
+        {
+            FLOAT Wet[FSolidPass::WET_KINDS][RdxMath::WetBlockFloats];
+            for (INT k = 0; k < FSolidPass::WET_KINDS; k++)
+            {
+                FLOAT* const W = Wet[k];
+                for (INT i = 0; i < 3; i++)
+                {
+                    W[i]                = CamEye[i];
+                    W[4 + i]            = CamAxes[i];
+                    W[8 + i]            = CamAxes[3 + i];
+                    W[12 + i]           = CamAxes[6 + i];
+                }
+                W[3]  = (FLOAT)(k + 1);
+                W[7]  = W[11] = W[15] = 0.0f;
+                W[16] = CloudScreen[0] * Sx + JitterPx[0];
+                W[17] = CloudScreen[1] * Sy + JitterPx[1];
+                W[18] = CloudFocal * Sx;
+                W[19] = (FLOAT)WetShowView;
+                W[20] = RdxMath::WetPatchUnits;
+                W[21] = RdxMath::WetLevelBase;
+                W[22] = RdxMath::WetLevelSpread;
+                W[23] = RdxMath::WetStoneDarkest;
+                W[24] = RdxMath::WetFloodLeast;
+                W[25] = RdxMath::WetFloodMost;
+                W[26] = RdxMath::WetFloodSpread;
+                W[27] = RdxMath::WetPuddleEdge;
+                // The rain's cover over the level (SetWetCover): its grid's corner, and one over its span along X and Y; none
+                // until a level's is made.
+                for (INT c = 0; c < 4; c++)
+                    W[28 + c] = WetCoverNow[c];
+            }
+            Solid.SetWetBlocks((INT)FrameIndex, &Wet[0][0]);
+            appMemcpy(WetBlockNow, Wet[0], sizeof(WetBlockNow));
+            bWetBlockNow = 1;
+        }
+        else
+        {
+            Solid.SetWetBlocks((INT)FrameIndex, nullptr);
+            bWetBlockNow = 0;
+        }
         // What the frame's lamps give the eye and the lens: the weapon lamps' glares and ghosts, and the
         // flashlight's images in its mirrors and panes.
         MakeLampFlares(bCone ? Block : nullptr);
@@ -12109,6 +12669,398 @@ void FBackend::WaterSurfaceSettle(ID3D12GraphicsCommandList* Cmd)
     Cmd->ResourceBarrier((bWaterShadeLive && WaterShade) ? 2u : 1u, B);
 }
 
+INT FBackend::WetMarkView(ID3D12GraphicsCommandList* Cmd)
+{
+    const INT View = Textures.GetReservedIndex(WetMarkUav);
+    if (EnsureWetMark())
+    {
+        if (!bWetMarkCleared)
+        {
+            WetMarkTo(Cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const FLOAT Zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            Cmd->ClearRenderTargetView(WetMarkRtvHeap->GetCPUDescriptorHandleForHeapStart(), Zero, 0, nullptr);
+            bWetMarkCleared = 1;
+        }
+        WetMarkTo(Cmd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    else if (!bWetMarkViewReal)
+    {
+        // Bound all the same: a view of nothing, which takes no write.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC Ud;
+        appMemzero(&Ud, sizeof(Ud));
+        Ud.Format        = DXGI_FORMAT_R32_UINT;
+        Ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        Device->CreateUnorderedAccessView(nullptr, nullptr, &Ud, Textures.GetCpuHandle(View));
+    }
+    // The table the run binds starts at the water's own depth's view; the mark's is WetMarkUav's distance after it.
+    return Textures.GetReservedIndex(WaterSurfaceUavView);
+}
+
+UBOOL FBackend::EnsureWetMark()
+{
+    if (WetMark && WetMarkRtvHeap)
+        return 1;
+    if (!Device || !Textures.GetHeap() || SceneWidth <= 0 || SceneHeight <= 0)
+        return 0;
+    static INT Told = 0;
+    if (!WetMarkRtvHeap)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC HeapDesc;
+        appMemzero(&HeapDesc, sizeof(HeapDesc));
+        HeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        HeapDesc.NumDescriptors = 1;
+        if (FAILED(Device->CreateDescriptorHeap(&HeapDesc, __uuidof(ID3D12DescriptorHeap), WetMarkRtvHeap.VoidSlot())))
+        {
+            if (Told++ < 3)
+                RdxLog(TEXT("wet floors: their mark's render target view's heap would not be made"));
+            return 0;
+        }
+    }
+    // Typeless: cleared through a float view of the same bits (zero is zero either way), written and read as a whole
+    // number.
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC Desc;
+    appMemzero(&Desc, sizeof(Desc));
+    Desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    Desc.Width            = (UINT64)SceneWidth * 2;     // a pixel's mark at its even column, its relief's normal beside it
+    Desc.Height           = SceneHeight;
+    Desc.DepthOrArraySize = 1;
+    Desc.MipLevels        = 1;
+    Desc.SampleDesc.Count = 1;
+    Desc.Format           = DXGI_FORMAT_R32_TYPELESS;
+    Desc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_CLEAR_VALUE Clear;
+    appMemzero(&Clear, sizeof(Clear));
+    Clear.Format = DXGI_FORMAT_R32_FLOAT;
+    WetMark.Release();
+    if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                               &Clear, __uuidof(ID3D12Resource), WetMark.VoidSlot())))
+    {
+        WetMark.Release();
+        if (Told++ < 3)
+            RdxLog(TEXT("wet floors: their %ix%i mark would not be made - they are drawn wet, with no reflection"),
+                   SceneWidth, SceneHeight);
+        return 0;
+    }
+    WetMarkState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    D3D12_RENDER_TARGET_VIEW_DESC Rd;
+    appMemzero(&Rd, sizeof(Rd));
+    Rd.Format        = DXGI_FORMAT_R32_FLOAT;
+    Rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    Device->CreateRenderTargetView(WetMark.Get(), &Rd, WetMarkRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_UNORDERED_ACCESS_VIEW_DESC Ud;
+    appMemzero(&Ud, sizeof(Ud));
+    Ud.Format        = DXGI_FORMAT_R32_UINT;
+    Ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    Device->CreateUnorderedAccessView(WetMark.Get(), nullptr, &Ud, Textures.GetCpuHandle(Textures.GetReservedIndex(WetMarkUav)));
+    D3D12_SHADER_RESOURCE_VIEW_DESC Sd;
+    appMemzero(&Sd, sizeof(Sd));
+    Sd.Format                  = DXGI_FORMAT_R32_UINT;
+    Sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    Sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    Sd.Texture2D.MipLevels     = 1;
+    Device->CreateShaderResourceView(WetMark.Get(), &Sd, Textures.GetCpuHandle(Textures.GetReservedIndex(WetMarkSrv)));
+    bWetMarkViewReal = 1;
+    RdxLog(TEXT("wet floors: their mark ready, %ix%i - the nearest wet floor at each pixel and its relief's normal, for ")
+           TEXT("the late reflection pass"), SceneWidth * 2, SceneHeight);
+    return 1;
+}
+
+// Its pipelines carry the picture's format, the depth's and the sample count: where one of them moved since they were
+// made - the HDR key, the shadows on or off, the multisampling, each changed after waiting for the GPU, so nothing in
+// flight still draws with them - they are made again. Drawn with the old ones, every pixel of the pass would be
+// written in the wrong format (D3D12 ERROR #613).
+UBOOL FBackend::EnsureWetReflect()
+{
+    const DXGI_FORMAT WetDepth = bShadows ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
+    if (WetReflectReady != 0 &&
+        (WetReflectFor[0] != Colours.Draw || WetReflectFor[1] != WetDepth || WetReflectSamples != MsaaCount))
+    {
+        WetReflect.Shutdown();
+        WetReflectReady = 0;
+        RdxLog(TEXT("wet floors: the reflection pass made again - the picture's or the depth's format, or the samples, "
+                    "moved"));
+    }
+    if (WetReflectReady == 0 && Device)
+    {
+        WetReflectReady   = WetReflect.Init(Device.Get(), Colours.Draw, RDX_LIGHT_TARGET_FORMAT, WetDepth, MsaaCount)
+                                ? 1 : -1;
+        WetReflectFor[0]  = Colours.Draw;
+        WetReflectFor[1]  = WetDepth;
+        WetReflectSamples = MsaaCount;
+    }
+    return WetReflectReady > 0;
+}
+
+// Every shader the renderer may ask for, compiled while it starts, so that no level's load and no change in the menu
+// waits on the compiler (Laci's rule: every shader at the start, none later). The passes made at their first use are
+// made now, by their own flags where they have them; the passes of the modes not running - HDR, the picture's
+// scaling, the upscaling, FXAA and SMAA, the occlusion, the shadows' application and their maps, the rays' shadows'
+// smoothing, the rays' far probe, the motion vectors and the measuring views - are made now and left unused, their shaders kept; and the
+// builds that differ by the shadows - the solid pass's (bStencilKinds) and the depth's resolve with the multisampling -
+// are made for the other way too, then made again as the shadows are, that second time from the shader cache. A pass
+// whose own flag is left alone is made again where it is first used, from the cache. With the cache whole none of this
+// compiles anything; after a new renderer or without the cache this is where the time goes, once.
+void FBackend::WarmShaders()
+{
+    ID3D12Device* const D = Device.Get();
+    if (!D)
+        return;
+    const DXGI_FORMAT DepthFormat = bShadows ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
+    // The passes made at their first use.
+    if (BounceReady == 0)
+        BounceReady = Bounce.Init(D) ? 1 : -1;
+    if (DepthNearerReady == 0)
+        DepthNearerReady = Final.InitDepthNearer(D) ? 1 : -1;
+    if (FogRoomsReady == 0)
+        FogRoomsReady = FogRoom.Init(D) ? 1 : -1;
+    if (FieldReady == 0)
+        FieldReady = Field.Init(D) ? 1 : -1;
+    if (DofReady == 0)
+        DofReady = Dof.Init(D) ? 1 : -1;
+    WalkReady();
+    Volume.WarmHaze(D, Colours.Draw);
+    EnsureMirrorProbe();
+    EnsureWetReflect();
+    if (MotionObjReady == 0)
+    {
+        MotionObjReady  = Final.InitMotionObjects(D, DepthFormat, bMotionNoDepth) ? 1 : -1;
+        MotionObjFormat = DepthFormat;
+    }
+    Final.InitWaterStamp(D, DepthFormat);
+    EnsureSplashes();
+    EnsureRipples();
+    EnsureCaustics();
+    EnsureCausticLay(Colours.Draw, (MsaaCount > 1) ? (UINT)MsaaSampleCount() : 1u);
+    // The modes not running: their passes made, left unused.
+    Final.InitHdr(D);
+    Final.InitBox(D);
+    Final.InitUpscale(D);
+    Final.InitFxaa(D);
+    Final.InitSmaa(D);
+    Final.InitAo(D);
+    Final.InitShadow(D, Colours.Draw);
+    Final.InitWaterPack(D);
+    Final.InitRtFactorBlur(D);
+    Final.InitMotion(D);
+    Final.InitDepth(D);
+    Final.InitMotionView(D);
+    Final.InitCaption(D);
+    FShadowMaps::WarmShaders();
+    FRtPass::WarmShaders();
+    // The builds that differ by the shadows: the other way first, then this one again.
+    Final.InitMsaaDepth(D, 4, !bShadows);
+    Final.InitMsaaDepth(D, 4, bShadows);
+    if (MsaaCount > 1)
+        Final.InitMsaaDepth(D, MsaaCount, bShadows);
+    Solid.SetStencilKinds(!bShadows);
+    Solid.RebuildPipelines(D);
+    Solid.SetStencilKinds(bShadows);
+    if (!Solid.RebuildPipelines(D))
+        RDX_LOG("shaders: the geometry pass's pipelines could not be made again after the other build's");
+}
+
+UBOOL FBackend::DrawWetReflections(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTOR_HANDLE Dsv)
+{
+    // Only where a wet floor was drawn this frame - its first run cleared the mark - and the view had its place. The
+    // mark readable from here on whatever this pass does: the wet floors' layer on rays reads it too.
+    bWetDrawnNow = 0;
+    if (!bWetMarkCleared || !WetMark || !Cmd)
+        return 0;
+    WetMarkTo(Cmd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // At the Default reflections the wet floors give nothing back: their darkened stone is the solid pass's own.
+    if (!bWetBlockNow || !Textures.GetHeap() || ReflectionLevel == 0)
+        return 0;
+    // The lamps' slot is the pass's constant buffer: without it there is no pass (the frame's start made it).
+    if (!EnsureWetReflect() || !EnsureWetLamps())
+        return 0;
+    BindSceneTargets(Cmd, Dsv);
+    FLOAT C[FWetReflect::CONSTANTS];
+    appMemcpy(C, WetBlockNow, sizeof(WetBlockNow));
+    FLOAT* const More = C + RdxMath::WetBlockFloats;
+    More[0] = (FLOAT)SceneWidth;
+    More[1] = (FLOAT)SceneHeight;
+    More[2] = 1.0f / (FLOAT)Max(SceneWidth, 1);
+    More[3] = 1.0f / (FLOAT)Max(SceneHeight, 1);
+    More[4] = RdxMath::WetFilmShare;
+    More[5] = RdxMath::WetDampSpread;
+    More[6] = RdxMath::WetStreakStrength;
+    More[7] = RdxMath::WetStreakRough;
+    More[8] = RdxMath::WetStreakPuddleRough;
+    More[9] = More[10] = More[11] = 0.0f;
+    // Whether the water's image is the rays' this frame (the layer on rays, AddWetLayer): then this pass leaves it.
+    More[12] = (bWetLayerNow && IsRtMirrorRunning()) ? 1.0f : 0.0f;
+    More[13] = WetRainNow[0];
+    More[14] = WetRainNow[1];
+    // The wet floors' image by the level: none (Low), coarse (Medium), the full trace.
+    More[15] = RdxMath::ReflectionsWetImage(ReflectionLevel) ? (RdxMath::ReflectionsWetCoarse(ReflectionLevel) ? 1.0f : 2.0f)
+                                                              : 0.0f;
+    // The own lamps - the flashlight, the weapon lamps - for their glints (WetReflect.hlsl's WetSpots): each one's lens
+    // in the view's space as the wet floors' view has it, the glass of FBeamBounce::LampRadius, its light as its cone
+    // throws it - the cone's own numbers, as the solid pass's own lamps - and its axis. The lens as bright as that
+    // light makes it: the cone's light at a distance d is its colour by BeamHalfDist squared over d squared, a ball of
+    // the lens's radius gives that at a brightness of that over pi r squared.
+    {
+        enum { SPOT_ROWS = 2 + 3 * RdxMath::OwnLampMost };
+        FLOAT* const S = GrassBlock(SPOT_ROWS, WetSpotsNow);
+        if (S)
+        {
+            appMemzero(S, SPOT_ROWS * 4 * sizeof(FLOAT));
+            const FLOAT* const V = WetBlockNow;          // the view's eye, then its axes: right, down, forward
+            const FLOAT        R = FBeamBounce::LampRadius;
+            const FLOAT        Bright = RdxMath::BeamHalfDist * RdxMath::BeamHalfDist / (PI * R * R);
+            INT                N = 0;
+            for (INT i = 0; i < OwnLampCount && i < (INT)RdxMath::OwnLampMost; i++)
+            {
+                const FOwnLamp& L = OwnLamps[i];
+                const FLOAT     Q[3] = { L.At[0] - V[0], L.At[1] - V[1], L.At[2] - V[2] };
+                FLOAT* const    O = S + 8 + 12 * N++;
+                for (INT a = 0; a < 3; a++)
+                {
+                    O[a]     = Q[0] * V[4 * (a + 1)] + Q[1] * V[4 * (a + 1) + 1] + Q[2] * V[4 * (a + 1) + 2];
+                    O[8 + a] = L.Aim[0] * V[4 * (a + 1)] + L.Aim[1] * V[4 * (a + 1) + 1] + L.Aim[2] * V[4 * (a + 1) + 2];
+                    O[4 + a] = L.Colour[a] * Bright;
+                }
+                O[3] = R;
+            }
+            S[0] = (FLOAT)N;
+            S[1] = RdxMath::BeamSpillShare;
+            S[4] = RdxMath::BeamRimCos;
+            S[5] = 1.0f / (RdxMath::BeamHotCos - RdxMath::BeamRimCos);
+            S[6] = RdxMath::BeamSpillRimCos;
+            S[7] = 1.0f / (RdxMath::BeamSpillHotCos - RdxMath::BeamSpillRimCos);
+        }
+    }
+    if (!WetSpotsNow)
+        return 0;
+    // The targets BindSceneTargets bound: three with the shadows' where it found them, else the picture alone.
+    const UBOOL bMsaa  = MsaaWorldLive();
+    const UBOOL bThree = (bShadows && (bMsaa ? (MsaaLight && MsaaAdded)
+                                             : (LightTarget && AddedTarget && LightRtvHeap))) ? 1 : 0;
+    WetReflect.Draw(Cmd, Textures.GetHeap(), C, Textures.GetGpuHandle(WaterSlot(0, WaterViewPicture)),
+                    Textures.GetGpuHandle(WaterSlot(0, WaterViewDepth)),
+                    Textures.GetGpuHandle(Textures.GetReservedIndex(WetMarkSrv)),
+                    Textures.GetGpuHandle(Textures.GetReservedIndex(WetCoverSrv)),
+                    WetLampBuffer->GetGPUVirtualAddress() + (UINT64)FrameIndex * RdxMath::WetLampBytes, WetSpotsNow,
+                    bThree, bMsaa);
+    // Kept for the second draw, the fires' flames, after the volumetric walk (DrawVolumetrics).
+    appMemcpy(WetConstNow, C, sizeof(C));
+    bWetDrawnNow = 1;
+    bWetMsaaNow  = bMsaa;
+    return 1;
+}
+
+void FBackend::SetWetCover(const FLOAT* Cells, INT W, INT H, FLOAT X, FLOAT Y, FLOAT Cell)
+{
+    for (INT c = 0; c < 4; c++)
+        WetCoverNow[c] = 0.0f;
+    if (!Device || !Textures.GetHeap())
+        return;
+    const INT  Pair = 1 - WetCoverPair;
+    const UINT Row  = (UINT)W * 4 * sizeof(FLOAT);
+    const UINT Pitch = (Row + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UBOOL      bMade = 0;
+    if (Cells && W > 0 && H > 0 && Cell > 0.0f && bInFrame && CommandList)
+    {
+        // The pair two levels old goes; this level's is made in its place.
+        WetCoverTex[Pair].Release();
+        WetCoverUp[Pair].Release();
+        D3D12_HEAP_PROPERTIES Heap;
+        appMemzero(&Heap, sizeof(Heap));
+        Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC Desc;
+        appMemzero(&Desc, sizeof(Desc));
+        Desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        Desc.Width            = (UINT64)W;
+        Desc.Height           = (UINT)H;
+        Desc.DepthOrArraySize = 1;
+        Desc.MipLevels        = 1;
+        Desc.SampleDesc.Count = 1;
+        Desc.Format           = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        D3D12_HEAP_PROPERTIES Up;
+        appMemzero(&Up, sizeof(Up));
+        Up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC UpDesc;
+        appMemzero(&UpDesc, sizeof(UpDesc));
+        UpDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        UpDesc.Width            = (UINT64)Pitch * (UINT64)H;
+        UpDesc.Height           = 1;
+        UpDesc.DepthOrArraySize = 1;
+        UpDesc.MipLevels        = 1;
+        UpDesc.SampleDesc.Count = 1;
+        UpDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        BYTE*       Mapped = nullptr;
+        D3D12_RANGE NoRead = { 0, 0 };
+        if (SUCCEEDED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                      nullptr, __uuidof(ID3D12Resource), WetCoverTex[Pair].VoidSlot())) &&
+            SUCCEEDED(Device->CreateCommittedResource(&Up, D3D12_HEAP_FLAG_NONE, &UpDesc,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      __uuidof(ID3D12Resource), WetCoverUp[Pair].VoidSlot())) &&
+            SUCCEEDED(WetCoverUp[Pair]->Map(0, &NoRead, (void**)&Mapped)) && Mapped)
+        {
+            for (INT y = 0; y < H; y++)
+                appMemcpy(Mapped + (SIZE_T)Pitch * y, Cells + (SIZE_T)y * W * 4, Row);
+            WetCoverUp[Pair]->Unmap(0, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION Dst;
+            appMemzero(&Dst, sizeof(Dst));
+            Dst.pResource        = WetCoverTex[Pair].Get();
+            Dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            Dst.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION Src;
+            appMemzero(&Src, sizeof(Src));
+            Src.pResource                          = WetCoverUp[Pair].Get();
+            Src.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            Src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            Src.PlacedFootprint.Footprint.Width    = (UINT)W;
+            Src.PlacedFootprint.Footprint.Height   = (UINT)H;
+            Src.PlacedFootprint.Footprint.Depth    = 1;
+            Src.PlacedFootprint.Footprint.RowPitch = Pitch;
+            CommandList->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+            D3D12_RESOURCE_BARRIER B;
+            appMemzero(&B, sizeof(B));
+            B.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            B.Transition.pResource   = WetCoverTex[Pair].Get();
+            B.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            B.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            B.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            CommandList->ResourceBarrier(1, &B);
+            WetCoverPair  = Pair;
+            WetCoverNow[0] = X;
+            WetCoverNow[1] = Y;
+            WetCoverNow[2] = 1.0f / (Cell * (FLOAT)W);
+            WetCoverNow[3] = 1.0f / (Cell * (FLOAT)H);
+            bMade          = 1;
+        }
+        else
+        {
+            WetCoverTex[Pair].Release();
+            WetCoverUp[Pair].Release();
+            RdxLog(TEXT("wet floors: the rain's cover's %ix%i texture would not be made - everywhere open"), W, H);
+        }
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC Sd;
+    appMemzero(&Sd, sizeof(Sd));
+    Sd.Format                  = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    Sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    Sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    Sd.Texture2D.MipLevels     = 1;
+    Device->CreateShaderResourceView(bMade ? WetCoverTex[WetCoverPair].Get() : nullptr, &Sd,
+                                     Textures.GetCpuHandle(Textures.GetReservedIndex(WetCoverSrv)));
+    bWetCoverViewSet = 1;
+}
+
+void FBackend::WetMarkTo(ID3D12GraphicsCommandList* Cmd, D3D12_RESOURCE_STATES State)
+{
+    if (!WetMark || WetMarkState == State)
+        return;
+    D3D12_RESOURCE_BARRIER B;
+    SplashBarrier(B, WetMark.Get(), WetMarkState, State);
+    Cmd->ResourceBarrier(1, &B);
+    WetMarkState = State;
+}
+
 // The view the water's runs bind at u6 where the shade is not made: one of nothing, which takes no write.
 void FBackend::WaterShadeViewNone()
 {
@@ -12997,8 +13949,8 @@ UBOOL FBackend::DrawSplashes(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTO
     // The water's own mirror looks for the screen's centre where a water run has it (the shader's WaterScreen.xy).
     Composite[16] = SplashCentreX;
     Composite[17] = SplashCentreY;
-    // And whether the water mirrors at all, as a water run is told (WaterSpare.x): with the reflections on.
-    Composite[32] = RdxMath::ReflectionsHasMirror(ReflectionLevel) ? 1.0f : 0.0f;
+    // And how the water mirrors, as a water run is told (WaterSpare.x, RdxMath::WaterMirrorSwitch).
+    Composite[32] = RdxMath::WaterMirrorSwitch(ReflectionLevel);
     // And the nearest fountains, for their water's own look and their slot's light (the shader's CurtainLightAt), in
     // the numbers the view leaves free - 12 to 15 and 18 to 31 - RdxMath::CurtainLitFloats each: the slot's one end
     // from the camera, its other end on the level, the fall's height; none where that height is zero.
@@ -13142,6 +14094,54 @@ void FBackend::SetReliefLamps(const FLOAT* Lamps, INT Count)
     ReliefLampCopy[0] = (FLOAT)Count;
     for (INT i = 0; i < Count * 8; i++)
         ReliefLampCopy[4 + i] = Lamps[i];
+}
+
+UBOOL FBackend::EnsureWetLamps()
+{
+    if (WetLampBuffer)
+        return 1;
+    if (bWetLampFailed || !Device)
+        return 0;
+    bWetLampFailed = 1;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC Buf;
+    appMemzero(&Buf, sizeof(Buf));
+    Buf.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    Buf.Width            = (UINT64)RdxMath::WetLampBytes * BACKEND_FRAME_COUNT;
+    Buf.Height           = 1;
+    Buf.DepthOrArraySize = 1;
+    Buf.MipLevels        = 1;
+    Buf.SampleDesc.Count = 1;
+    Buf.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (!Check(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Buf, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               __uuidof(ID3D12Resource), WetLampBuffer.VoidSlot()),
+               TEXT("CreateCommittedResource(wet lamps)")) ||
+        FAILED(WetLampBuffer->Map(0, nullptr, (void**)&WetLampMapped)))
+    {
+        WetLampBuffer.Release();
+        WetLampMapped = nullptr;
+        return 0;
+    }
+    appMemzero(WetLampMapped, RdxMath::WetLampBytes * BACKEND_FRAME_COUNT);     // no lamps in any slot until they are set
+    bWetLampFailed = 0;
+    return 1;
+}
+
+void FBackend::SetWetLamps(const FLOAT* Lamps, INT Count)
+{
+    static_assert(RdxMath::WetLampBytes <= 65536 && (RdxMath::WetLampBytes % 256) == 0,
+                  "a wet lamp slot is one constant buffer, on a constant buffer's alignment");
+    if (!WetLampMapped || FrameIndex >= BACKEND_FRAME_COUNT || !Lamps)
+        return;
+    Count = Clamp(Count, 0, (INT)RdxMath::WetLampMax);
+    // The shader's layout: how many, then two rows of four a lamp - it reads no further than the count.
+    FLOAT* const Slot = (FLOAT*)(WetLampMapped + FrameIndex * RdxMath::WetLampBytes);
+    appMemzero(Slot, 4 * sizeof(FLOAT));
+    Slot[0] = (FLOAT)Count;
+    for (INT i = 0; i < Count * 8; i++)
+        Slot[4 + i] = Lamps[i];
 }
 
 void FBackend::SetWaterLamps(const FLOAT* Lamps, INT Count)
@@ -13816,11 +14816,12 @@ UBOOL FBackend::EnsureCausticLay(DXGI_FORMAT Format, UINT Samples)
     {
         D3D12_DESCRIPTOR_RANGE Ranges[2];
         appMemzero(Ranges, sizeof(Ranges));
+        // The water's set from its depth up to the net (the probe's view after them is not the caustics').
         Ranges[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        Ranges[0].NumDescriptors     = WaterSetViews - WaterViewDepth;
+        Ranges[0].NumDescriptors     = WaterViewNet + 1 - WaterViewDepth;
         Ranges[1].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         Ranges[1].NumDescriptors     = 1;
-        Ranges[1].BaseShaderRegister = WaterSetViews - WaterViewDepth;
+        Ranges[1].BaseShaderRegister = WaterViewNet + 1 - WaterViewDepth;
         D3D12_ROOT_PARAMETER Params[3];
         appMemzero(Params, sizeof(Params));
         Params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

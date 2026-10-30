@@ -121,8 +121,13 @@
     <ClInclude Include="Bloom.h" />
     <ClInclude Include="FieldVolume.h" />
     <ClInclude Include="HoloShell.h" />
+    <ClInclude Include="MirrorBody.h" />
+    <ClInclude Include="WetReflect.h" />
+    <ClInclude Include="MirrorProbe.h" />
+    <ClInclude Include="RaySparse.h" />
     <ClInclude Include="FogRooms.h" />
     <ClInclude Include="ShadowMaps.h" />
+    <ClInclude Include="CardWriter.h" />
     <ClInclude Include="DustShader.h" />
     <ClInclude Include="GrassShader.h" />
     <ClInclude Include="TreeGen.h" />
@@ -144,6 +149,7 @@
     <ClInclude Include="RenderLimits.h" />
     <ClInclude Include="ShaderCache.h" />
     <ClInclude Include="DepthOfField.h" />
+    <ClInclude Include="ShotWriter.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Backend.cpp" />
@@ -162,6 +168,10 @@
     <ClCompile Include="Bloom.cpp" />
     <ClCompile Include="FieldVolume.cpp" />
     <ClCompile Include="HoloShell.cpp" />
+    <ClCompile Include="MirrorBody.cpp" />
+    <ClCompile Include="WetReflect.cpp" />
+    <ClCompile Include="MirrorProbe.cpp" />
+    <ClCompile Include="RaySparse.cpp" />
     <ClCompile Include="FogRooms.cpp" />
     <ClCompile Include="ShadowMaps.cpp" />
     <ClCompile Include="Fsr3Pass.cpp" />
@@ -178,12 +188,49 @@
     <ClCompile Include="RtPass.cpp" />
     <ClCompile Include="ShaderCache.cpp" />
     <ClCompile Include="DepthOfField.cpp" />
+    <ClCompile Include="ShotWriter.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="SecondRevision.int" />
     <None Include="ShadowFactorSurface.hlsli" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The wet floors' late reflection pass (WetReflect.hlsl): its text goes into the DLL, compiled at run time
+         (WetReflect.cpp). -->
+    <CustomBuild Include="WetReflect.hlsl">
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\..\scripts\embed-text.ps1" -Out "$(IntDir)WetReflectText.h" -Pairs "GWetReflectText=%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
+      <Outputs>$(IntDir)WetReflectText.h</Outputs>
+      <Message>Shader: WetReflect.hlsl (its text)</Message>
+    </CustomBuild>
+    <!-- The own body in the panes where no rays run (MirrorBody.hlsl): its text goes into the DLL, compiled at run time
+         (MirrorBody.cpp). -->
+    <CustomBuild Include="MirrorBody.hlsl">
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\..\scripts\embed-text.ps1" -Out "$(IntDir)MirrorBodyText.h" -Pairs "GMirrorBodyText=%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
+      <Outputs>$(IntDir)MirrorBodyText.h</Outputs>
+      <Message>Shader: MirrorBody.hlsl (its text)</Message>
+    </CustomBuild>
+    <!-- The mirror probe gathered from the picture (MirrorProbe.hlsl): its passes' text goes into the DLL, compiled at run
+         time like every other pass that needs no shader model 6 (MirrorProbe.cpp). -->
+    <CustomBuild Include="MirrorProbe.hlsl">
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\..\scripts\embed-text.ps1" -Out "$(IntDir)MirrorProbeText.h" -Pairs "GMirrorProbeText=%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
+      <Outputs>$(IntDir)MirrorProbeText.h</Outputs>
+      <Message>Shader: MirrorProbe.hlsl (its text)</Message>
+    </CustomBuild>
+    <!-- Reflections=RTLow's pass over the rays' list (RaySparse.hlsl): DXIL by dxc, as the geometry pass's builds on rays,
+         whose list it reads by the same text (RaySparse.cpp). -->
+    <CustomBuild Include="RaySparse.hlsl">
+      <Command>"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T cs_6_0 -E SparseCS -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)RaySparseCS.h" -Vn GRaySparseCS "%(FullPath)"
+if errorlevel 1 exit /b 1</Command>
+      <AdditionalInputs>$(ProjectDir)RenderLimits.h;$(ProjectDir)RayListSlots.hlsli</AdditionalInputs>
+      <Outputs>$(IntDir)RaySparseCS.h</Outputs>
+      <Message>Shader: RaySparse.hlsl (DXIL)</Message>
+    </CustomBuild>
     <!-- The shadow factor (ShadowFactor.hlsl, and the statements it includes): its text goes into the DLL for the maps'
          factor, compiled at run time like every other pass (FinalPass.cpp). The rays' factor and occlusion of the same
          source (RDX_RT=1) are the 64-bit host's to build (Host64.vcxproj). -->
@@ -224,6 +271,12 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSGlassMirrorLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostGlassMirrorPSLit.h" -Vn GSolidPassRtHostGlassMirrorPSLit "%(FullPath)"
 if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWetMirrorAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskWetMirrorPS.h" -Vn GSolidPassRtAskWetMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWetMirror -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostWetMirrorPS.h" -Vn GSolidPassRtHostWetMirrorPS "%(FullPath)"
+if errorlevel 1 exit /b 1
+"$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWetMirrorLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostWetMirrorPSLit.h" -Vn GSolidPassRtHostWetMirrorPSLit "%(FullPath)"
+if errorlevel 1 exit /b 1
 "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWater -D RDX_RT=1 -D RDX_RT_HOST=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostPS.h" -Vn GSolidPassRtHostPS "%(FullPath)"
 if errorlevel 1 exit /b 1
 "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSWaterLit -D RDX_RT=1 -D RDX_RT_HOST=1 -D RDX_LIGHT_TARGET=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtHostPSLit.h" -Vn GSolidPassRtHostPSLit "%(FullPath)"
@@ -249,7 +302,7 @@ if errorlevel 1 exit /b 1
 "$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\dxc.exe" -nologo -T ps_6_5 -E PSPaneKeepAsk -D RDX_RT=1 -D RDX_RT_ASK=1 -O3 -Qstrip_debug -Qstrip_reflect -Fh "$(IntDir)SolidPassRtAskPaneKeepPS.h" -Vn GSolidPassRtAskPaneKeepPS "%(FullPath)"
 if errorlevel 1 exit /b 1</Command>
       <AdditionalInputs>$(ProjectDir)RenderLimits.h;$(ProjectDir)RayListSlots.hlsli;$(ProjectDir)RtTables.hlsli;$(ProjectDir)RtLampLight.hlsli;$(ProjectDir)..\..\scripts\embed-text.ps1</AdditionalInputs>
-      <Outputs>$(IntDir)SolidPassText.h;$(IntDir)SolidPassRtVS.h;$(IntDir)SolidPassRtHS.h;$(IntDir)SolidPassRtDS.h;$(IntDir)SolidPassRtMarkPS.h;$(IntDir)SolidPassRtMarkPSLit.h;$(IntDir)SolidPassRtFlashVS.h;$(IntDir)SolidPassRtMainVS.h;$(IntDir)SolidPassRtAskGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPSLit.h;$(IntDir)SolidPassRtHostPS.h;$(IntDir)SolidPassRtHostPSLit.h;$(IntDir)SolidPassRtAskPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPSLit.h;$(IntDir)SolidPassRtAskSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSplashPS.h;$(IntDir)SolidPassRtHostSplashPSLit.h;$(IntDir)SolidPassRtAskSplashPS.h;$(IntDir)SolidPassRtAskMarkPS.h;$(IntDir)SolidPassRtHostPaneKeepPS.h;$(IntDir)SolidPassRtAskPaneKeepPS.h</Outputs>
+      <Outputs>$(IntDir)SolidPassText.h;$(IntDir)SolidPassRtVS.h;$(IntDir)SolidPassRtHS.h;$(IntDir)SolidPassRtDS.h;$(IntDir)SolidPassRtMarkPS.h;$(IntDir)SolidPassRtMarkPSLit.h;$(IntDir)SolidPassRtFlashVS.h;$(IntDir)SolidPassRtMainVS.h;$(IntDir)SolidPassRtAskGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPS.h;$(IntDir)SolidPassRtHostGlassMirrorPSLit.h;$(IntDir)SolidPassRtAskWetMirrorPS.h;$(IntDir)SolidPassRtHostWetMirrorPS.h;$(IntDir)SolidPassRtHostWetMirrorPSLit.h;$(IntDir)SolidPassRtHostPS.h;$(IntDir)SolidPassRtHostPSLit.h;$(IntDir)SolidPassRtAskPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSludgeMirrorPSLit.h;$(IntDir)SolidPassRtAskSludgeMirrorPS.h;$(IntDir)SolidPassRtHostSplashPS.h;$(IntDir)SolidPassRtHostSplashPSLit.h;$(IntDir)SolidPassRtAskSplashPS.h;$(IntDir)SolidPassRtAskMarkPS.h;$(IntDir)SolidPassRtHostPaneKeepPS.h;$(IntDir)SolidPassRtAskPaneKeepPS.h</Outputs>
       <Message>Shader: SolidPass.hlsl (its text, and the DXIL of the runs on rays: each one's asking and its reading of the 64-bit host's answers)</Message>
     </CustomBuild>
   </ItemGroup>

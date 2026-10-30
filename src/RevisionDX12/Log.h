@@ -50,7 +50,8 @@ void RdxStartupReport(const TCHAR* When);
 // A shader, for the start's clock: Ms spent on it, compiled (bCompiled) or taken from the cache (RdxCompile). Every mark
 // then says how much of its step went on shaders.
 void RdxStartupNoteShader(DOUBLE Ms, UBOOL bCompiled);
-// How many shaders the process has asked for so far - compiled and read from the file together.
+// How many shaders the process has compiled so far - the ones read from the cache's file not counted: the start's
+// caption (FBackend::PresentCompiling).
 INT  RdxStartupShaders();
 
 #define RDX_LOG(text)      RdxLog(TEXT("%s"), TEXT(text))

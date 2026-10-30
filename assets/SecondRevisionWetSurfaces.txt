@@ -1,0 +1,70 @@
+; SecondRevisionWetSurfaces.txt - the floors that get wet where it rains: the texture's package and own name, as the
+; renderer's readout shows them (with their underscores), then stone (soaks the water up and darkens), metal (only a
+; film of water on it) or wood (soaks the water up and darkens, gives nothing back). What follows a ';' is a remark.
+Paris.pa_sidewalk_a             stone
+Paris.pa_street_a               stone
+CoreTexConcrete.RoadBlacktop_B  stone
+CoreTexMetal.GripMetlFloor_A    metal
+UNATCO.un_sBrickwalk            stone
+UNATCO.un_heli_c                stone
+UNATCO.un_statwlkwy_c           stone
+UNATCO.un_statwlkwy_d           stone
+CoreTexMetal.Heli_LiftMetl_A    metal
+CoreTexMetal.Heli_LiftDetl_B    metal
+CoreTexMetal.DrtyIronWOriv_A    metal
+Mobile_Camp.mc_trler_gnrc       stone   ; green and mottled - painted metal or moss: to be seen
+BatteryPark.BP_HexWalk          stone
+BatteryPark.Pebwalk2            stone
+BatteryPark.BP_BrickWalksX      stone
+CoreTexConcrete.ClenGreyStret_B stone
+CoreTexEarth.ChipRockGravl_A    stone
+NewYorkCity.2ndAveSub_flr       stone
+NewYorkCity.2ndAveSub_flrS      stone
+NewYorkCity.NSF_Concrete_A      stone
+NewYorkCity.WareHouseBlock2     stone
+NewYorkCity.WareHousBlock1      stone
+Supertanker.shipskin01          metal
+Supertanker.ST_StorCeiln        metal
+area51textures.Area51Wall_A     metal
+HK_BuildingExt.ClenWhteWall_B   metal
+UNATCO.un_dock_S                wood
+CoreTexWood.BoatHouseWood_A     wood
+NYCBar.BoatHouseWood_B          wood
+BatteryPark.DGW2                wood
+HK_BuildingExt.ClenBrwnSngle_A  wood    ; brown shingles - its package's group is wood
+BatteryPark.BP_sHexWalk         stone
+HK_BuildingExt.HKM_Bricks_01    stone
+HK_BuildingExt.ClenGreySdwlk_A  stone
+HK_BuildingExt.ClenGreyCncrt_A  stone
+CoreTexEarth.LakeBed_A          stone
+CoreTexConcrete.grungysdwlk_a   stone
+CoreTexConcrete.ClenBlakStret_A stone
+CoreTexMetal.MetlBoxPanel_A     metal
+CoreTexMetal.MetlBoxPanel_B     metal
+CoreTexMetal.ClenBlueGrte_A     metal
+Dockyard.courgmtl02             metal
+Dockyard.semitrailer            metal
+Dockyard.crane02                metal
+Dockyard.tank01                 metal
+Dockyard.grnd01                 stone
+CoreTexConcrete.flatconcrete_a  stone
+CoreTexConcrete.ClenGreyStret_C stone
+CoreTexEarth.DrtyBrwnEarth_B    stone
+Mobile_Camp.mc_metal_a          metal
+Catacombs.Ctcomb_3              stone
+Paris.pa_chat_a                 stone
+Paris.pa_chat_c                 stone
+area51textures.A51_Wall_14      stone
+area51textures.area51tank_a     metal
+area51textures.pa_nukewste_a    metal
+Rocket.ClenUtilVSide_B          metal
+Rocket.ClenRcktCpsle_A          metal
+Rocket.ClenTrckSide_A           metal
+Airfield.Street_B               stone
+CoreTexConcrete.RoadBlacktop__A stone
+CoreTexConcrete.RoadBlacktop__C stone
+CoreTexConcrete.SmthGrayCemnt_A stone
+SubBase.SB_CemntWall_A          stone   ; its package's group says metal - the picture is cement panels
+area51textures.A51_Wall_03      stone
+CoreTexConcrete.un_heli_cncrt_a stone
+Rocket.DrtyTileRoof_A           metal

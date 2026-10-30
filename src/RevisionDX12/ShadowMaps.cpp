@@ -6,6 +6,10 @@
 #include <d3dcompiler.h>
 #include "ShaderCache.h"
 
+// The thread pool's work of the spots' collection (CollectSpotTriangles) and its helpers; -1: not asked yet.
+static PTP_WORK GSpotPool    = nullptr;
+static INT      GSpotHelpers = -1;
+
 // The faces are drawn with RdxMath::CubeFaceMatrix's rows as four rows of root constants - no matrix packing convention to
 // get wrong. Depth only, no render target. The level's maps with no pixel shader (VSMain); the actors' with their texture
 // places (VSActor) and a pixel shader that leaves out what a masked texture's mask leaves out (PSActor) - the masks' slot 0 is
@@ -105,7 +109,11 @@ FShadowMaps::FShadowMaps()
     ActorState          = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     WorldState          = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     WorldVertexCount    = 0;
-    RetiredAge          = 0;
+    for (INT k = 0; k < RETIRED_WORLD_MOST; k++)
+    {
+        RetiredWorldVb[k] = nullptr;
+        RetiredAge[k]     = 0;
+    }
     WorldSpheres        = nullptr;
     WorldTriangles      = 0;
     CellStart           = nullptr;
@@ -119,6 +127,15 @@ FShadowMaps::FShadowMaps()
     StampClock          = 0;
     Candidates          = nullptr;
     FaceMasks           = nullptr;
+    ClusterFirst        = nullptr;
+    ClusterSpheres      = nullptr;
+    ClusterStamp        = nullptr;
+    ClusterCount        = 0;
+    CellClusterStart    = nullptr;
+    CellClusters        = nullptr;
+    CellClusterMaxR     = nullptr;
+    BigClusters         = nullptr;
+    BigClusterCount     = 0;
     ActorVertexCount    = 0;
     WorldIbUsed         = 0;
     FrameSlot           = 0;
@@ -127,6 +144,9 @@ FShadowMaps::FShadowMaps()
     UseClock            = 0;
     StatWorldRedraws    = 0;
     StatActorDraws      = 0;
+    StatFacesKept       = 0;
+    StatFacesMoving     = 0;
+    StatFacesChanged    = 0;
     TotalWorldRedraws   = 0;
     TotalDeferred       = 0;
     StatStaleUsed       = 0;
@@ -235,6 +255,18 @@ UBOOL FShadowMaps::MakeActorBuffers(INT Slot, INT Vertices)
     return 1;
 }
 
+void FShadowMaps::WarmShaders()
+{
+    TComRef<ID3DBlob> Vs, VsActor, PsActor, Error;
+    const SIZE_T      Len = strlen(GShadowMapShader);
+    RdxCompile(GShadowMapShader, Len, "ShadowMap", nullptr, nullptr, "VSMain", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+               Vs.Slot(), Error.Slot());
+    RdxCompile(GShadowMapShader, Len, "ShadowMap", nullptr, nullptr, "VSActor", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+               VsActor.Slot(), Error.Slot());
+    RdxCompile(GShadowMapShader, Len, "ShadowMap", nullptr, nullptr, "PSActor", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+               PsActor.Slot(), Error.Slot());
+}
+
 UBOOL FShadowMaps::CreatePipeline(ID3D12Device* Device)
 {
     // Root: the face's matrix (vertex shader), and a table with the masks' view (the actors' pixel shader), point-sampled.
@@ -283,6 +315,7 @@ UBOOL FShadowMaps::CreatePipeline(ID3D12Device* Device)
 
     TComRef<ID3DBlob> Vs, VsActor, PsActor;
     const SIZE_T Len = strlen(GShadowMapShader);
+    // The same three as WarmShaders asks for.
     if (FAILED(RdxCompile(GShadowMapShader, Len, "ShadowMap", nullptr, nullptr, "VSMain", "vs_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, Vs.Slot(), Error.Slot())) ||
         FAILED(RdxCompile(GShadowMapShader, Len, "ShadowMap", nullptr, nullptr, "VSActor", "vs_5_0",
@@ -446,6 +479,7 @@ UBOOL FShadowMaps::Init(ID3D12Device* Device, const RdxMath::FShadowPreset& InPr
         !ShadowCheck(ArenaUvwVb->Map(0, &NoRead, (void**)&ArenaUvwMapped), TEXT("shape arena texture slots Map")))
         return 0;
     ArenaUsed = 0;
+    ArenaGen++;
 
     const DOUBLE MB = 4.0 * 6.0 * MaxLights *
                       ((DOUBLE)Preset.ActorMapSize * Preset.ActorMapSize + (DOUBLE)Preset.WorldMapSize * Preset.WorldMapSize) /
@@ -489,6 +523,7 @@ void FShadowMaps::ReleasePreset()
     ArenaMapped    = nullptr;
     ArenaUvwMapped = nullptr;
     ArenaUsed      = 0;
+    ArenaGen++;
     DsvHeap.Release();
     ActorCubes.Release();
     WorldCubes.Release();
@@ -516,14 +551,31 @@ void FShadowMaps::ReleasePreset()
 void FShadowMaps::ForgetWorld()
 {
     WorldVb.Release();
-    RetiredWorldVb.Release();
+    FreeRetiredWorlds();
     WorldVertexCount = 0;
-    RetiredAge       = 0;
     FreeWorldGrid();
+}
+
+void FShadowMaps::FreeRetiredWorlds()
+{
+    for (INT k = 0; k < RETIRED_WORLD_MOST; k++)
+    {
+        if (RetiredWorldVb[k])
+            RetiredWorldVb[k]->Release();
+        RetiredWorldVb[k] = nullptr;
+        RetiredAge[k]     = 0;
+    }
 }
 
 void FShadowMaps::Shutdown()
 {
+    if (GSpotPool)
+    {
+        ::WaitForThreadpoolWorkCallbacks(GSpotPool, TRUE);
+        ::CloseThreadpoolWork(GSpotPool);
+        GSpotPool = nullptr;
+    }
+    GSpotHelpers = -1;
     ReleasePreset();
     ForgetWorld();
     if (Casters)
@@ -622,6 +674,7 @@ void FShadowMaps::ForgetMasks()
     UnmaskableCount = 0;
     MaskCount       = 1;          // slot 0: solid
     MaskDirty[0]    = 1;
+    MaskGen++;
 }
 
 UBOOL FShadowMaps::GetCasterGeometry(INT Index, D3D12_VERTEX_BUFFER_VIEW& View, INT& First, INT& Count) const
@@ -695,13 +748,22 @@ INT FShadowMaps::AddMask(void* Key, const BYTE* Coverage)
 
 void FShadowMaps::FreeWorldGrid()
 {
-    if (WorldSpheres) { appFree(WorldSpheres); WorldSpheres = nullptr; }
-    if (CellStart)    { appFree(CellStart);    CellStart    = nullptr; }
-    if (CellTris)     { appFree(CellTris);     CellTris     = nullptr; }
-    if (BigTris)      { appFree(BigTris);      BigTris      = nullptr; }
-    if (Stamp)        { appFree(Stamp);        Stamp        = nullptr; }
-    if (Candidates)   { appFree(Candidates);   Candidates   = nullptr; }
-    if (FaceMasks)    { appFree(FaceMasks);    FaceMasks    = nullptr; }
+    if (WorldSpheres) { RdxFreeLarge(WorldSpheres); WorldSpheres = nullptr; }
+    if (CellStart)    { appFree(CellStart);         CellStart    = nullptr; }
+    if (CellTris)     { RdxFreeLarge(CellTris);     CellTris     = nullptr; }
+    if (BigTris)      { appFree(BigTris);           BigTris      = nullptr; }
+    if (Stamp)        { RdxFreeLarge(Stamp);        Stamp        = nullptr; }
+    if (Candidates)   { RdxFreeLarge(Candidates);   Candidates   = nullptr; }
+    if (FaceMasks)    { RdxFreeLarge(FaceMasks);    FaceMasks    = nullptr; }
+    if (ClusterFirst)     { RdxFreeLarge(ClusterFirst);     ClusterFirst     = nullptr; }
+    if (ClusterSpheres)   { RdxFreeLarge(ClusterSpheres);   ClusterSpheres   = nullptr; }
+    if (ClusterStamp)     { RdxFreeLarge(ClusterStamp);     ClusterStamp     = nullptr; }
+    if (CellClusterStart) { appFree(CellClusterStart);      CellClusterStart = nullptr; }
+    if (CellClusters)     { RdxFreeLarge(CellClusters);     CellClusters     = nullptr; }
+    if (CellClusterMaxR)  { appFree(CellClusterMaxR);       CellClusterMaxR  = nullptr; }
+    if (BigClusters)      { appFree(BigClusters);           BigClusters      = nullptr; }
+    ClusterCount    = 0;
+    BigClusterCount = 0;
     WorldTriangles = 0;
     BigCount       = 0;
     GridX = GridY = GridZ = GridCells = 0;
@@ -709,16 +771,17 @@ void FShadowMaps::FreeWorldGrid()
 }
 
 // The grid: cells of 512 units over the level's box - doubled until there are at most 65536 of them. A triangle is listed in
-// every cell its sphere's box covers; one covering more than 64 cells goes to BigTris instead.
+// every cell its sphere's box covers; one covering more than 64 cells goes to BigTris instead. The lists as long as the
+// level's triangles come from RdxAllocLarge: refused, the level's maps are drawn from the whole level.
 UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
 {
     FreeWorldGrid();
     if (!Xyz || Triangles <= 0)
         return 1;
-    WorldSpheres = (FLOAT*)appMalloc(Triangles * 4 * sizeof(FLOAT), TEXT("RdxShadowSpheres"));
-    Stamp        = (INT*)appMalloc(Triangles * sizeof(INT), TEXT("RdxShadowStamp"));
-    Candidates   = (INT*)appMalloc(Triangles * sizeof(INT), TEXT("RdxShadowCandidates"));
-    FaceMasks    = (BYTE*)appMalloc(Triangles * sizeof(BYTE), TEXT("RdxShadowFaceMasks"));
+    WorldSpheres = (FLOAT*)RdxAllocLarge((SIZE_T)Triangles * 4 * sizeof(FLOAT));
+    Stamp        = (INT*)RdxAllocLarge((SIZE_T)Triangles * sizeof(INT));
+    Candidates   = (INT*)RdxAllocLarge((SIZE_T)Triangles * sizeof(INT));
+    FaceMasks    = (BYTE*)RdxAllocLarge((SIZE_T)Triangles * sizeof(BYTE));
     if (!WorldSpheres || !Stamp || !Candidates || !FaceMasks)
     {
         FreeWorldGrid();
@@ -798,7 +861,7 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
     for (INT c = 0; c < GridCells; c++)
         CellStart[c + 1] += CellStart[c];
     const INT Refs = CellStart[GridCells];
-    CellTris = (INT*)appMalloc(Max(Refs, 1) * sizeof(INT), TEXT("RdxShadowCellTris"));
+    CellTris = (INT*)RdxAllocLarge((SIZE_T)Max(Refs, 1) * sizeof(INT));
     BigTris  = (INT*)appMalloc(Max(BigCount, 1) * sizeof(INT), TEXT("RdxShadowBigTris"));
     if (!CellTris || !BigTris)
     {
@@ -823,25 +886,194 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
         for (INT z = Z0; z <= Z1; z++)
             for (INT y = Y0; y <= Y1; y++)
                 for (INT x = X0; x <= X1; x++)
-                    CellTris[Fill[(z * GridY + y) * GridX + x]++] = t;
+                {
+                    const INT c = (z * GridY + y) * GridX + x;
+                    CellTris[Fill[c]++] = t;
+                }
     }
     appFree(Fill);
     RdxLog(TEXT("shadow maps: the level grid is %ix%ix%i, cell %.0f units, %i references, %i large triangles (%.1f MB)"),
            GridX, GridY, GridZ, CellSize, Refs, BigCount,
            ((DOUBLE)Triangles * 3 * sizeof(INT) + (DOUBLE)Triangles * 4 * sizeof(FLOAT) + (DOUBLE)(GridCells + 1 + Refs + BigCount) *
             sizeof(INT)) / (1024.0 * 1024.0));
+    if (!BuildClusters())
+    {
+        FreeWorldGrid();
+        return 0;
+    }
     return 1;
+}
+
+// A cluster: at most ClusterMost consecutive triangles while the box of their spheres has a half diagonal of at most
+// ClusterReach - a node's pieces come one after another, so a cluster's lie together - and its sphere holds theirs
+// with ClusterSlack to spare, more than the tests' rounding can take away. How big they are says only how fast the
+// spots' collection is, not what it takes.
+enum { ClusterMost = 128 };
+static const FLOAT ClusterReach = 256.0f, ClusterSlack = 0.5f;
+
+// Whether the triangle of sphere S begins a new cluster after one of InRun triangles whose spheres' box is Lo..Hi; the
+// box and the count carried on to it.
+static inline UBOOL ClusterBreaks(const FLOAT* S, FLOAT* Lo, FLOAT* Hi, INT& InRun)
+{
+    if (InRun > 0 && InRun < ClusterMost)
+    {
+        FLOAT NLo[3], NHi[3], D2 = 0.0f;
+        for (INT a = 0; a < 3; a++)
+        {
+            NLo[a] = Min(Lo[a], S[a] - S[3]);
+            NHi[a] = Max(Hi[a], S[a] + S[3]);
+            D2 += (NHi[a] - NLo[a]) * (NHi[a] - NLo[a]);
+        }
+        if (D2 <= 4.0f * ClusterReach * ClusterReach)
+        {
+            for (INT a = 0; a < 3; a++)
+            {
+                Lo[a] = NLo[a];
+                Hi[a] = NHi[a];
+            }
+            InRun++;
+            return 0;
+        }
+    }
+    for (INT a = 0; a < 3; a++)
+    {
+        Lo[a] = S[a] - S[3];
+        Hi[a] = S[a] + S[3];
+    }
+    InRun = 1;
+    return 1;
+}
+
+UBOOL FShadowMaps::BuildClusters()
+{
+    const INT Triangles = WorldTriangles;
+    FLOAT     Lo[3], Hi[3];
+    INT       InRun = 0, Count = 0;
+    for (INT t = 0; t < Triangles; t++)
+        Count += ClusterBreaks(WorldSpheres + t * 4, Lo, Hi, InRun) ? 1 : 0;
+    ClusterFirst   = (INT*)RdxAllocLarge((SIZE_T)(Count + 1) * sizeof(INT));
+    ClusterSpheres = (FLOAT*)RdxAllocLarge((SIZE_T)Max(Count, 1) * 4 * sizeof(FLOAT));
+    ClusterStamp   = (INT*)RdxAllocLarge((SIZE_T)Max(Count, 1) * sizeof(INT));
+    if (!ClusterFirst || !ClusterSpheres || !ClusterStamp)
+        return 0;
+    appMemzero(ClusterStamp, Max(Count, 1) * sizeof(INT));
+    ClusterCount = Count;
+    InRun        = 0;
+    INT k        = 0;
+    for (INT t = 0; t < Triangles; t++)
+        if (ClusterBreaks(WorldSpheres + t * 4, Lo, Hi, InRun))
+            ClusterFirst[k++] = t;
+    ClusterFirst[Count] = Triangles;
+    // Each cluster's sphere: about the middle of its triangles' spheres' box, as far as the farthest of them reaches.
+    for (INT c = 0; c < Count; c++)
+    {
+        FLOAT BLo[3] = { 1.0e30f, 1.0e30f, 1.0e30f }, BHi[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+        for (INT t = ClusterFirst[c]; t < ClusterFirst[c + 1]; t++)
+        {
+            const FLOAT* const S = WorldSpheres + t * 4;
+            for (INT a = 0; a < 3; a++)
+            {
+                BLo[a] = Min(BLo[a], S[a] - S[3]);
+                BHi[a] = Max(BHi[a], S[a] + S[3]);
+            }
+        }
+        const FLOAT Mid[3] = { 0.5f * (BLo[0] + BHi[0]), 0.5f * (BLo[1] + BHi[1]), 0.5f * (BLo[2] + BHi[2]) };
+        FLOAT       Far    = 0.0f;
+        for (INT t = ClusterFirst[c]; t < ClusterFirst[c + 1]; t++)
+        {
+            const FLOAT* const S  = WorldSpheres + t * 4;
+            const FLOAT        DX = S[0] - Mid[0], DY = S[1] - Mid[1], DZ = S[2] - Mid[2];
+            Far                   = Max(Far, (FLOAT)appSqrt(DX * DX + DY * DY + DZ * DZ) + S[3]);
+        }
+        FLOAT* const Sp = ClusterSpheres + c * 4;
+        Sp[0]           = Mid[0];
+        Sp[1]           = Mid[1];
+        Sp[2]           = Mid[2];
+        Sp[3]           = Far + ClusterSlack;
+    }
+    // Their lists in the cells, as the triangles' are made.
+    CellClusterStart = (INT*)appMalloc((GridCells + 1) * sizeof(INT), TEXT("RdxShadowClusterCells"));
+    INT* const Fill  = (INT*)appMalloc(GridCells * sizeof(INT), TEXT("RdxShadowClusterFill"));
+    if (!CellClusterStart || !Fill)
+    {
+        if (Fill)
+            appFree(Fill);
+        return 0;
+    }
+    appMemzero(CellClusterStart, (GridCells + 1) * sizeof(INT));
+    INT Big = 0;
+    for (INT pass = 0; pass < 2; pass++)
+    {
+        for (INT c = 0; c < Count; c++)
+        {
+            const FLOAT* const S = ClusterSpheres + c * 4;
+            INT X0, X1, Y0, Y1, Z0, Z1;
+            CellRange(S[0], S[3], GridMin[0], CellSize, GridX, X0, X1);
+            CellRange(S[1], S[3], GridMin[1], CellSize, GridY, Y0, Y1);
+            CellRange(S[2], S[3], GridMin[2], CellSize, GridZ, Z0, Z1);
+            if ((X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1) > 64)
+            {
+                if (pass == 0)
+                    BigClusterCount++;
+                else
+                    BigClusters[Big++] = c;
+                continue;
+            }
+            for (INT z = Z0; z <= Z1; z++)
+                for (INT y = Y0; y <= Y1; y++)
+                    for (INT x = X0; x <= X1; x++)
+                    {
+                        const INT Cell = (z * GridY + y) * GridX + x;
+                        if (pass == 0)
+                            CellClusterStart[Cell + 1]++;
+                        else
+                        {
+                            CellClusters[Fill[Cell]++] = c;
+                            CellClusterMaxR[Cell]      = Max(CellClusterMaxR[Cell], S[3]);
+                        }
+                    }
+        }
+        if (pass == 0)
+        {
+            for (INT Cell = 0; Cell < GridCells; Cell++)
+                CellClusterStart[Cell + 1] += CellClusterStart[Cell];
+            CellClusters    = (INT*)RdxAllocLarge((SIZE_T)Max(CellClusterStart[GridCells], 1) * sizeof(INT));
+            BigClusters     = (INT*)appMalloc(Max(BigClusterCount, 1) * sizeof(INT), TEXT("RdxShadowBigClusters"));
+            CellClusterMaxR = (FLOAT*)appMalloc(GridCells * sizeof(FLOAT), TEXT("RdxShadowClusterMaxR"));
+            if (!CellClusters || !BigClusters || !CellClusterMaxR)
+            {
+                appFree(Fill);
+                return 0;
+            }
+            appMemcpy(Fill, CellClusterStart, GridCells * sizeof(INT));
+            for (INT Cell = 0; Cell < GridCells; Cell++)
+                CellClusterMaxR[Cell] = 0.0f;
+        }
+    }
+    appFree(Fill);
+    RdxLog(TEXT("shadow maps: the level's %i triangles in %i clusters for the spots, %i references in the cells, "
+                "%i large"),
+           Triangles, Count, CellClusterStart[GridCells], BigClusterCount);
+    return 1;
+}
+
+INT FShadowMaps::NextStamp()
+{
+    if (++StampClock >= 0x7FFFFFF0)
+    {
+        appMemzero(Stamp, WorldTriangles * sizeof(INT));
+        if (ClusterStamp)
+            appMemzero(ClusterStamp, Max(ClusterCount, 1) * sizeof(INT));
+        StampClock = 1;
+    }
+    return StampClock;
 }
 
 INT FShadowMaps::CollectWorldTriangles(const RdxMath::FVec3& Light, FLOAT Radius)
 {
     if (!WorldSpheres || !CellStart || !CellTris)
         return 0;
-    if (++StampClock >= 0x7FFFFFF0)
-    {
-        appMemzero(Stamp, WorldTriangles * sizeof(INT));
-        StampClock = 1;
-    }
+    NextStamp();
     INT N = 0;
     INT X0, X1, Y0, Y1, Z0, Z1;
     CellRange(Light.X, Radius, GridMin[0], CellSize, GridX, X0, X1);
@@ -878,17 +1110,268 @@ INT FShadowMaps::CollectWorldTriangles(const RdxMath::FVec3& Light, FLOAT Radius
     return N;
 }
 
-UBOOL FShadowMaps::SetWorld(ID3D12Device* Device, const FLOAT* Xyz, INT VertexCount)
+// The spot's collection on several threads (CollectSpotTriangles): each looks through all the cells, and takes only the
+// clusters of its own share of the level's - so each cluster's stamp is one thread's, and what comes out is the same
+// triangles, only in another order. The indices go where a counter says, Chunk triangles' room at a time; what a thread
+// leaves of its last room is filled with a triangle of no size. The pool's threads count with the calling one's SSE
+// control word.
+struct FSpotJob
 {
-    // The GPU may still be drawing a frame with the old buffer: it goes to the retired slot, released a few frames later.
+    const FLOAT*   Spheres;          // the triangles'
+    const INT*     First;            // the clusters' first triangles
+    const FLOAT*   ClusterSpheres;
+    const INT*     CellStart;        // the clusters' lists in the cells
+    const INT*     CellClusters;
+    const FLOAT*   CellMaxR;
+    INT*           Stamp;            // the clusters'
+    INT            Clock, Clusters, Shares;
+    RdxMath::FVec3 Pos, Aim;
+    FLOAT          Cos, Sin, Reach, Half, Size;
+    FLOAT          GridMin[3];
+    INT            GridX, GridY, X0, X1, Y0, Y1, Z0, Z1;
+    UINT*          Out;
+    LONG           Room;
+    UINT           Csr;
+    volatile LONG  NextShare, Taken, Full;
+};
+static FSpotJob GSpotJob;
+enum { SpotChunk = 64 };
+
+// Cluster c's triangles the spot may light, each handed to Take: the triangles' two tests (CollectWorldTriangles' and
+// the cone's) one by one - none of them where the cluster's sphere fails them, as a sphere holding another only fails
+// them sooner (both are distances' tests, which moving the centre changes by no more than it moves); and every one of
+// them without the tests where the cluster's sphere lies within the reach and the cone by a unit to spare, as each of
+// its triangles' spheres then does. False where Take finds no room.
+template <class FTake>
+static inline UBOOL SpotCluster(const FSpotJob& J, INT c, FTake&& Take)
+{
+    const FLOAT* const Sp = J.ClusterSpheres + c * 4;
+    const FLOAT        CX = Sp[0] - J.Pos.X, CY = Sp[1] - J.Pos.Y, CZ = Sp[2] - J.Pos.Z;
+    const FLOAT        C2 = CX * CX + CY * CY + CZ * CZ, Far = J.Reach + Sp[3];
+    if (!(C2 < Far * Far))
+        return 1;
+    const RdxMath::FVec3 Centre = { Sp[0], Sp[1], Sp[2] };
+    if (!RdxMath::SphereTouchesSpot(J.Pos, J.Aim, J.Cos, J.Sin, J.Reach, Centre, Sp[3]))
+        return 1;
+    const FLOAT Along = CX * J.Aim.X + CY * J.Aim.Y + CZ * J.Aim.Z;
+    const FLOAT Off2  = C2 - Along * Along;
+    const FLOAT Off   = RdxMath::Sqrt(Off2 > 0.0f ? Off2 : 0.0f);
+    const UBOOL bAll  = RdxMath::Sqrt(C2) + Sp[3] + 1.0f <= J.Reach &&
+                       Off * J.Cos - Along * J.Sin + Sp[3] + 1.0f <= 0.0f;
+    for (INT t = J.First[c]; t < J.First[c + 1]; t++)
+    {
+        if (!bAll)
+        {
+            const FLOAT* const S  = J.Spheres + t * 4;
+            const FLOAT        DX = S[0] - J.Pos.X, DY = S[1] - J.Pos.Y, DZ = S[2] - J.Pos.Z;
+            const FLOAT        R  = J.Reach + S[3];
+            if (!(DX * DX + DY * DY + DZ * DZ < R * R))
+                continue;
+            const RdxMath::FVec3 C = { S[0], S[1], S[2] };
+            if (!RdxMath::SphereTouchesSpot(J.Pos, J.Aim, J.Cos, J.Sin, J.Reach, C, S[3]))
+                continue;
+        }
+        if (!Take(t))
+            return 0;
+    }
+    return 1;
+}
+
+static void SpotShare(FSpotJob& J, INT Share)
+{
+    const INT Lo = (INT)((SQWORD)J.Clusters * Share / J.Shares);
+    const INT Hi = (INT)((SQWORD)J.Clusters * (Share + 1) / J.Shares);
+    LONG At = 0, End = 0;
+    auto Take = [&](INT t) -> UBOOL
+    {
+        if (At == End)
+        {
+            At  = ::InterlockedExchangeAdd(&J.Taken, 3 * SpotChunk);
+            End = At + 3 * SpotChunk;
+            if (End > J.Room)
+                return 0;
+        }
+        const UINT Base = (UINT)(t * 3);
+        J.Out[At]     = Base;
+        J.Out[At + 1] = Base + 1;
+        J.Out[At + 2] = Base + 2;
+        At += 3;
+        return 1;
+    };
+    for (INT z = J.Z0; z <= J.Z1; z++)
+        for (INT y = J.Y0; y <= J.Y1; y++)
+            for (INT x = J.X0; x <= J.X1; x++)
+            {
+                const INT c = (z * J.GridY + y) * J.GridX + x;
+                if (J.CellStart[c] == J.CellStart[c + 1])
+                    continue;
+                const RdxMath::FVec3 Mid = { J.GridMin[0] + ((FLOAT)x + 0.5f) * J.Size,
+                                             J.GridMin[1] + ((FLOAT)y + 0.5f) * J.Size,
+                                             J.GridMin[2] + ((FLOAT)z + 0.5f) * J.Size };
+                const FLOAT Round = J.Half + 2.7320508f * J.CellMaxR[c] + 2.0f;
+                if (!RdxMath::SphereTouchesSpot(J.Pos, J.Aim, J.Cos, J.Sin, J.Reach, Mid, Round))
+                    continue;
+                for (INT k = J.CellStart[c]; k < J.CellStart[c + 1]; k++)
+                {
+                    const INT n = J.CellClusters[k];
+                    if (n < Lo || n >= Hi || J.Stamp[n] == J.Clock)
+                        continue;
+                    J.Stamp[n] = J.Clock;
+                    if (!SpotCluster(J, n, Take))
+                    {
+                        J.Full = 1;
+                        return;
+                    }
+                }
+            }
+    for (; At < End; At++)
+        J.Out[At] = 0;
+}
+
+// The shares not taken yet, one at a time.
+static void SpotShares(FSpotJob& J)
+{
+    for (;;)
+    {
+        const LONG s = ::InterlockedIncrement(&J.NextShare) - 1;
+        if (s >= J.Shares || J.Full)
+            break;
+        SpotShare(J, (INT)s);
+    }
+}
+
+static VOID CALLBACK SpotWorker(PTP_CALLBACK_INSTANCE, PVOID Param, PTP_WORK)
+{
+    FSpotJob&  J   = *(FSpotJob*)Param;
+    const UINT Was = _mm_getcsr();
+    _mm_setcsr(J.Csr);
+    SpotShares(J);
+    _mm_setcsr(Was);
+}
+
+// CollectWorldTriangles' test and the spot's cone after it (RdxMath::SphereTouchesSpot), the level's triangles taken
+// a cluster at a time (SpotCluster). A cell is not opened where a sphere round it holding the spheres of all the
+// clusters it lists - each such sphere's box reaches into the cell, so its centre is within the cell's half diagonal
+// and its radius times the square root of three of the cell, and it stretches on by that radius - cannot touch the
+// cone: then none of them can (the test is a distance's, which a sphere holding another only brings nearer). And a
+// triangle that passes is in a cluster listed in the cell of a place of the cluster's sphere within the lamp's sphere,
+// which is among the cells looked at: so the triangles are those the two tests give, only in another order - which a
+// map of depth alone does not see.
+INT FShadowMaps::CollectSpotTriangles(const RdxMath::FVec3& Pos, const RdxMath::FVec3& Aim, FLOAT Cos, FLOAT Sin,
+                                      FLOAT Reach, UINT* Out, INT Room)
+{
+    if (!WorldSpheres || !ClusterFirst || !CellClusterStart || !CellClusters || !CellClusterMaxR || !Out)
+        return -1;
+    NextStamp();
+    INT Taken = 0;
+    INT X0, X1, Y0, Y1, Z0, Z1;
+    CellRange(Pos.X, Reach, GridMin[0], CellSize, GridX, X0, X1);
+    CellRange(Pos.Y, Reach, GridMin[1], CellSize, GridY, Y0, Y1);
+    CellRange(Pos.Z, Reach, GridMin[2], CellSize, GridZ, Z0, Z1);
+    if (GSpotHelpers < 0)
+    {
+        SYSTEM_INFO Si;
+        ::GetSystemInfo(&Si);
+        // The calling thread takes a share too, and one processor is left alone.
+        GSpotHelpers = Clamp((INT)Si.dwNumberOfProcessors - 2, 0, 6);
+        if (GSpotHelpers > 0)
+            GSpotPool = ::CreateThreadpoolWork(SpotWorker, &GSpotJob, nullptr);
+        if (!GSpotPool)
+            GSpotHelpers = 0;
+        RdxLog(TEXT("shadow maps: the spots' level triangles gathered on %i threads"), GSpotHelpers + 1);
+    }
+    FSpotJob& J        = GSpotJob;
+    J.Spheres          = WorldSpheres;
+    J.First            = ClusterFirst;
+    J.ClusterSpheres   = ClusterSpheres;
+    J.CellStart        = CellClusterStart;
+    J.CellClusters     = CellClusters;
+    J.CellMaxR         = CellClusterMaxR;
+    J.Stamp            = ClusterStamp;
+    J.Clock            = StampClock;
+    J.Clusters         = ClusterCount;
+    J.Shares           = GSpotHelpers + 1;
+    J.Pos              = Pos;
+    J.Aim              = Aim;
+    J.Cos              = Cos;
+    J.Sin              = Sin;
+    J.Reach            = Reach;
+    J.Half             = CellSize * 0.8660254f;
+    J.Size             = CellSize;
+    J.GridMin[0]       = GridMin[0];
+    J.GridMin[1]       = GridMin[1];
+    J.GridMin[2]       = GridMin[2];
+    J.GridX            = GridX;
+    J.GridY            = GridY;
+    J.X0               = X0;
+    J.X1               = X1;
+    J.Y0               = Y0;
+    J.Y1               = Y1;
+    J.Z0               = Z0;
+    J.Z1               = Z1;
+    J.Out              = Out;
+    J.Room             = Room;
+    J.Csr              = _mm_getcsr();
+    J.NextShare        = 0;
+    J.Taken            = 0;
+    J.Full             = 0;
+    for (INT k = 0; k < GSpotHelpers; k++)
+        ::SubmitThreadpoolWork(GSpotPool);
+    SpotShares(J);
+    if (GSpotHelpers > 0)
+        ::WaitForThreadpoolWorkCallbacks(GSpotPool, FALSE);
+    if (J.Full)
+        return -1;
+    // The clusters in no cell, after the threads, on this one.
+    Taken     = (INT)J.Taken;
+    auto Take = [&](INT t) -> UBOOL
+    {
+        if (Taken + 3 > Room)
+            return 0;
+        const UINT Base = (UINT)(t * 3);
+        Out[Taken++]    = Base;
+        Out[Taken++]    = Base + 1;
+        Out[Taken++]    = Base + 2;
+        return 1;
+    };
+    for (INT b = 0; b < BigClusterCount; b++)
+    {
+        const INT n = BigClusters[b];
+        if (ClusterStamp[n] == StampClock)
+            continue;
+        ClusterStamp[n] = StampClock;
+        if (!SpotCluster(J, n, Take))
+            return -1;
+    }
+    return Taken;
+}
+
+UBOOL FShadowMaps::SetWorld(ID3D12Device* Device, const FLOAT* Xyz, INT VertexCount, FCardWriter* Card)
+{
+    // The GPU may still be drawing a frame with the old buffer: it goes among the retired ones, released a few frames
+    // later - and so does the one before it, if that is not free yet.
     if (WorldVb)
     {
-        RetiredWorldVb.Release();
         ID3D12Resource* Old = WorldVb.Get();
         Old->AddRef();
         WorldVb.Release();
-        *RetiredWorldVb.Slot() = Old;
-        RetiredAge = 0;
+        INT k = 0;
+        while (k < RETIRED_WORLD_MOST && RetiredWorldVb[k])
+            k++;
+        if (k < RETIRED_WORLD_MOST)
+        {
+            RetiredWorldVb[k] = Old;
+            RetiredAge[k]     = 0;
+        }
+        else
+        {
+            // Every place taken within a few frames: this one is kept for good rather than freed while a frame in
+            // flight may read it.
+            static UBOOL bSaid = 0;
+            if (!bSaid)
+                RdxLog(TEXT("shadow maps: more levels retired at once than there is room to age - one kept for good"));
+            bSaid = 1;
+        }
     }
     WorldVertexCount    = 0;
     TotalWorldRedraws   = 0;
@@ -903,25 +1386,36 @@ UBOOL FShadowMaps::SetWorld(ID3D12Device* Device, const FLOAT* Xyz, INT VertexCo
         // The cubes' contents belong to the level being forgotten: no face may count as clean any more, or the first
         // frame of the next level would skip a clear it needs (see FSlot::ActorFaceUsed).
         Slots[s].ActorFaceUsed = ALL_FACES;
+        Slots[s].KeptFaces     = 0;
     }
     if (MaskMapped)
         ForgetMasks();
     ArenaUsed = 0;
+    ArenaGen++;
     if (!Device || !Xyz || VertexCount <= 0 || !IsReady())
         return 1;
 
     const UINT64 Bytes = (UINT64)VertexCount * 3 * sizeof(FLOAT);
-    if (!CreateUploadBuffer(Device, Bytes, WorldVb, TEXT("level vertex buffer")))
-        return 0;
-    D3D12_RANGE NoRead = { 0, 0 };
-    BYTE* Dest = nullptr;
-    if (!ShadowCheck(WorldVb->Map(0, &NoRead, (void**)&Dest), TEXT("level vertex buffer Map")))
+    ID3D12Resource* const OnCard = Card ? Card->MakeCardBuffer(Bytes, TEXT("shadow maps' level vertex buffer"))
+                                        : nullptr;
+    if (OnCard && Card->WriteCardBuffer(OnCard, 0, Xyz, Bytes))
+        *WorldVb.Slot() = OnCard;
+    else
     {
-        WorldVb.Release();
-        return 0;
+        if (OnCard)
+            OnCard->Release();
+        if (!CreateUploadBuffer(Device, Bytes, WorldVb, TEXT("level vertex buffer")))
+            return 0;
+        D3D12_RANGE NoRead = { 0, 0 };
+        BYTE* Dest = nullptr;
+        if (!ShadowCheck(WorldVb->Map(0, &NoRead, (void**)&Dest), TEXT("level vertex buffer Map")))
+        {
+            WorldVb.Release();
+            return 0;
+        }
+        appMemcpy(Dest, Xyz, (INT)Bytes);
+        WorldVb->Unmap(0, nullptr);
     }
-    appMemcpy(Dest, Xyz, (INT)Bytes);
-    WorldVb->Unmap(0, nullptr);
     WorldVertexCount = VertexCount;
     // Without the grid every world map is drawn with the whole level, as before.
     if (!BuildWorldGrid(Xyz, VertexCount / 3))
@@ -954,9 +1448,13 @@ void FShadowMaps::BeginFrame(INT FrameIndex)
             ActorWanted = ActorRoom[FrameSlot];
         }
     }
-    // BACKEND_FRAME_COUNT frames are in flight at most: a frame after that the old level's buffer is nobody's.
-    if (RetiredWorldVb && ++RetiredAge >= BACKEND_FRAME_COUNT + 1)
-        RetiredWorldVb.Release();
+    // BACKEND_FRAME_COUNT frames are in flight at most: a frame after that an old level's buffer is nobody's.
+    for (INT k = 0; k < RETIRED_WORLD_MOST; k++)
+        if (RetiredWorldVb[k] && ++RetiredAge[k] >= BACKEND_FRAME_COUNT + 1)
+        {
+            RetiredWorldVb[k]->Release();
+            RetiredWorldVb[k] = nullptr;
+        }
 }
 
 FLOAT* FShadowMaps::AddCaster(INT VertexCount, FLOAT X, FLOAT Y, FLOAT Z, FLOAT Radius, INT& Index)
@@ -1121,6 +1619,7 @@ void FShadowMaps::SetLights(const FShadowLightFrame* In, INT Count)
         // The slot has changed hands: whatever the previous light left in the actor cube's faces is not this light's,
         // and the face-skipping in Render would take the old light's faces for clean ones (see FSlot::ActorFaceUsed).
         Slots[Best].ActorFaceUsed = ALL_FACES;
+        Slots[Best].KeptFaces     = 0;
     }
     // How each light's world map stands (RdxMath::ClassifyWorldMap): measured against where the map was actually DRAWN
     // from - which Render records - and not against the previous frame. Comparing frame to frame, a light drifting less
@@ -1296,21 +1795,12 @@ void FShadowMaps::RenderSpots(ID3D12GraphicsCommandList* Cmd, ID3D12DescriptorHe
             UBOOL     bIndexed = 0;
             if (WorldIbMapped[FrameSlot] && WorldSpheres && CellStart)
             {
-                const INT N = CollectWorldTriangles(Pos, RdxMath::OwnLampReach);
-                if (First + N * 3 <= WORLD_INDICES)
+                // Where they do not fit, the whole level.
+                const INT Got = CollectSpotTriangles(Pos, Aim, Cos, Sin, RdxMath::OwnLampReach,
+                                                     WorldIbMapped[FrameSlot] + First, WORLD_INDICES - First);
+                if (Got >= 0)
                 {
-                    UINT* const Out = WorldIbMapped[FrameSlot] + First;
-                    for (INT n = 0; n < N; n++)
-                    {
-                        const FLOAT* const Sp = WorldSpheres + Candidates[n] * 4;
-                        const RdxMath::FVec3 C = { Sp[0], Sp[1], Sp[2] };
-                        if (!RdxMath::SphereTouchesSpot(Pos, Aim, Cos, Sin, RdxMath::OwnLampReach, C, Sp[3]))
-                            continue;
-                        const UINT Base = (UINT)(Candidates[n] * 3);
-                        Out[Taken++] = Base;
-                        Out[Taken++] = Base + 1;
-                        Out[Taken++] = Base + 2;
-                    }
+                    Taken = Got;
                     WorldIbUsed += Taken;
                     bIndexed = 1;
                 }
@@ -1392,6 +1882,9 @@ void FShadowMaps::Render(ID3D12GraphicsCommandList* Cmd, ID3D12DescriptorHeap* S
 {
     StatWorldRedraws = 0;
     StatActorDraws   = 0;
+    StatFacesKept    = 0;
+    StatFacesMoving  = 0;
+    StatFacesChanged = 0;
     StatStaleUsed    = 0;
     if (!IsReady() || !Cmd || LightCount <= 0 || !DsvHeap || !SrvHeap || !MaskArray || !MaskUpload)
         return;
@@ -1627,6 +2120,15 @@ void FShadowMaps::Render(ID3D12GraphicsCommandList* Cmd, ID3D12DescriptorHeap* S
         // which is how we know the maps' 10.5 ms is the DRAWS and not the clearing.
         const unsigned WasUsed = S.ActorFaceUsed;
         S.ActorFaceUsed        = (BYTE)FaceUsed;
+        // Kept faces were drawn from where the light stood then, with the arena and the masks as they were: from
+        // anywhere else, or with either new, none is (FSlot::KeptFaces).
+        if (memcmp(&S.KeptAt, &Pos, sizeof(Pos)) != 0 || S.KeptArenaGen != ArenaGen || S.KeptMaskGen != MaskGen)
+        {
+            S.KeptFaces    = 0;
+            S.KeptAt       = Pos;
+            S.KeptArenaGen = ArenaGen;
+            S.KeptMaskGen  = MaskGen;
+        }
 
         SetSquareViewport(Cmd, Preset.ActorMapSize);
         Cmd->SetPipelineState(ActorPipeline.Get());
@@ -1638,6 +2140,46 @@ void FShadowMaps::Render(ID3D12GraphicsCommandList* Cmd, ID3D12DescriptorHeap* S
             // Empty now and empty last time: the face already says "nothing in the way", so leave it entirely alone.
             if (!(FaceUsed & Bit) && !(WasUsed & Bit))
                 continue;
+            // Its casters now, by their place in the arena, against those it was last drawn with: all of them the
+            // arena's, the same stretches - then it holds what drawing it again would give, and is left alone too.
+            INT   Length = 0;
+            UBOOL bArena = 1;
+            INT   First[FACE_KEEP], Count[FACE_KEEP];
+            for (INT n = 0; n < NearCount && (FaceUsed & Bit); n++)
+            {
+                if (!(NearFaces[n] & Bit))
+                    continue;
+                const FCaster& C = Casters[Near[n]];
+                bArena = bArena && C.bArena;
+                if (bArena && Length < FACE_KEEP)
+                {
+                    INT k = Length;
+                    for (; k > 0 && First[k - 1] > C.First; k--)
+                    {
+                        First[k] = First[k - 1];
+                        Count[k] = Count[k - 1];
+                    }
+                    First[k] = C.First;
+                    Count[k] = C.Count;
+                }
+                Length++;
+            }
+            const UBOOL bKeepable = (FaceUsed & Bit) && bArena && Length <= FACE_KEEP;
+            if (bKeepable && (S.KeptFaces & Bit) && Length == S.KeptLength[f] &&
+                memcmp(First, S.KeptFirst[f], Length * sizeof(INT)) == 0 &&
+                memcmp(Count, S.KeptCount[f], Length * sizeof(INT)) == 0)
+            {
+                StatFacesKept++;
+                continue;
+            }
+            if (FaceUsed & Bit)
+            {
+                if (!bArena)
+                    StatFacesMoving++;
+                else
+                    StatFacesChanged++;
+            }
+            S.KeptFaces &= (BYTE)~Bit;
             D3D12_CPU_DESCRIPTOR_HANDLE Dsv = DsvStart;
             Dsv.ptr += (SIZE_T)((Slot * 6 + f) * DsvInc);
             Cmd->OMSetRenderTargets(0, nullptr, FALSE, &Dsv);
@@ -1647,18 +2189,48 @@ void FShadowMaps::Render(ID3D12GraphicsCommandList* Cmd, ID3D12DescriptorHeap* S
             if (!(FaceUsed & Bit))
                 continue;
             SetFace(Cmd, f, Pos);
+            // Casters whose vertices follow on from each other in the same buffer go in one draw: the frame's casters
+            // are laid down one after the other, so do the arena's, and the near ones of a face mostly come in a row.
+            // The same triangles in the same order - and only depth is written - so the map is the same, with a
+            // fraction of the draws.
+            INT RunArena = -1, RunFirst = 0, RunCount = 0;
+            auto Flush = [&]()
+            {
+                if (RunCount <= 0)
+                    return;
+                if (BoundArena != RunArena)
+                {
+                    BoundArena = RunArena;
+                    Cmd->IASetVertexBuffers(0, 2, RunArena ? ArenaViews : ActorViews);
+                }
+                Cmd->DrawInstanced((UINT)RunCount, 1, (UINT)RunFirst, 0);
+                StatActorDraws++;
+                RunCount = 0;
+            };
             for (INT n = 0; n < NearCount; n++)
             {
                 if (!(NearFaces[n] & Bit))
                     continue;
-                const FCaster& C = Casters[Near[n]];
-                if (BoundArena != (C.bArena ? 1 : 0))
+                const FCaster& C     = Casters[Near[n]];
+                const INT      Arena = C.bArena ? 1 : 0;
+                if (RunCount > 0 && Arena == RunArena && C.First == RunFirst + RunCount)
                 {
-                    BoundArena = C.bArena ? 1 : 0;
-                    Cmd->IASetVertexBuffers(0, 2, C.bArena ? ArenaViews : ActorViews);
+                    RunCount += C.Count;
+                    continue;
                 }
-                Cmd->DrawInstanced((UINT)C.Count, 1, (UINT)C.First, 0);
-                StatActorDraws++;
+                Flush();
+                RunArena = Arena;
+                RunFirst = C.First;
+                RunCount = C.Count;
+            }
+            Flush();
+            // Drawn with the arena's alone, and few enough to keep: kept, for the frames that draw it the same.
+            if (bKeepable)
+            {
+                appMemcpy(S.KeptFirst[f], First, Length * sizeof(INT));
+                appMemcpy(S.KeptCount[f], Count, Length * sizeof(INT));
+                S.KeptLength[f] = (BYTE)Length;
+                S.KeptFaces    |= (BYTE)Bit;
             }
         }
     }

@@ -338,6 +338,10 @@ static const FKindSize GKinds[] = {
     { Kind_Bush1, "Bushes1", 88.0f, 53.0f, 0.0f },
     { Kind_Bush2, "Bushes2", 70.0f, 32.0f, 0.0f },
     { Kind_Bush3, "Bushes3", 60.0f, 45.0f, 0.0f },
+    { Kind_Rose, "Rose", 56.0f, 9.35f, 0.0f },       // a bed's flower in the level's sheets (pflanzentex150)
+    { Kind_Lily, "Lily", 56.0f, 9.35f, 0.0f },       // the bed's orange lilies (pflanzentex149)
+    { Kind_Pink, "Pink", 56.0f, 9.35f, 0.0f },       // the bed's pale pink flowers (pflanzentex148)
+    { Kind_Fern, "Fern", 48.0f, 16.0f, 0.0f },       // a bed's fern (pflanzentex143, 145, 146)
 };
 
 int main(int argc, char** argv)
@@ -364,11 +368,38 @@ int main(int argc, char** argv)
 
     // The two pictures the renderer draws for the plants, from the same code.
     static unsigned char BarkPixels[256 * 512 * 4];
-    static unsigned char LeafPixels[2048 * 1024 * 4];
+    static unsigned char LeafPixels[4096 * 1024 * 4];
     DrawBark(BarkPixels, 256, 512);
-    DrawLeaves(LeafPixels, 2048, 1024);
+    DrawLeaves(LeafPixels, 4096, 1024);
     const FTexture Bark  = { 256, 512, BarkPixels, true };
-    const FTexture Leafs = { 2048, 1024, LeafPixels, false };
+    const FTexture Leafs = { 4096, 1024, LeafPixels, false };
+    // The sheet of the plants grown stem by stem (DrawStemSheet), and the picture of it, over a grey.
+    static unsigned char StemPixels[2048 * 512 * 4];
+    DrawStemSheet(StemPixels, 2048, 512);
+    const FTexture Stems = { 2048, 512, StemPixels, false };
+    static unsigned char SkinPixels[64 * 256 * 4];
+    DrawStemSkin(SkinPixels, 64, 256);
+    const FTexture Skin = { 64, 256, SkinPixels, true };
+    {
+        FImage Sheet;
+        Sheet.Make(2048, 512);
+        for (int y = 0; y < 512; y++)
+            for (int x = 0; x < 2048; x++)
+            {
+                float* const               C = Sheet.Colour + 3 * (y * 2048 + x);
+                const unsigned char* const P = StemPixels + 4 * (y * 2048 + x);
+                const float                A = (float)P[3] / 255.0f;
+                for (int c = 0; c < 3; c++)
+                {
+                    const float S = (float)P[c] / 255.0f;
+                    const float L = (S <= 0.04045f) ? S / 12.92f : powf((S + 0.055f) / 1.055f, 2.4f);
+                    C[c] = L * A + 0.2f * (1.0f - A);
+                }
+            }
+        char Path[MAX_PATH];
+        sprintf_s(Path, "%s\\stems.bmp", Out);
+        WriteBmp(Path, Sheet, 1);
+    }
     // EZ-Tree's leaf cards (scripts/make_leaf_cards.py): the sheet beside the renderer, read from the project's assets.
     static unsigned char CardPixels[4096 * 1024 * 4];
     bool bCards = false;
@@ -405,13 +436,13 @@ int main(int argc, char** argv)
     {
         // The pictures themselves: the bark, and the leaves' sheet at half its size.
         FImage Sheet;
-        Sheet.Make(1280, 512);
+        Sheet.Make(2304, 512);
         for (int y = 0; y < 512; y++)
-            for (int x = 0; x < 1280; x++)
+            for (int x = 0; x < 2304; x++)
             {
-                float* const C = Sheet.Colour + 3 * (y * 1280 + x);
+                float* const C = Sheet.Colour + 3 * (y * 2304 + x);
                 const unsigned char* P = (x < 256) ? BarkPixels + 4 * (y * 256 + x)
-                                                   : LeafPixels + 4 * ((2 * y) * 2048 + 2 * (x - 256));
+                                                   : LeafPixels + 4 * ((2 * y) * 4096 + 2 * (x - 256));
                 const float A = (x < 256) ? 1.0f : (float)P[3] / 255.0f;
                 for (int c = 0; c < 3; c++)
                 {
@@ -474,6 +505,30 @@ int main(int argc, char** argv)
                    Mesh.BarkIndex.Num / 3, Mesh.Leaf.Num * (LeafFrameIndices / 3), GrowMs, BuildMs);
             if (!bBuilt)
                 continue;
+            // The wood and the flowers' heads to the bit (FNV-1a): their shape - places, normals, bark coordinates and
+            // indices - which a change to the leaves alone must leave as it was; apart, their sway and how open the
+            // plant is round them, which follow the leaves.
+            {
+                unsigned long long Form = 1469598103934665603ull, Wind = Form, Open = Form;
+                auto Feed = [](unsigned long long& H, const void* Data, size_t Bytes)
+                {
+                    for (size_t b = 0; b < Bytes; b++)
+                        H = (H ^ ((const unsigned char*)Data)[b]) * 1099511628211ull;
+                };
+                const TList<FVertex>* Parts[2] = {&Mesh.Bark, &Mesh.Petal};
+                for (int p = 0; p < 2; p++)
+                    for (int v = 0; v < Parts[p]->Num; v++)
+                    {
+                        const FVertex& Vx = Parts[p]->Data[v];
+                        Feed(Form, &Vx.X, 8 * sizeof(float));
+                        Feed(Wind, Vx.Wind, sizeof(Vx.Wind));
+                        Feed(Open, Vx.Open, sizeof(Vx.Open));
+                    }
+                Feed(Form, Mesh.BarkIndex.Data, Mesh.BarkIndex.Num * sizeof(Mesh.BarkIndex.Data[0]));
+                Feed(Form, Mesh.PetalIndex.Data, Mesh.PetalIndex.Num * sizeof(Mesh.PetalIndex.Data[0]));
+                printf("         wood and flowers: shape %016llx, sway %016llx, open %016llx (%d nodes)\n", Form, Wind,
+                       Open, Plant.Nodes.Num);
+            }
             // How open the crown is round its leaves (FOpenness): the tenth, the half and the ninth tenth of them, all
             // round and towards the sun - what decides how deep its shade reads.
             {
@@ -510,7 +565,8 @@ int main(int argc, char** argv)
                 {
                     FVec    Pos, Nrm;
                     FVertex V = {};
-                    LeafCorner(Mesh.Leaf[l], c, Pos, Nrm, V.U, V.V, (bEz || Shape.Cards) ? 1.0f : 0.5f);
+                    LeafCorner(Mesh.Leaf[l], c, Pos, Nrm, V.U, V.V,
+                               (bEz || Shape.Cards || IsRose(Shape.Kind) || IsStemPlant(Shape.Kind)) ? 1.0f : 0.5f);
                     V.X = Pos.X; V.Y = Pos.Y; V.Z = Pos.Z;
                     V.NX = Nrm.X; V.NY = Nrm.Y; V.NZ = Nrm.Z;
                     for (int o = 0; o < 4; o++)
@@ -571,9 +627,13 @@ int main(int argc, char** argv)
                     for (int q = 0; q < Part.Width * Part.Height; q++)
                         GTriAt[q] = -1;
                 }
-                DrawMesh(Part, Cam, Mesh.Bark, Mesh.BarkIndex, Bark, false);
+                DrawMesh(Part, Cam, Mesh.Bark, Mesh.BarkIndex, IsStemPlant(Shape.Kind) ? Skin : Bark, false);
+                // A shrub rose's flowers' heads, as the renderer draws them: as the bark, in the leaves' sheet.
+                if (Mesh.PetalIndex.Num > 0)
+                    DrawMesh(Part, Cam, Mesh.Petal, Mesh.PetalIndex, Leafs, false);
                 if (!bFork)
-                    DrawMesh(Part, Cam, LeafVerts, LeafIndex, (bEz || Shape.Cards) ? Cards : Leafs, true);
+                    DrawMesh(Part, Cam, LeafVerts, LeafIndex,
+                             (bEz || Shape.Cards) ? Cards : (IsStemPlant(Shape.Kind) ? Stems : Leafs), true);
                 Holes[v] = HolePixels(Part);
                 if (GTriAt)
                 {

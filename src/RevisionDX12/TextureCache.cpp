@@ -157,11 +157,19 @@ void FTextureCache::ReleaseAll()
     // free to go. Without this a long session across several levels keeps growing until
     // the cache fills - and a full cache renders surfaces with no lighting.
     for (INT i = 0; i < Count; i++)
+    {
         if (Entries[i].Resource)
         {
             Entries[i].Resource->Release();
             Entries[i].Resource = nullptr;
         }
+        if (Entries[i].Kept)
+        {
+            appFree(Entries[i].Kept);
+            Entries[i].Kept      = nullptr;
+            Entries[i].KeptBytes = 0;
+        }
+    }
     Count      = 0;
     WhiteIndex = -1;
     LastEntry  = -1;
@@ -218,11 +226,19 @@ void FTextureCache::Shutdown()
     }
 
     for (INT i = 0; i < Count; i++)
+    {
         if (Entries[i].Resource)
         {
             Entries[i].Resource->Release();
             Entries[i].Resource = nullptr;
         }
+        if (Entries[i].Kept)
+        {
+            appFree(Entries[i].Kept);
+            Entries[i].Kept      = nullptr;
+            Entries[i].KeptBytes = 0;
+        }
+    }
     Count     = 0;
     LastEntry = -1;
 
@@ -704,6 +720,12 @@ INT FTextureCache::FindColour(QWORD CacheId, QWORD PaletteId, UBOOL bMasked, UBO
     if (Entry < 0 && !bMasked && bSrgb)
         Entry = Find(CacheId, PaletteId, 1, 1);
     return (Entry >= 0) ? Entries[Entry].SrvIndex : -1;
+}
+
+UBOOL FTextureCache::WrittenThisFrame(const FTextureInfo& Info, DWORD PolyFlags, UBOOL bSrgb) const
+{
+    const INT Entry = Find(Info.CacheID, Info.PaletteCacheID, (PolyFlags & PF_Masked) ? 1 : 0, bSrgb);
+    return Entry >= 0 && Entries[Entry].RefreshSerial == FrameSerial;
 }
 
 // A transition barrier on the whole resource.
@@ -1688,6 +1710,10 @@ INT FTextureCache::Upload(const FTextureInfo& Info, UBOOL bMasked, UBOOL bSrgb, 
     Device->CreateShaderResourceView(Texture, &SrvDesc, CpuHandle);
 
     FEntry& E = Entries[Count];
+    if (E.Kept)
+        appFree(E.Kept);
+    E.Kept          = nullptr;
+    E.KeptBytes     = 0;
     E.bSrgb         = bSrgb;
     E.bKeepAlpha    = bKeepAlpha;
     E.CacheId       = Info.CacheID;
@@ -1760,6 +1786,16 @@ void FTextureCache::Refresh(INT Index, const FTextureInfo& Info, ID3D12GraphicsC
         E.RefreshSerial = FrameSerial;
         return;
     }
+    // A light or fog map the engine built again just as it was: the texture holds those very texels - nothing to
+    // record. Its one level's bytes are all there is to it; the flags it goes up with are the entry's own.
+    const UBOOL bKeepable = !Info.Texture && MipCount == 1 && Info.Format == TEXF_RGBA7 && Mip->DataPtr;
+    const INT   Bytes     = bKeepable ? Mip->USize * Mip->VSize * 4 : 0;
+    if (bKeepable && E.Kept && E.KeptBytes == Bytes && memcmp(E.Kept, Mip->DataPtr, Bytes) == 0)
+    {
+        E.RefreshSerial = FrameSerial;
+        FrameRefreshesKept++;
+        return;
+    }
     if (!CanRecordCopy(Info))
         return;
 
@@ -1780,6 +1816,21 @@ void FTextureCache::Refresh(INT Index, const FTextureInfo& Info, ID3D12GraphicsC
             FrameMapRefreshes++;
             FrameMapRefreshSec += Took;
         }
+    }
+
+    // What went up is kept, to be told from the next build. A copy not recorded left the texture as it was, and what
+    // was kept with it.
+    if (bOk && bKeepable)
+    {
+        if (E.KeptBytes != Bytes)
+        {
+            if (E.Kept)
+                appFree(E.Kept);
+            E.Kept      = (BYTE*)appMalloc(Bytes, TEXT("RdxKeptMap"));
+            E.KeptBytes = E.Kept ? Bytes : 0;
+        }
+        if (E.Kept)
+            appMemcpy(E.Kept, Mip->DataPtr, Bytes);
     }
 
     if (bOk)

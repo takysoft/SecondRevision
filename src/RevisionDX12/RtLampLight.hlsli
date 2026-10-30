@@ -24,6 +24,139 @@ float3 RtCasterNormal(float3 V)
 static float GRtLampLeast = 0.004f;
 #endif
 
+#if !RDX_RT_NO_QUERY
+// Reflections=RTLow (RtEye.w 2 and past it): how many of the lamps that reach a spot the rays see in the mirror image
+// look for what stands in their way - the strongest there; the others' light comes with nothing in its way. 0: all of
+// them. The table carries it as RtEye.w less two (FRtPass::PrepareWater).
+#define RT_LOW_LAMPS_MOST 4u
+uint RtLowShadowedLamps()
+{
+    const float W = RtEye.w;
+    return (W > 1.5f) ? min((uint)(W - 1.5f), RT_LOW_LAMPS_MOST) : 0u;
+}
+#endif
+
+// What a lamp gives a spot, by how far off it is and how squarely the spot's face looks at it - and a spot's cone -,
+// as RtLampLight weighs it; 0 where it does not reach the spot, is not of the spot's kind, or is too faint to show.
+float RtLampWeight(float3 Spot, float3 N, bool bSpecial, uint At, out float3 To, out float Dist, out float3 Colour)
+{
+    To     = float3(0.0f, 0.0f, 1.0f);
+    Dist   = 0.0f;
+    Colour = 0.0f;
+    const float4 Place = asfloat(RtWater.Load4(At));           // where it is, and its reach
+    const float3 D     = Place.xyz - Spot;
+    const float  DistSq = dot(D, D);
+    if (DistSq >= Place.w * Place.w)
+        return 0.0f;
+    const float4 Lamp = asfloat(RtWater.Load4(At + 16u));      // its colour, and a spot's cone's cosine
+    const uint4  Aim  = RtWater.Load4(At + 32u);               // where a spot points, and the lamp's flags
+    if (((Aim.w & 1u) != 0u) != bSpecial)
+        return 0.0f;
+    Dist = sqrt(DistSq);
+    To   = D / max(Dist, 1e-3f);
+    const float Fall = 1.0f - DistSq / (Place.w * Place.w);
+    float K = saturate(dot(N, To)) * Fall * Fall;
+    if (Lamp.w >= -1.0f)
+        K *= saturate((-dot(To, asfloat(Aim.xyz)) - Lamp.w) / max(1.0f - Lamp.w, 0.001f));
+#if RDX_RT_LAMPS_LEAST
+    if (K * max(Lamp.r, max(Lamp.g, Lamp.b)) < GRtLampLeast)
+        return 0.0f;
+#else
+    if (K * max(Lamp.r, max(Lamp.g, Lamp.b)) < 0.004f)
+        return 0.0f;
+#endif
+    Colour = Lamp.rgb;
+    return K;
+}
+
+#if !RDX_RT_NO_QUERY
+// Whether nothing stands between a spot and a lamp Dist off along To - RtLampLight's own ray, against Mask.
+bool RtLampSeen(float3 Spot, float3 N, float3 To, float Dist, uint Mask)
+{
+    RayDesc R;
+    R.Origin    = Spot + N;
+    R.Direction = To;
+    R.TMin      = 1.0f;
+    R.TMax      = Dist - RT_GLINT_STOP;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> Q;
+    Q.TraceRayInline(Scene, RAY_FLAG_NONE, Mask, R);
+    while (Q.Proceed())
+    {
+        if (Q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+            RtTakes(Q.CandidateGeometryIndex(), Q.CandidatePrimitiveIndex(), Q.CandidateTriangleBarycentrics()))
+            Q.CommitNonOpaqueTriangleHit();
+    }
+    return Q.CommittedStatus() != COMMITTED_TRIANGLE_HIT;
+}
+
+// RtLampLight at RTLow: the lamps that reach the spot, weighed in one go over its lists (RtLampWeight); the Strong
+// strongest kept aside and the rest's light taken as it is, with nothing in its way - then a ray each for the kept
+// ones, as RtLampLight traces it. Head, More, List and Count: RtLampLight's lists for the spot.
+float3 RtLampLightStrong(float3 Spot, float3 N, bool bSpecial, uint Mask, uint Strong, uint4 Head, uint4 More,
+                         uint2 List, uint Count)
+{
+    float  TopW[RT_LOW_LAMPS_MOST];
+    float3 TopL[RT_LOW_LAMPS_MOST];
+    float3 TopTo[RT_LOW_LAMPS_MOST];
+    float  TopDist[RT_LOW_LAMPS_MOST];
+    [unroll] for (uint z = 0u; z < RT_LOW_LAMPS_MOST; z++)
+    {
+        TopW[z]    = 0.0f;
+        TopL[z]    = float3(0.0f, 0.0f, 0.0f);
+        TopTo[z]   = float3(0.0f, 0.0f, 1.0f);
+        TopDist[z] = 0.0f;
+    }
+    float3 Free = 0.0f;
+    [loop] for (uint i = 0u; i < Count; i++)
+    {
+        const uint Id = (i < List.y) ? RtWater.Load(Head.w + (List.x + i) * 4u)
+                                     : RtWater.Load(More.x + (i - List.y) * 4u);
+        float3 To, Colour;
+        float  Dist;
+        const float K = RtLampWeight(Spot, N, bSpecial, Head.x + Id * RDX_RT_LAMP_BYTES, To, Dist, Colour);
+        if (K <= 0.0f)
+            continue;
+        // Into the strongest ones' places, the one it pushes out going on down; what falls past them is free.
+        float  W = K * max(Colour.r, max(Colour.g, Colour.b));
+        float3 L = Colour * K;
+        float3 T = To;
+        float  D = Dist;
+        [unroll] for (uint t = 0u; t < RT_LOW_LAMPS_MOST; t++)
+        {
+            if (t < Strong && W > TopW[t])
+            {
+                const float  SW = TopW[t];
+                const float3 SL = TopL[t];
+                const float3 ST = TopTo[t];
+                const float  SD = TopDist[t];
+                TopW[t]    = W;
+                TopL[t]    = L;
+                TopTo[t]   = T;
+                TopDist[t] = D;
+                W = SW;
+                L = SL;
+                T = ST;
+                D = SD;
+            }
+        }
+        Free += L;
+    }
+    float3 Sum = Free;
+    [unroll] for (uint t = 0u; t < RT_LOW_LAMPS_MOST; t++)
+    {
+        if (t < Strong && TopW[t] > 0.0f)
+        {
+            bool bSeen = true;
+            if (TopDist[t] > RT_GLINT_STOP + 4.0f)
+                bSeen = RtLampSeen(Spot, N, TopTo[t], TopDist[t], Mask);
+            if (bSeen)
+                Sum += TopL[t];
+        }
+    }
+    return Sum;
+}
+#endif
+
 // The light a spot gets from the level's lamps (FRtPass::SetLamps), worked out at the spot: every lamp that reaches it,
 // by how far off the lamp is and how squarely the spot's face looks at it - and a spot's cone - and only where
 // nothing stands between the two: a ray to the lamp, against the level and the actors alike, so that whatever casts
@@ -50,6 +183,12 @@ float3 RtLampLight(float3 Spot, float3 N, bool bSpecial, uint Mask)
     // Never past the table's own lamps, whatever a list's length says: a list holds a lamp once.
     const uint  Count  = min(List.y + More.y, Head.y * 2u);
     float3 Sum = 0.0f;
+#if !RDX_RT_NO_QUERY
+    // RTLow: the strongest few with a ray each, the rest with nothing in their way (RtLampLightStrong).
+    const uint Strong = (Mask != 0u) ? RtLowShadowedLamps() : 0u;
+    if (Strong != 0u)
+        return RtLampLightStrong(Spot, N, bSpecial, Mask, Strong, Head, More, List, Count);
+#endif
     [loop] for (uint i = 0u; i < Count; i++)
     {
         const uint   Id = (i < List.y) ? RtWater.Load(Head.w + (List.x + i) * 4u)

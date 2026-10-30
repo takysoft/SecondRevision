@@ -262,7 +262,7 @@ void RdxStartupNoteShader(DOUBLE Ms, UBOOL bCompiled)
 
 INT RdxStartupShaders()
 {
-    return GShadersCompiled + GShadersCached;
+    return GShadersCompiled;
 }
 
 static ULONGLONG FileTimeNow()

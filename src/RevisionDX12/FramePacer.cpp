@@ -322,7 +322,12 @@ UBOOL FFramePacer::CopyToBackBuffer(const FJob& J, ID3D12Resource* Picture)
     const INT Slot = NextSlot;
     ID3D12GraphicsCommandList* const L = NextList();
     CopyPicture(L, Picture, J.BackBuffers[B]);
-    L->Close();
+    // A list that would not close is not executed: that removes the device (out of memory, say, in a 32-bit process).
+    if (FAILED(L->Close()))
+    {
+        NoteResult(E_FAIL);
+        return 0;
+    }
     ID3D12CommandList* Lists1[1] = { L };
     Queue->ExecuteCommandLists(1, Lists1);
     SlotDone[Slot] = Signal();

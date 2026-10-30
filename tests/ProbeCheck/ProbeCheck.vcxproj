@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    ProbeCheck.exe - the probe gathered from the picture (MirrorProbe.hlsl) tried on the GPU without the game
+    (docs/tukrozodes-szonda-terv.md). A 32-bit program like the renderer; the shaders are compiled from the source tree
+    at run time. Needs a GPU, not the game.
+  -->
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5C2E8A41-93D7-4F0B-B6E2-7A19C4D3E852}</ProjectGuid>
+    <RootNamespace>ProbeCheck</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset Condition="'$(PlatformToolset)'==''">v145</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\tests\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\probecheck\</IntDir>
+    <TargetName>ProbeCheck</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="ProbeCheck.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\src\RevisionDX12\RenderMath.h" />
+    <ClInclude Include="..\..\src\RevisionDX12\RenderLimits.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ProbeCheckMarch.hlsl" />
+    <None Include="..\..\src\RevisionDX12\MirrorProbe.hlsl" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

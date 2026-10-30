@@ -1,0 +1,32 @@
+; SecondRevisionLampSurfaces.txt - the lamps' bodies, as Laci found them with the readout on the four rainy levels: a
+; level texture that is a lamp's glass or lens (its package and own name, with the underscores the readout shows as
+; spaces), or an actor class whose model is one. Only the sure ones. Where the game's own light stands apart from the
+; body, the puddles are to take their lamps' light from here (docs/terv-latvany-roadmap.md 9.1) - not the water, not
+; the glass. Not read by the renderer yet. What follows a ';' is a remark: where it was found, the level's light
+; nearest it there (the readout's NEAREST LIGHT), and in how many of the game's 225 maps it is used.
+;
+; name                          kind     remark
+BatteryPark.BP_LightLens2       texture  ; wall and post lanterns - 01_NYC_UNATCOIsland: Light398, 94 from it, radius 525; 02_NYC_BatteryPark: Light86, 162 from it; in 26 maps
+BatteryPark.BP_LightLens3       texture  ; glowing cube on a ledge - 02_NYC_BatteryPark: Light438, 86 from it; in 14 maps
+BatteryPark.BP_LightLens1       texture  ; beside LightLens2 and 3 in the package's Glass group, not seen on a level yet (Laci: in)
+UNATCO.un_light_a               texture  ; street lamp head, its underside - 01_NYC_UNATCOIsland: Light290, 390 from it; 15_Area51_Bunker: Light18, 30 from it, radius 1225; in 37 maps
+V_Com_Center.ClenBlueLight_A    texture  ; box lantern on the lawn - 01_NYC_UNATCOIsland: Light460, 40 from it, radius 825; in 34 maps
+Catacombs.pa_sqrlight           texture  ; row of square wall lights - 01_NYC_UNATCOIsland: Light38, 186 from it; in 48 maps
+Paris.pa_streetlight_           texture  ; street lamp's lantern (the name ends in an underscore) - 10_Paris_Metro: Light19, 284 from it, radius 1525; in 17 maps
+Paris.pa_litwindow_a            texture  ; lit window - 10_Paris_Metro: Light433, 278 from it; Light190, 298 from it, radius 400; in 7 maps
+Paris.pa_bldng_c_e              texture  ; frosted glass of a lit bay window behind iron railings - 10_Paris_Metro: Light43, 418 from it, radius 1025; in 11 maps
+UNATCO.un_lightmdcl_a           texture  ; ceiling tube light (the cafe) - 10_Paris_Metro: Light6, 120 from it, radius 1150; in 30 maps
+Area51Textures.A51_Light_02     texture  ; red dome light - 10_Paris_Metro: Light8, 76 from it, radius 150; red square light - 15_Area51_Bunker: Light153, 124 from it; in 35 maps
+Area51Textures.A51_Light_03     texture  ; cyan square wall light - 15_Area51_Bunker: Light210, 16 from it, radius 625; in 24 maps
+Area51Textures.A51_Light_04     texture  ; cyan light band around the silo - 15_Area51_Bunker: Light305, 132 from it, radius 775; in 25 maps
+Rocket.ClenRedLight_B           texture  ; red warning light (on the ground, on a crate) - 15_Area51_Bunker: Light229, 39 from it, radius 175; Light244, 37 from it; in 53 maps
+V_Com_Center.BlueLight_01       texture  ; lit window panes, small floor lamp - 15_Area51_Bunker: Spotlight1, 71 from it; Light376, 39 from it, radius 175; in 66 maps
+UNATCO.un_insetlight_b          texture  ; round inset light on the bunker - 15_Area51_Bunker: Light289, 306 from it, radius 275; in 45 maps
+Rev_SphereLight                 class    ; RevisionDeco: globe wall lamp - 02_NYC_BatteryPark: Rev_SphereLight47, its own light 7 from it; 10_Paris_Metro: Rev_SphereLight44, Light220 142 from it; in 17 maps
+;
+; Found, but not by its texture:
+; CoreTexPaper.FiniWhitDrywa_A  - the shade of the pier's hanging lamp (02_NYC_BatteryPark, Spotlight19 with a corona
+;                                 under it) is a drywall texture, a wall in 15 maps (UNATCO HQ among them): this lamp is
+;                                 to be known by its corona light instead.
+; Left out, not sure: Extension.SolidRed and Extension.VisionBlue (the police car's lights, the marker posts' red band -
+; plain 8x8 colours, paint elsewhere); Paris.pa_litwindow_b (not seen).

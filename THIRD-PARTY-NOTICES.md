@@ -70,7 +70,7 @@ Note on scope: in that repository the zlib licence covers the `VulkanDrv`, `D3D1
 ## AMD FSR SDK 2.3 (the signed FSR DLLs SecondRevisionHost64 loads)
 
 `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` in the
-`SecondRevisionHost64` folder are
+`SecondRevision\Host64` folder are
 AMD's own signed binaries from the AMD FSR SDK v2.3.0 (`Kits/FidelityFX/signedbin`), unchanged. The SDK's licence
 file (`Kits/FidelityFX/docs/license.md`) names them among the files under this licence:
 
@@ -106,7 +106,7 @@ driver's 32-bit extension, the 32-bit size of one state block).
 
 ## NVIDIA DLSS SDK 310.9.1 (AntiAliasing=DLSS and its frame generation, in SecondRevisionHost64)
 
-`nvngx_dlss.dll` and `nvngx_dlssg.dll` in the `SecondRevisionHost64` folder are NVIDIA's DLSS runtimes - the upscaler's
+`nvngx_dlss.dll` and `nvngx_dlssg.dll` in the `SecondRevision\Host64` folder are NVIDIA's DLSS runtimes - the upscaler's
 and frame generation's - from the NVIDIA DLSS SDK v310.9.1 (`lib/Windows_x86_64/rel`), unchanged;
 `SecondRevisionHost64.exe` is linked with the SDK's NGX library (`nvsdk_ngx_s.lib`). All three are used under the NVIDIA
 RTX SDKs License (v. March 14, 2024), which the SDK ships as `LICENSE.txt`; they are not covered by this project's own
@@ -321,8 +321,9 @@ them ("3rd Party Software").
 ## Intel XeSS SDK 3.0.2 (AntiAliasing=XeSS, in SecondRevisionHost64)
 
 libxess.dll, Intel's XeSS upscaler, beside SecondRevisionHost64.exe, which loads it at run time; it is shipped as Intel
-ships it. The header files it is used through are the SDK's. Beside it are the SDK's own licence (libxess-LICENSE.txt)
-and its list of the third-party components inside the library and their terms (libxess-third-party-programs.txt).
+ships it. The header files it is used through are the SDK's. In the `SecondRevision\Legal` folder are the SDK's own
+licence (libxess-LICENSE.txt) and its list of the third-party components inside the library and their terms
+(libxess-third-party-programs.txt).
 
 	Intel Simplified Software License (Version October 2022)
 
@@ -525,8 +526,9 @@ SOFTWARE.
 ## ambientCG: the grown trees' bark (Trees3D)
 
 `assets/SecondRevision-bark.bin` is made by `scripts/make_bark.py` from the colour map of Bark001 by ambientCG
-(https://ambientcg.com/a/Bark001), released under the Creative Commons CC0 1.0 Universal licence - in the public domain,
-no attribution required; named here all the same.
+(https://ambientcg.com/a/Bark001), and `assets/SecondRevision-barkheight.bin` from its displacement map, both released
+under the Creative Commons CC0 1.0 Universal licence - in the public domain, no attribution required; named here all the
+same.
 
 ## New Vision (Dave Watts): the height maps of its textures (Geometry)
 

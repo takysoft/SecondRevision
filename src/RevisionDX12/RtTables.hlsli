@@ -3,7 +3,10 @@
 // One text, so the two cannot read it differently. RtWater - the table - is declared by whoever includes this.
 
 // xyz: the camera; w: 1 where a quarter of the rays are asked - of each two by two pixels one for the others where
-// their rays are alike (Reflections=RTHalf; SolidPass.hlsl, RtAskLed) -, else 0.
+// their rays are alike (Reflections=RTHalf; SolidPass.hlsl, RtAskLed) -, 2 and past it where about a ninth are traced
+// - of each three by three pixels one for the others the same way, chosen after they asked (RTLow; RaySparse.hlsl),
+// and by how much past 2, how many lamps cast their shadows in its mirror image (RtLampLight.hlsli,
+// RtLowShadowedLamps) -, else 0.
 #define RtEye   asfloat(RtWater.Load4(0u))
 // x: the records' first byte, y: their count; z: a view for measuring (0 none; 1 what the mirror rays met, 2 the
 // glints, 3 how far, 4 the surfaces' own colours alone, 5 the sky from the far probe alone, 6 how high the rays met

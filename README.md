@@ -1,6 +1,6 @@
 # SecondRevision - An unofficial DirectX 12 renderer for Deus Ex
 
-Version 0.01 - experimental.
+Version 0.2.0 - experimental.
 
 **Experimental version!**\
 Please keep in mind, that it was mainly developed on an AMD RX 9070 XT.\
@@ -32,6 +32,7 @@ Click a picture to see it at full size.
 | ![Vanilla](screenshots/09-Vanilla.jpg) | ![I Never Asked For This](screenshots/09-INeverAskedForThis.jpg) |
 | ![Vanilla](screenshots/10-Vanilla.jpg) | ![I Never Asked For This](screenshots/10-INeverAskedForThis.jpg) |
 | ![Vanilla](screenshots/12-Vanilla.jpg) | ![I Never Asked For This](screenshots/12-INeverAskedForThis.jpg) |
+| ![Vanilla](screenshots/13-Vanilla.jpg) | ![I Never Asked For This](screenshots/13-INeverAskedForThis.jpg) |
 
 </details>
 
@@ -175,9 +176,9 @@ This will add files to the game's `System` and `NewVision` folders.\
 If you don't have New Vision, you don't need the `NewVision` folder, but it won't hurt if you copy it.
 
 - `SecondRevision.dll`, `SecondRevision.int` = the renderer
-- `SecondRevision-leafcards.bin`, `SecondRevision-bark.bin` = the grown trees' leaves and bark
-- `SecondRevisionHost64` folder = the 64-bit companion app, with AMD's, NVIDIA's and Intel's upscaler DLLs
-- `SecondRevision-THIRD-PARTY-NOTICES.md` = the licences of the third-party parts
+- `SecondRevision\Assets` folder = the grown trees' leaves and bark, the lamps' and the wet floors' lists
+- `SecondRevision\Host64` folder = the 64-bit companion app, with AMD's, NVIDIA's and Intel's upscaler DLLs
+- `SecondRevision\Legal` folder = this readme and the licences of the renderer and the third-party parts
 
 Then set the renderer in the game's ini (`Revision.ini` for Revision), section `[Engine.Engine]`:
 

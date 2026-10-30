@@ -198,6 +198,11 @@ enum { MAX_WATER_SURFACES = 128 };
 static FWaterSurface GSurfaces[MAX_WATER_SURFACES];
 static INT           GSurfaceCount  = 0;
 static UBOOL         GAnyLevelWater = 0;
+// Each of the level's surfaces: the surface whose texture mapping it is drawn with, -1 for its own (RdxWaterLeadOf) -
+// for the census's level's model, of that many surfaces.
+static INT*          GLeadOfSurf    = NULL;
+static INT           GLeadSurfs     = 0;
+static const UModel* GLeadModel     = NULL;
 // The liquids' see-through borders with the zones around them, level or upright - the surface of a pool, a pane between
 // a tank and a room: what the caustics' mask is drawn from (RdxWaterPortals). Each is a level's polygon as the BSP
 // holds it: its corners, their middle and how far the farthest is from it, its liquid's zone, and its plane turned so
@@ -1241,6 +1246,86 @@ static void FindFountainPools(UModel* Model)
                  FeetLost, PoolsLost, Apart);
 }
 
+// A node's polygon's area seen from above.
+static FLOAT NodeAreaXY(UModel* Model, const FBspNode& Node)
+{
+    FLOAT Twice = 0.0f;
+    for (INT v = 0; v < Node.NumVertices; v++)
+    {
+        const INT iA = Node.iVertPool + v, iB = Node.iVertPool + (v + 1) % Node.NumVertices;
+        if (iA < 0 || iA >= Model->Verts.Num() || iB < 0 || iB >= Model->Verts.Num())
+            return 0.0f;
+        const INT pA = Model->Verts(iA).pVertex, pB = Model->Verts(iB).pVertex;
+        if (pA < 0 || pA >= Model->Points.Num() || pB < 0 || pB >= Model->Points.Num())
+            return 0.0f;
+        const FVector& A = Model->Points(pA);
+        const FVector& B = Model->Points(pB);
+        Twice += A.X * B.Y - B.X * A.Y;
+    }
+    return 0.5f * Abs(Twice);
+}
+
+// Each water surface's largest piece - of the level's surfaces it is made of, the one most of it lies on - and the
+// pieces that are drawn as that one lays the texture on (RdxWaterLeadOf): the same texture, drawn alike, its axes and
+// base in the model. SurfWater and SurfArea: the census's, by the level's surface.
+static void FindLeads(UModel* Model, const INT* SurfWater, const FLOAT* SurfArea)
+{
+    if (GLeadOfSurf)
+        appFree(GLeadOfSurf);
+    GLeadOfSurf = NULL;
+    GLeadSurfs  = 0;
+    GLeadModel  = NULL;
+    const INT NumSurfs = Model->Surfs.Num();
+    if (!SurfWater || !SurfArea || NumSurfs <= 0)
+        return;
+    GLeadOfSurf = (INT*)appMalloc(NumSurfs * sizeof(INT), TEXT("RdxWaterLeads"));
+    if (!GLeadOfSurf)
+        return;
+    INT Lead[MAX_WATER_SURFACES];
+    for (INT w = 0; w < MAX_WATER_SURFACES; w++)
+        Lead[w] = -1;
+    for (INT i = 0; i < NumSurfs; i++)
+    {
+        GLeadOfSurf[i] = -1;
+        const INT w = SurfWater[i];
+        if (w >= 0 && w < MAX_WATER_SURFACES && (Lead[w] < 0 || SurfArea[i] > SurfArea[Lead[w]]))
+            Lead[w] = i;
+    }
+    const DWORD DrawnAlike = PF_Translucent | PF_Masked | PF_Modulated | PF_Invisible | PF_TwoSided;
+    auto Mapped = [&](const FBspSurf& S)
+    {
+        return S.vTextureU >= 0 && S.vTextureU < Model->Vectors.Num() && S.vTextureV >= 0 &&
+               S.vTextureV < Model->Vectors.Num() && S.pBase >= 0 && S.pBase < Model->Points.Num();
+    };
+    INT Pieces = 0;
+    for (INT i = 0; i < NumSurfs; i++)
+    {
+        const INT w = SurfWater[i];
+        if (w < 0 || w >= MAX_WATER_SURFACES || Lead[w] < 0 || Lead[w] == i)
+            continue;
+        const FBspSurf& Own = Model->Surfs(i);
+        const FBspSurf& By  = Model->Surfs(Lead[w]);
+        if (!Own.Texture || Own.Texture != By.Texture || ((Own.PolyFlags ^ By.PolyFlags) & DrawnAlike) || !Mapped(Own) ||
+            !Mapped(By))
+            continue;
+        GLeadOfSurf[i] = Lead[w];
+        Pieces++;
+        RDX_LOGF("water census:   surface %i (%s) is drawn as surface %i lays its texture on - the larger piece of the "
+                 "water at height %.0f (%.0f of its units^2 against %.0f)", i, Own.Texture->GetName(), Lead[w],
+                 GSurfaces[w].Z, SurfArea[i], SurfArea[Lead[w]]);
+    }
+    GLeadSurfs = NumSurfs;
+    GLeadModel = Model;
+    RDX_LOGF("water census: %i pieces of the water surfaces drawn as their water's largest piece lays the texture on",
+             Pieces);
+}
+
+INT RdxWaterLeadOf(const UModel* Model, INT iSurf)
+{
+    return (Model && Model == GLeadModel && GLeadOfSurf && Model->Surfs.Num() == GLeadSurfs && iSurf >= 0 &&
+            iSurf < GLeadSurfs) ? GLeadOfSurf[iSurf] : -1;
+}
+
 static void Census(ULevel* Level)
 {
     UModel* Model = Level->Model;
@@ -1280,6 +1365,15 @@ static void Census(ULevel* Level)
     if (!OnBorder)
         return;
     appMemzero(OnBorder, NumSurfs > 0 ? NumSurfs : 1);
+    // Which water surface each of the level's surfaces is a piece of (-1 none, -2 more than one) and how much of it
+    // lies there: the largest piece lays the texture on for the rest (RdxWaterLeadOf).
+    INT*   SurfWater = (INT*)appMalloc((NumSurfs > 0 ? NumSurfs : 1) * sizeof(INT), TEXT("RdxWaterCensus"));
+    FLOAT* SurfArea  = (FLOAT*)appMalloc((NumSurfs > 0 ? NumSurfs : 1) * sizeof(FLOAT), TEXT("RdxWaterCensus"));
+    for (INT i = 0; i < NumSurfs && SurfWater && SurfArea; i++)
+    {
+        SurfWater[i] = -1;
+        SurfArea[i]  = 0.0f;
+    }
     INT AirNodes = 0, ZeroNodes = 0;
     FBox  ZoneBox[FBspNode::MAX_ZONES];      // all of a zone's borders with other zones, level or not
     for (INT z = 0; z < FBspNode::MAX_ZONES; z++)
@@ -1364,6 +1458,11 @@ static void Census(ULevel* Level)
                 GSurfaces[s].Air = Dry;
                 GSurfaces[s].Z   = GSurfaces[s].ZSum / (FLOAT)GSurfaces[s].Corners;
             }
+            if (s >= 0 && SurfWater && SurfArea && Node.iSurf >= 0 && Node.iSurf < NumSurfs)
+            {
+                SurfWater[Node.iSurf] = (SurfWater[Node.iSurf] == -1 || SurfWater[Node.iSurf] == s) ? s : -2;
+                SurfArea[Node.iSurf] += NodeAreaXY(Model, Node);
+            }
             // And where the level draws it see-through, a border of the caustics' mask - level or not.
             if (NodeSeeThrough(Model, Node))
             {
@@ -1401,6 +1500,11 @@ static void Census(ULevel* Level)
         AddRow(Surf.Texture, Surf.PolyFlags & ~EditorFlags, Row_Look, Hints, 0);
     }
     appFree(OnBorder);
+    FindLeads(Model, SurfWater, SurfArea);
+    if (SurfWater)
+        appFree(SurfWater);
+    if (SurfArea)
+        appFree(SurfArea);
 
     GAnyLevelWater = (GSurfaceCount > 0) ? 1 : 0;
     for (INT z = 0; z < FBspNode::MAX_ZONES; z++)
@@ -2415,7 +2519,10 @@ UBOOL RdxWaterSheet(const FSceneNode* Frame, const FSurfaceInfo& Surface, const 
             CountSteps(Tex);
         }
     }
-    const FBspSurf& Surf = Model->Surfs(Node.iSurf);
+    // Laid on as the texture is drawn: by the water's largest piece where this piece is drawn as that one lays the
+    // texture on (RdxWaterLeadOf).
+    const INT       LeadSurf = RdxWaterLeadOf(Model, Node.iSurf);
+    const FBspSurf& Surf     = Model->Surfs((LeadSurf >= 0) ? LeadSurf : Node.iSurf);
     FLOAT TileU = 0.0f, TileV = 0.0f;
     TileSize(Model, Surf, TileU, TileV);
     FVector DirU = (Surf.vTextureU >= 0 && Surf.vTextureU < Model->Vectors.Num()) ? Model->Vectors(Surf.vTextureU) : FVector(1, 0, 0);
@@ -2681,6 +2788,48 @@ FLOAT RdxWaterLampShows(const FSceneNode* Frame, const FVector& Lamp)
         Shows *= S.Clear ? RdxMath::WaterLampThrough(Way.Z / Far, Eye.Z < S.Z) : 0.0f;
     }
     return Shows;
+}
+
+FLOAT RdxFloorRainThick(ULevel* Level, const FVector& Cam)
+{
+    static FLOAT          Thick   = 0.0f;
+    static FLOAT          Clock   = 0.0f;
+    static const ULevel*  Counted = NULL;     // compared only, never followed
+    if (!Level)
+        return 0.0f;
+    if (Level != Counted)
+    {
+        Counted = Level;
+        Thick   = 0.0f;
+        Clock   = 0.0f;
+    }
+    if (GRaindropName == NAME_None)
+        GRaindropName = FName(TEXT("Raindrop"), FNAME_Find);
+    INT Drops = 0;
+    if (GRaindropName != NAME_None)
+    {
+        const FLOAT Reach = 0.5f * RdxMath::RippleWorld;
+        for (INT i = 0; i < Level->Actors.Num(); i++)
+        {
+            const AActor* A = Level->Actors(i);
+            if (!A || A->bDeleteMe || A->Velocity.Z > -1.0f || Abs(A->Location.X - Cam.X) > Reach ||
+                Abs(A->Location.Y - Cam.Y) > Reach)
+                continue;
+            for (UClass* C = A->GetClass(); C; C = C->GetSuperClass())
+                if (C->GetFName() == GRaindropName)
+                {
+                    Drops++;
+                    break;
+                }
+        }
+    }
+    // By the level's clock: a paused game's rain stands, and its rings with it.
+    const FLOAT Now = Level->GetLevelInfo() ? Level->GetLevelInfo()->TimeSeconds : 0.0f;
+    const FLOAT Dt  = (Clock > 0.0f && Now > Clock) ? Now - Clock : 0.0f;
+    Clock           = Now;
+    const FLOAT To  = Clamp((FLOAT)Drops / RdxMath::FloorRainFullDrops, 0.0f, 1.0f);
+    Thick += (To - Thick) * Min(Dt / 0.5f, 1.0f);
+    return Thick;
 }
 
 FLOAT RdxWaterRainThick()

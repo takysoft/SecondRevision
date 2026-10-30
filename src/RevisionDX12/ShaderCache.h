@@ -11,7 +11,7 @@
 // The file outlives the build: a new DLL compiles only the shaders whose text it changed. The one exception is a text
 // that #includes others through the caller's own handler - those texts live inside the DLL and are not in the key, so
 // this DLL's build is. What nobody asks for any more is left out of the file after a month, and the file is held to a
-// few megabytes (RdxMath::ShaderCacheWritten).
+// size that takes every mode's shaders (ShaderCache.cpp's MaxKeptBytes, RdxMath::ShaderCacheWritten).
 //
 // The file is only ever a shortcut: where it cannot be read or written (a damaged file, no write access anywhere) the
 // shaders are compiled as they always were. Where the DLL's folder cannot take it - a game installed where the user may
@@ -23,12 +23,21 @@ HRESULT RdxCompile(LPCVOID Source, SIZE_T Length, LPCSTR SourceName, const D3D_S
 // Measurement only (the marker SecondRevision-no-shader-cache.txt): the file is neither read nor written, and nothing is
 // kept in memory - every shader goes through the compiler, as before the cache. Set before the first compile.
 void RdxShaderCacheDisable();
+// The start's warm-up is over (FBackend::WarmShaders): every shader compiled from here on is named in the log, as one
+// the warm-up should have made.
+void RdxShaderWarmDone();
+// How many shaders the start read from the cache's file: none where there was no file (a first start, the file
+// deleted, the cache off) - then the start compiles every shader the renderer has.
+INT  RdxShaderCacheRead();
 
 // Somebody to tell before every shader that goes through the compiler - not one read from the file - on the thread
 // that asked for it: the start's caption, which says that shaders are being compiled (FBackend::PresentCompiling).
-// Null: nobody.
+// Null: nobody. With a Wait as well, the compiler then runs on a thread of its own, and the thread that asked waits in
+// Wait until it is done (Compiling: that thread, signalled when it ends) - the start's window answers Windows meanwhile
+// (FBackend::WaitCompiling). Without one, or where no thread can be made, the compiler runs on the asking thread.
 typedef void (*FRdxCompileWatch)(void* Who);
-void RdxCompileWatch(FRdxCompileWatch Watch, void* Who);
+typedef void (*FRdxCompileWait)(void* Who, HANDLE Compiling);
+void RdxCompileWatch(FRdxCompileWatch Watch, void* Who, FRdxCompileWait Wait = nullptr);
 
 // Measurement only (the marker SecondRevision-shader-cache-elsewhere.txt, its text a folder): as if the DLL's folder could
 // not be written - the file is read from and written to that folder, the place the user's own folder takes otherwise.

@@ -10,6 +10,10 @@
 
 #include "../src/RevisionDX12/RenderMath.h"
 #include "../src/RevisionDX12/TreeGen.h"
+#include "../src/RevisionDX12/Spherify.h"
+#include "../src/RevisionDX12/MeshRound.h"
+#include "../src/RevisionDX12/LevelRound.h"
+#include "../src/RevisionDX12/EdgeBevel.h"
 #include "../src/RevisionDX12/PomArchive.h"
 #include "../src/Host64/Host64Camera.h"
 #include "ArchiveVectors.h"
@@ -323,6 +327,72 @@ static void TestLightMapCoords()
     CheckNear(Repeat(WrongV), 0.2186f, 1e-3f, "with the wrong divisor the sample lands on empty sky");
     CheckNear(Repeat(GoodV),    0.75f,   1e-3f, "with the right divisor it lands in the band of buildings");
     Check(Repeat(GoodV) > 0.46f, "the buildings are in the lower half of the texture");
+
+    // The light maps' blending over the spherifier's soft edges (SoftLightShare, SoftLightMix, LightTexelPlace,
+    // SampleLightTexels).
+    CheckNear(SoftLightShare(0.0f, 20.0f), 0.5f, 1e-6f, "soft light: half of the light across on the edge");
+    CheckNear(SoftLightShare(10.0f, 20.0f), 0.25f, 1e-6f, "soft light: a quarter halfway to the reach");
+    CheckNear(SoftLightShare(-2.0f, 20.0f), 0.55f, 1e-6f, "soft light: more than half just past the edge");
+    Check(SoftLightShare(20.0f, 20.0f) == 0.0f && SoftLightShare(25.0f, 20.0f) == 0.0f &&
+              SoftLightShare(5.0f, 0.0f) == 0.0f && SoftLightShare(-40.0f, 20.0f) == 1.0f,
+          "soft light: none at the reach or past it, or with no reach; all of it far past the edge");
+    {
+        bool bDown = true;
+        for (int k = 1; k <= 20; k++)
+            bDown = bDown && SoftLightShare((float)k, 20.0f) <= SoftLightShare((float)(k - 1), 20.0f);
+        // The two sides of an edge, each its own reach: the light across it runs on without a step.
+        const float A = 100.0f, B = 40.0f, RA = 20.0f, RB = 12.0f;
+        const float AtA = A + (B - A) * SoftLightShare(0.0f, RA), AtB = B + (A - B) * SoftLightShare(0.0f, RB);
+        Check(bDown && fabsf(AtA - AtB) < 1e-4f, "soft light: the share only falls into the polygon; no step on the edge");
+    }
+    {
+        const float Own[4] = { 100.0f, 100.0f, 100.0f, 255.0f };
+        const float Across[8] = { 40.0f, 40.0f, 40.0f, 255.0f, 160.0f, 10.0f, 70.0f, 255.0f };
+        float       Out[4];
+        const float One[1] = { 0.25f };
+        SoftLightMix(Own, One, Across, 1, Out);
+        CheckNear(Out[0], 100.0f + (40.0f - 100.0f) * 0.25f, 1e-3f, "soft light: one side's share as it is");
+        const float Two[2] = { 0.5f, 0.5f };
+        SoftLightMix(Own, Two, Across, 2, Out);
+        Check(fabsf(Out[0] - 100.0f) < 1e-3f && fabsf(Out[1] - 50.0f) < 1e-3f && fabsf(Out[2] - 70.0f) < 1e-3f &&
+                  fabsf(Out[3] - 255.0f) < 1e-3f,
+              "soft light: two sides meeting at a corner, half each - the three polygons' mean");
+        const float None[2] = { 0.0f, -1.0f };
+        SoftLightMix(Own, None, Across, 2, Out);
+        Check(Out[0] == 100.0f && Out[1] == 100.0f, "soft light: no share, the texel's own");
+    }
+    {
+        // A texel's place and back: the axes skewed and scaled, panned - the place's coordinate is the texel's middle.
+        const FVec3 Base = { 100.0f, -40.0f, 12.0f }, U = { 0.8f, 0.6f, 0.0f }, V = { 0.1f, 0.0f, -1.2f };
+        const float PanU = 7.5f, PanV = -3.0f, InvU = 1.0f / (2.0f * 32.0f), InvV = 1.0f / (1.5f * 16.0f);
+        bool bBack = true;
+        for (int j = 0; j < 16; j += 5)
+            for (int i = 0; i < 32; i += 7)
+            {
+                FVec3 P = { 0.0f, 0.0f, 0.0f };
+                bBack = bBack && LightTexelPlace(i, j, 32, 16, PanU, PanV, InvU, InvV, Base, U, V, P);
+                const FVec3 D = { P.X - Base.X, P.Y - Base.Y, P.Z - Base.Z };
+                bBack = bBack && fabsf((Dot(D, U) - PanU) * InvU - ((float)i + 0.5f) / 32.0f) < 1e-4f &&
+                        fabsf((Dot(D, V) - PanV) * InvV - ((float)j + 0.5f) / 16.0f) < 1e-4f;
+            }
+        FVec3 Q;
+        const FVec3 Same = { 0.8f, 0.6f, 0.0f };
+        Check(bBack && !LightTexelPlace(0, 0, 32, 16, PanU, PanV, InvU, InvV, Base, U, Same, Q),
+              "corner light: a texel's place on its surface lies under the texel's middle; parallel axes give none");
+    }
+    {
+        // Two by two texels: the middle is their mean; a corner's middle is that texel; outside the lit part it holds
+        // to the last lit texel.
+        const unsigned char T[16] = { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 126, 0, 2 };
+        float O[4];
+        SampleLightTexels(T, 2, 2, 2, 2, 0.5f, 0.5f, O);
+        const bool bMean = fabsf(O[0] - 60.0f) < 1e-3f && fabsf(O[1] - 69.0f) < 1e-3f && fabsf(O[3] - 53.0f) < 1e-3f;
+        SampleLightTexels(T, 2, 2, 2, 2, 0.25f, 0.25f, O);
+        const bool bCorner = fabsf(O[0]) < 1e-3f && fabsf(O[2] - 20.0f) < 1e-3f;
+        SampleLightTexels(T, 2, 2, 1, 2, 0.9f, 0.25f, O);
+        const bool bLit = fabsf(O[0]) < 1e-3f && fabsf(O[3] - 30.0f) < 1e-3f;
+        Check(bMean && bCorner && bLit, "corner light: a light map read between its texels, within the lit part");
+    }
 }
 
 static void TestPerspective()
@@ -1193,9 +1263,9 @@ static void TestShadowPresets()
     Check(ParseShadowQuality(" high\t", bKnown) == ShadowQuality_High && bKnown, "spaces and tabs at the edges");
     Check(ParseShadowQuality("0", bKnown) == ShadowQuality_Off && bKnown, "0 = Off");
     Check(ParseShadowQuality("3", bKnown) == ShadowQuality_High && bKnown, "3 = High");
-    Check(ParseShadowQuality("RT", bKnown) == ShadowQuality_Rt && bKnown, "RT");
-    Check(ParseShadowQuality(" rt ", bKnown) == ShadowQuality_Rt && bKnown, "rt, with spaces around it");
-    Check(ParseShadowQuality("4", bKnown) == ShadowQuality_Rt && bKnown, "4 = RT");
+    Check(ParseShadowQuality("RT", bKnown) == ShadowQuality_High && !bKnown, "RT alone is no word any more - unknown, High");
+    Check(ParseShadowQuality(" rt high ", bKnown) == ShadowQuality_Rt && bKnown, "rt high, as the menu says it");
+    Check(ParseShadowQuality("4", bKnown) == ShadowQuality_Rt && bKnown, "4 = RT High");
     Check(ParseShadowQuality("RT-Low", bKnown) == ShadowQuality_RtLow && bKnown, "RT-Low");
     Check(ParseShadowQuality(" rt low ", bKnown) == ShadowQuality_RtLow && bKnown, "rt low - a space inside counts for nothing");
     Check(ParseShadowQuality(L"RTMEDIUM", bKnown) == ShadowQuality_RtMedium && bKnown, "RTMEDIUM, wide characters");
@@ -2439,8 +2509,8 @@ static void TestUpscaling()
         Check(ParseAmbientOcclusion(" ssao ", bA) == Ao_Ssao && bA, "ssao, with spaces around it");
         Check(ParseAmbientOcclusion(L"SSAO", bA) == Ao_Ssao && bA, "SSAO, as wide characters");
         Check(ParseAmbientOcclusion("True", bA) == Ao_Off && !bA, "True is no word of the key: unknown, and unknown is Off");
-        Check(ParseAmbientOcclusion("RTAO", bA) == Ao_Off && !bA, "a kind that does not exist is unknown, and unknown is Off");
-        Check(ParseAmbientOcclusion(" rt ", bA) == Ao_Rt && bA, "RT, in any case, with spaces around it");
+        Check(ParseAmbientOcclusion("HBAO", bA) == Ao_Off && !bA, "a kind that does not exist is unknown, and unknown is Off");
+        Check(ParseAmbientOcclusion(" rtao ", bA) == Ao_Rt && bA, "RTAO, in any case, with spaces around it");
         Check(ParseAmbientOcclusion((const char*)0, bA) == Ao_Off && !bA, "no text: Off");
         bool bRoundTrips = true;
         for (int i = 0; i < Ao_Count; i++)
@@ -2466,29 +2536,372 @@ static void TestUpscaling()
               "water: the caustics at High");
         // The reflections' key, and what a file without it means by its water's level.
         Check(ParseReflections("Default", bA) == Reflections_Default && bA && ParseReflections(" high ", bA) ==
-              Reflections_High && bA && ParseReflections(L"rt", bA) == Reflections_Rt && bA &&
-              ParseReflections("RTHalf", bA) == Reflections_RtHalf && bA,
-              "reflections: Default, High, RT and RTHalf, spaces and case aside");
+              Reflections_High && bA && ParseReflections(L"rthigh", bA) == Reflections_RtHigh && bA &&
+              ParseReflections("RTMedium", bA) == Reflections_RtMedium && bA && ParseReflections(" rtlow", bA) ==
+              Reflections_RtLow && bA && ParseReflections("low", bA) == Reflections_Low && bA &&
+              ParseReflections(" Medium ", bA) == Reflections_Medium && bA,
+              "reflections: Default, Low, Medium, High, RTHigh, RTMedium and RTLow, spaces and case aside");
         Check(ParseReflections("Off", bA) == Reflections_Default && bA && ParseReflections("True", bA) ==
               Reflections_Default && !bA,
               "reflections: Off is Default; True is no word of the key - unknown, Default");
+        Check(ParseReflections("RT", bA) == Reflections_Default && !bA && ParseReflections("RTHalf", bA) ==
+              Reflections_Default && !bA,
+              "reflections: the old RT and RTHalf are no words any more - unknown, Default");
+        Check(ParseAmbientOcclusion("RTAO", bA) == Ao_Rt && bA && ParseAmbientOcclusion("RT", bA) == Ao_Off && !bA,
+              "ambient occlusion: RTAO; the old RT is no word any more - unknown, Off");
         Check(ParseReflections("Ultra", bA) == Reflections_Default && !bA &&
               ParseReflections((const char*)0, bA) == Reflections_Default && !bA,
               "reflections: what is not a level, and no text, are unknown - and Default");
-        Check(!ReflectionsHasMirror(Reflections_Default) && ReflectionsHasMirror(Reflections_High) &&
-              ReflectionsHasMirror(Reflections_Rt) && ReflectionsHasMirror(Reflections_RtHalf),
-              "reflections: a mirror image from High on");
-        Check(!ReflectionsTraced(Reflections_High) && ReflectionsTraced(Reflections_Rt) &&
-              ReflectionsTraced(Reflections_RtHalf), "reflections: from rays at RT and RTHalf");
-        Check(ReflectionsStep(Reflections_Default, 1) == Reflections_High && ReflectionsStep(Reflections_High, 1) ==
-              Reflections_RtHalf && ReflectionsStep(Reflections_RtHalf, 1) == Reflections_Rt &&
-              ReflectionsStep(Reflections_Rt, 1) == Reflections_Default &&
-              ReflectionsStep(Reflections_Default, -1) == Reflections_Rt,
-              "reflections: the menu steps Default, High, RTHalf, RT and round again, either way");
+        Check(!ReflectionsHasMirror(Reflections_Default) && !ReflectionsHasMirror(Reflections_Low) &&
+              ReflectionsHasMirror(Reflections_Medium) && ReflectionsHasMirror(Reflections_High) &&
+              ReflectionsHasMirror(Reflections_RtHigh) && ReflectionsHasMirror(Reflections_RtMedium) &&
+              ReflectionsHasMirror(Reflections_RtLow),
+              "reflections: a mirror image from Medium on");
+        Check(!ReflectionsWetImage(Reflections_Low) && ReflectionsWetImage(Reflections_Medium) &&
+              ReflectionsWetImage(Reflections_High) && ReflectionsWetImage(Reflections_RtLow) &&
+              ReflectionsWetCoarse(Reflections_Medium) && !ReflectionsWetCoarse(Reflections_High) &&
+              !ReflectionsWetCoarse(Reflections_RtLow),
+              "reflections: the wet floors' image from Medium on, the coarse one at Medium alone");
+        Check(WaterMirrorSwitch(Reflections_Default) == 0.0f && WaterMirrorSwitch(Reflections_Low) == 0.25f &&
+              WaterMirrorSwitch(Reflections_Medium) == 0.75f && WaterMirrorSwitch(Reflections_High) == 1.0f &&
+              WaterMirrorSwitch(Reflections_RtLow) == 1.0f && WaterMirrorSwitch(Reflections_RtHigh) == 1.0f,
+              "reflections: the water's switch - none, the glints and the far image, the coarse mirror, the full one");
+        Check(!ReflectionsGlassTrace(Reflections_Medium) && ReflectionsGlassTrace(Reflections_High) &&
+              ReflectionsGlassTrace(Reflections_RtLow),
+              "reflections: the glass's picture trace from High on, the probe alone at Medium");
+        Check(ReflectionsGlassFar(Reflections_Low) && !ReflectionsGlassFar(Reflections_Default) &&
+              !ReflectionsGlassFar(Reflections_Medium) && !ReflectionsGlassFar(Reflections_High) &&
+              !ReflectionsGlassFar(Reflections_RtLow),
+              "reflections: the glass's far image alone at Low");
+        Check(!ReflectionsTraced(Reflections_High) && ReflectionsTraced(Reflections_RtHigh) &&
+              ReflectionsTraced(Reflections_RtMedium) && ReflectionsTraced(Reflections_RtLow),
+              "reflections: from rays at RTHigh, RTMedium and RTLow");
+        Check(ReflectionsStep(Reflections_Default, 1) == Reflections_Low &&
+              ReflectionsStep(Reflections_Low, 1) == Reflections_Medium &&
+              ReflectionsStep(Reflections_Medium, 1) == Reflections_High && ReflectionsStep(Reflections_High, 1) ==
+              Reflections_RtLow && ReflectionsStep(Reflections_RtLow, 1) == Reflections_RtMedium &&
+              ReflectionsStep(Reflections_RtMedium, 1) == Reflections_RtHigh &&
+              ReflectionsStep(Reflections_RtHigh, 1) == Reflections_Default &&
+              ReflectionsStep(Reflections_Default, -1) == Reflections_RtHigh &&
+              ReflectionsStep(Reflections_RtMedium, -1) == Reflections_RtLow,
+              "reflections: the menu steps Default, Low, Medium, High, RTLow, RTMedium, RTHigh and round again, "
+              "either way");
+        {
+            // The wet floors' list: a line a texture, its kind; remarks, empty lines, carriage returns and the case of
+            // the letters aside; a line that says anything else is not read, and counted.
+            const char Text[] = "; SecondRevisionWetSurfaces.txt - the floors that get wet\r\n"
+                                "Paris.pa_sidewalk_a             stone\r\n"
+                                "\r\n"
+                                "  Paris.pa_street_a\tSTONE ; the street\r\n"
+                                "CoreTexMetal.GripMetlFloor_A    metal\n"
+                                "CoreTexWood.Floor_A paper\n"
+                                "Paris.pa_brick_a stone again\n"
+                                "OnlyAName\n"
+                                "CoreTexConcrete.RoadBlacktop_B  Stone";
+            FWetSurface List[8];
+            int         Bad = -1;
+            const int   N   = ParseWetSurfaces(Text, (int)sizeof(Text) - 1, List, 8, Bad);
+            Check(N == 4 && Bad == 3, "wet floors: four lines read, three that say something else not read");
+            Check(N == 4 && strcmp(List[0].Name, "Paris.pa_sidewalk_a") == 0 && List[0].Kind == Wet_Stone &&
+                      strcmp(List[1].Name, "Paris.pa_street_a") == 0 && List[1].Kind == Wet_Stone &&
+                      strcmp(List[2].Name, "CoreTexMetal.GripMetlFloor_A") == 0 && List[2].Kind == Wet_Metal &&
+                      strcmp(List[3].Name, "CoreTexConcrete.RoadBlacktop_B") == 0 && List[3].Kind == Wet_Stone,
+                  "wet floors: the names as written, the kinds whatever their case, the last line without its end");
+            Check(WetKindOf(List, N, L"paris.PA_STREET_A") == Wet_Stone &&
+                      WetKindOf(List, N, "CoreTexMetal.GripMetlFloor_A") == Wet_Metal &&
+                      WetKindOf(List, N, L"Paris.pa_street") == Wet_None &&
+                      WetKindOf(List, N, L"Paris.pa_street_a_b") == Wet_None &&
+                      WetKindOf(List, N, (const char*)0) == Wet_None,
+                  "wet floors: a texture found by its whole name, the case aside, and nothing by a part of it");
+            FWetSurface Two[2];
+            const int   M = ParseWetSurfaces(Text, (int)sizeof(Text) - 1, Two, 2, Bad);
+            Check(M == 2 && Bad == 5, "wet floors: past the room, the lines are counted as not read");
+            const char  Wood[] = "UNATCO.un_dock_S wood\nCoreTexWood.BoatHouseWood_A  WOOD ; planks\nBatteryPark.DGW2 woods\n";
+            FWetSurface Planks[4];
+            const int   W = ParseWetSurfaces(Wood, (int)sizeof(Wood) - 1, Planks, 4, Bad);
+            Check(W == 2 && Bad == 1 && Planks[0].Kind == Wet_Wood && Planks[1].Kind == Wet_Wood,
+                  "wet floors: wood, whatever its case, and a word that only begins so not read");
+        }
+        {
+            // The lamps' bodies' list: a texture or a class a line, remarks after ';', the case aside.
+            const char Text[] = "; the lamps\nBatteryPark.BP_LightLens2   texture ; lanterns\r\nRev_SphereLight class\n"
+                                "Paris.pa_streetlight_ TEXTURE\nExtension.SolidRed paint\nA.B texture extra\n\n";
+            FLampSurface List[8];
+            int          Bad = 0;
+            const int    N   = ParseLampSurfaces(Text, (int)sizeof(Text) - 1, List, 8, Bad);
+            Check(N == 3 && Bad == 2 && List[0].Kind == Lamp_Texture && List[1].Kind == Lamp_Class &&
+                      List[2].Kind == Lamp_Texture,
+                  "lamps' list: texture and class, any case; a kind that is neither, or a third word, not read");
+            Check(LampListed(List, N, L"batterypark.bp_lightlens2", Lamp_Texture) &&
+                      LampListed(List, N, "REV_SPHERELIGHT", Lamp_Class) &&
+                      !LampListed(List, N, "Rev_SphereLight", Lamp_Texture) &&
+                      !LampListed(List, N, "Paris.pa_streetlight", Lamp_Texture),
+                  "lamps' list: a name of its kind only, whole, the case aside");
+            // Two panes of one lantern, side by side, are one lamp about both; a lamp across the street stays its own;
+            // a small body inside a larger one adds nothing to it.
+            FLampBody B[4] = { { 0.0f, 0.0f, 0.0f, 8.0f, 1.0f, 1.0f, 1.0f },
+                               { 20.0f, 0.0f, 0.0f, 8.0f, 1.0f, 1.0f, 1.0f },
+                               { 400.0f, 0.0f, 0.0f, 8.0f, 1.0f, 1.0f, 1.0f },
+                               { 402.0f, 0.0f, 0.0f, 2.0f, 1.0f, 1.0f, 1.0f } };
+            const int M = MergeLampBodies(B, 4, 8.0f, 48.0f);
+            Check(M == 2 && B[0].X > 9.99f && B[0].X < 10.01f && B[0].Extent > 17.99f && B[0].Extent < 18.01f &&
+                      B[1].X == 400.0f && B[1].Extent == 8.0f,
+                  "lamps' bodies: a lantern's panes one lamp about both; one inside another adds nothing");
+            // A row of windows side by side, each its own: one ball about two of them would be larger than a lamp.
+            FLampBody Row[3] = { { 0.0f, 0.0f, 0.0f, 30.0f, 1.0f, 1.0f, 1.0f },
+                                 { 62.0f, 0.0f, 0.0f, 30.0f, 1.0f, 1.0f, 1.0f },
+                                 { 124.0f, 0.0f, 0.0f, 30.0f, 1.0f, 1.0f, 1.0f } };
+            Check(MergeLampBodies(Row, 3, 8.0f, 48.0f) == 3 && Row[0].Extent == 30.0f && Row[1].X == 62.0f,
+                  "lamps' bodies: windows in a row stay apart, none grown");
+            const float Dist[5] = { 30.0f, 10.0f, 50.0f, 10.0f, 20.0f };
+            int         Order[5];
+            LampsByDistance(Dist, 5, Order);
+            Check(Order[0] == 1 && Order[1] == 3 && Order[2] == 4 && Order[3] == 0 && Order[4] == 2,
+                  "lamps' bodies: the nearest first, the equal in their order");
+            float Lo = 9.0f, Hi = -9.0f;
+            for (int t = 0; t < 1000; t++)
+            {
+                const float F = LampFlicker((float)t * 0.013f, 3.0f);
+                Lo            = (F < Lo) ? F : Lo;
+                Hi            = (F > Hi) ? F : Hi;
+            }
+            Check(Lo >= 1.0f - LampFlickerDepth - 1e-4f && Hi <= 1.0f + LampFlickerDepth + 1e-4f && Hi - Lo > 0.2f,
+                  "lamps' bodies: a fire's glow wavers within its depth either way, and does waver");
+        }
+        {
+            // The rain's cover: a roof's sharp edge (0 under it, 255 open) becomes a slope over 2 * Radius + 1 cells,
+            // rising all along it; the cells well away from the edge keep their value, and an even grid stays even.
+            enum { W = 24, H = 3 };
+            unsigned char G[W * H], Work[W * H], Even[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    G[y * W + x]    = (x < 12) ? 0 : 255;
+                    Even[y * W + x] = 200;
+                }
+            BlurWetCover(G, W, H, 4, Work);
+            BlurWetCover(Even, W, H, 4, Work);
+            bool bRises = true, bKept = true, bEven = true;
+            for (int y = 0; y < H; y++)
+            {
+                for (int x = 1; x < W; x++)
+                    bRises = bRises && G[y * W + x] >= G[y * W + x - 1];
+                bKept = bKept && G[y * W + 0] == 0 && G[y * W + 6] == 0 && G[y * W + 17] == 255 && G[y * W + 23] == 255;
+                for (int x = 0; x < W; x++)
+                    bEven = bEven && Even[y * W + x] == 200;
+            }
+            Check(bRises && bKept && G[W + 8] > 0 && G[W + 8] < 128 && G[W + 15] > 128 && G[W + 15] < 255 && bEven,
+                  "wet cover: a roof's edge softened into a slope, the cells away from it kept, an even grid even");
+            // Grown first by the radius, then blurred by it: nought on the cover's side of its edge and next to nothing
+            // on the other - the dry floor meets the wet one all but dry -, the full rain twice the radius out.
+            unsigned char E[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    E[y * W + x] = (x < 8) ? 0 : 255;
+            ErodeWetCover(E, W, H, 3, Work);
+            BlurWetCover(E, W, H, 3, Work);
+            bool bUp = true;
+            for (int x = 1; x < W; x++)
+                bUp = bUp && E[W + x] >= E[W + x - 1];
+            Check(bUp && E[W + 7] == 0 && E[W + 8] < 40 && E[W + 11] > 100 && E[W + 11] < 160 && E[W + 14] == 255,
+                  "wet cover: grown and blurred, all but dry at the cover's edge and the full rain twice the radius out");
+            Check(WetCoverRadius(16.0f) == 2 && WetCoverRadius(32.0f) == 1 && WetCoverRadius(256.0f) == 1,
+                  "wet cover: the band's half in cells, at least one");
+            // A pier under its roof: the roof (100 high) over the cells 6..9 of a row, the pier (0) everywhere. The
+            // lower floors' share is none under the roof and the pier's own elsewhere; grown and blurred as the cover
+            // is, it eases out from the roof's edge, and the highest floor near each cell reaches as far as that
+            // easing does - so past it the pier takes its own share again, the two alike there.
+            float         Top[W * H], TopWork[W * H];
+            unsigned char L[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    const bool bRoof = x >= 6 && x <= 9;
+                    Top[y * W + x]   = bRoof ? 100.0f : 0.0f;
+                    L[y * W + x]     = (bRoof && 100.0f - 0.0f > WetUnderFloor) ? 0 : 255;
+                }
+            ErodeWetCover(L, W, H, 2, Work);
+            BlurWetCover(L, W, H, 2, Work);
+            GrowWetTop(Top, W, H, 2 * 2 + 1, TopWork);
+            bool bEase = true;
+            for (int x = 10; x < W; x++)
+                bEase = bEase && L[W + x] >= L[W + x - 1];
+            Check(bEase && L[W + 8] == 0 && L[W + 10] < 64 && L[W + 14] == 255 && L[W + 15] == 255,
+                  "wet cover: the pier dries towards its roof's edge, its own rain again twice the radius out");
+            Check(Top[W + 14] == 100.0f && Top[W + 15] == 0.0f && Top[W + 1] == 100.0f && Top[W + 0] == 0.0f,
+                  "wet cover: the highest floor near reaches as far as the easing, no further");
+        }
+        {
+            // The wet patches' noise: zero on its grid's points, smooth between them, the same from the same place,
+            // and as near the same far from the level's middle (whole-number hashing, not a sine of a large number).
+            bool bGrid = true, bSmooth = true;
+            for (int y = -40; y <= 40; y += 7)
+                for (int x = -40; x <= 40; x += 3)
+                {
+                    bGrid = bGrid && WetNoise((float)x, (float)y) == 0.0f;
+                    const float X = (float)x * 0.37f + 0.11f, Y = (float)y * 0.29f - 0.23f;
+                    const float D = WetNoise(X + 0.001f, Y) - WetNoise(X, Y);
+                    bSmooth = bSmooth && D < 0.01f && D > -0.01f;
+                }
+            Check(bGrid, "wet patches: the noise is zero on its grid's points");
+            Check(bSmooth, "wet patches: a thousandth of a cell along, the noise moves by less than a hundredth");
+            Check(WetPatch(1234.5f, -987.25f) == WetPatch(1234.5f, -987.25f) &&
+                      WetPatch(30000.0f, 30000.0f) != WetPatch(30080.0f, 30000.0f),
+                  "wet patches: the same from the same place, and different half a patch away at the level's edge");
+            // Over a large stretch of the level: about zero on the whole, within about a half either way; and the
+            // share of the floor the look makes into puddles (the water over the stones' tops), its wettest and driest
+            // patches - reported for the plan's record, held only to what makes a picture of patches at all.
+            double Sum = 0.0;
+            int    N = 0, Over = 0, Puddle = 0, Dry = 0;
+            for (int y = 0; y < 400; y++)
+                for (int x = 0; x < 400; x++)
+                {
+                    const float P = WetPatch(-8000.0f + 40.0f * (float)x, 5000.0f + 40.0f * (float)y);
+                    Sum += P;
+                    N++;
+                    Over   += (P > 1.0f || P < -1.0f) ? 1 : 0;
+                    Puddle += (WetFloodOf(P) > 1.0f) ? 1 : 0;
+                    Dry    += (WetLevelOf(P) < 0.5f) ? 1 : 0;
+                }
+            const double Mean = Sum / (double)N;
+            Check(Mean < 0.05 && Mean > -0.05 && Over == 0, "wet patches: about zero on the whole, never past one");
+            printf("  wet patches: %.1f%% of the floor puddles over the stones' tops, %.1f%% wet less than half\n",
+                   100.0 * Puddle / N, 100.0 * Dry / N);
+            Check(Puddle > N / 50 && Puddle < N / 2, "wet patches: puddles over the stones in some of the floor, not most");
+            // The water's edge, the stone's darkening and metal's.
+            CheckNear(WetPuddleOf(0.5f, 0.5f), 0.5f, 1e-6f, "wet floors: at the water's line half the pixel is under it");
+            Check(WetPuddleOf(0.5f, 0.5f + WetPuddleEdge) == 0.0f && WetPuddleOf(0.5f, 0.5f - WetPuddleEdge) == 1.0f,
+                  "wet floors: the edge's width over the water dry, as far under it all water");
+            CheckNear(WetDarkOf(true, 1.0f, 0.0f), WetStoneDarkest, 1e-6f, "wet floors: wet stone is darkest");
+            CheckNear(WetDarkOf(true, 0.2f, 1.0f), WetStoneDarkest, 1e-6f, "wet floors: stone under water is darkest");
+            Check(WetDarkOf(false, 1.0f, 1.0f) == 1.0f && WetDarkOf(true, 0.0f, 0.0f) == 1.0f,
+                  "wet floors: metal and dry stone keep their colour");
+            // The mark the late pass reads: the nearer floor's the larger, kept at its own depth and lost a few steps
+            // away, the share under water within a step of its 63, the kind; nothing in a mark of zero.
+            const float    Near = 1.0f / 300.0f, Far = 1.0f / 301.0f;
+            const unsigned A = WetMarkPack(Near, 0.4f, false), B = WetMarkPack(Far, 1.0f, true);
+            Check(A > B, "wet mark: the nearer floor's mark is the larger, whatever it holds");
+            Check(WetMarkHolds(A, Near) && !WetMarkHolds(A, Far) && !WetMarkHolds(0u, Near),
+                  "wet mark: it holds at its own depth, not at a third of a percent off, and zero holds nowhere");
+            CheckNear(WetMarkPuddle(A), 0.4f, 0.5f / 63.0f, "wet mark: the share under water within half a step");
+            Check(!WetMarkMetal(A) && WetMarkMetal(B) && WetMarkPuddle(B) == 1.0f,
+                  "wet mark: the kind, and all of the pixel under water");
+            Check(WetMarkPack(1.0f / 50000.0f, 0.0f, false) != 0u, "wet mark: the farthest floor still marks");
+            // The relief's normal beside it: back within a step of its 1022 each way, upright and level both; the
+            // nearer floor's word the larger; none from a flat floor, nor from another floor's word than the mark's.
+            const float Tilts[5][2] = { { 0.0f, 0.0f }, { 0.31f, -0.12f }, { -0.7f, 0.5f }, { 0.999f, 0.0f },
+                                        { -0.05f, -0.64f } };
+            float       Worst = 0.0f;
+            bool        bAll  = true;
+            for (int t = 0; t < 5; t++)
+            {
+                float X, Y, Z;
+                bAll = WetTiltNormal(WetTiltPack(Near, Tilts[t][0], Tilts[t][1], true), A, X, Y, Z) && bAll;
+                Worst = (fabsf(X - Tilts[t][0]) > Worst) ? fabsf(X - Tilts[t][0]) : Worst;
+                Worst = (fabsf(Y - Tilts[t][1]) > Worst) ? fabsf(Y - Tilts[t][1]) : Worst;
+                bAll  = fabsf(X * X + Y * Y + Z * Z - 1.0f) < 0.01f && Z >= 0.0f && bAll;
+            }
+            Check(bAll, "wet tilt: every normal read back, of unit length, upwards");
+            Check(Worst <= 1.0f / (float)WetTiltSteps + 1e-6f, "wet tilt: X and Y within half a step");
+            float X, Y, Z;
+            Check(WetTiltPack(Near, -1.0f, -1.0f, true) > WetTiltPack(Far / 2.0f, 1.0f, 1.0f, true),
+                  "wet tilt: the nearer floor's word is the larger, whatever it holds");
+            Check(!WetTiltNormal(WetTiltPack(Near, 0.2f, 0.2f, false), A, X, Y, Z) && Z == 1.0f,
+                  "wet tilt: a flat floor's word holds no normal, and the level's up stands in");
+            Check(!WetTiltNormal(WetTiltPack(Near / 4.0f, 0.2f, 0.2f, true), A, X, Y, Z),
+                  "wet tilt: a farther floor's word is not the mark's floor's");
+        }
+        {
+            // What a texel takes in from across a soft side (SoftLightAcross): with each polygon's light even, the light
+            // across itself; with the light running on unbroken across the side, the texel's own - nothing mirrored
+            // over; and mixed in by half at the side, the two sides' mean.
+            const float Even[4] = { 40.0f, 50.0f, 60.0f, 255.0f }, Other[4] = { 100.0f, 110.0f, 120.0f, 255.0f };
+            float       Out[4];
+            SoftLightAcross(Even, Even, Other, Out);
+            Check(Out[0] == 100.0f && Out[1] == 110.0f && Out[2] == 120.0f,
+                  "soft light: even light on both polygons - the light across, as before");
+            const float Here[4] = { 200.0f, 180.0f, 160.0f, 255.0f }, AtSide[4] = { 90.0f, 80.0f, 70.0f, 255.0f };
+            SoftLightAcross(Here, AtSide, AtSide, Out);
+            Check(Out[0] == 200.0f && Out[1] == 180.0f && Out[2] == 160.0f,
+                  "soft light: the light running on unbroken across the side - the texel keeps its own");
+            float Mixed[4];
+            const float Half = 0.5f;
+            SoftLightAcross(Even, Even, Other, Out);
+            SoftLightMix(Even, &Half, Out, 1, Mixed);
+            CheckNear(Mixed[0], 70.0f, 1e-4f, "soft light: at the side, by half - the two sides' mean");
+        }
+        {
+            // The geometry pass's vertex room (VertexRoomFor): kept while the frames ask for three quarters of it or
+            // less, else half as much again as asked in whole steps - never past the most, never less than held.
+            Check(VertexRoomFor(300000, VertexRoomFirst) == VertexRoomFirst,
+                  "vertex room: three quarters asked keeps the room as it is");
+            const int Grown = VertexRoomFor(300001, VertexRoomFirst);
+            Check(Grown >= 450001 && Grown % VertexRoomStep == 0 && Grown < 450001 + VertexRoomStep,
+                  "vertex room: past three quarters, half as much again as asked, in whole steps");
+            Check(VertexRoomFor(1900000, 1500000) == VertexRoomMost && VertexRoomFor(2500000, 400000) == VertexRoomMost,
+                  "vertex room: never past the most");
+            Check(VertexRoomFor(100, VertexRoomMost) == VertexRoomMost, "vertex room: never less than is held");
+            Check(VertexRoomFor(2500000, 400000) < 2500000,
+                  "vertex room: past the most, less than asked - the caller drops what does not fit");
+        }
+        {
+            // The grass's ground less a floor laid on it (GrassSubtract): the pieces' area is the ground's less the
+            // floor's part over it, no point of a piece lies under the floor, and the floor's way round does not matter.
+            static float Pieces[GrassPieceMost * 2 * GrassPieceCorners];
+            int          Counts[GrassPieceMost];
+            const float  Lawn[8] = { 0.0f, 0.0f, 10.0f, 0.0f, 10.0f, 10.0f, 0.0f, 10.0f };
+            auto Area = [&](int N)
+            {
+                float Sum = 0.0f;
+                for (int k = 0; k < N; k++)
+                    Sum += 0.5f * fabsf(GrassTwiceArea(Pieces + 2 * GrassPieceCorners * k, Counts[k]));
+                return Sum;
+            };
+            // Whether any of the pieces holds a point inside the box (X0..X1, Y0..Y1), the box's edges left out.
+            auto Under = [&](int N, float X0, float Y0, float X1, float Y1)
+            {
+                for (int k = 0; k < N; k++)
+                {
+                    const float* const P = Pieces + 2 * GrassPieceCorners * k;
+                    for (float y = Y0 + 0.05f; y < Y1; y += 0.1f)
+                        for (float x = X0 + 0.05f; x < X1; x += 0.1f)
+                        {
+                            bool bOut = false, bLeft = GrassTwiceArea(P, Counts[k]) > 0.0f;
+                            for (int e = 0; e < Counts[k] && !bOut; e++)
+                            {
+                                const int   f = (e + 1 < Counts[k]) ? e + 1 : 0;
+                                const float C = (P[2 * f] - P[2 * e]) * (y - P[2 * e + 1]) -
+                                                (P[2 * f + 1] - P[2 * e + 1]) * (x - P[2 * e]);
+                                bOut = bLeft ? (C < -1e-4f) : (C > 1e-4f);
+                            }
+                            if (!bOut)
+                                return true;
+                        }
+                }
+                return false;
+            };
+            const float Hole[8] = { 2.0f, 2.0f, 4.0f, 2.0f, 4.0f, 4.0f, 2.0f, 4.0f };
+            int N = GrassSubtract(Lawn, 4, Hole, 4, Pieces, Counts, GrassPieceMost);
+            Check(N >= 1 && N <= 4, "grass ground: a floor inside the lawn leaves at most four pieces");
+            CheckNear(Area(N), 96.0f, 1e-3f, "grass ground: the lawn less a floor in it keeps the rest of its area");
+            Check(!Under(N, 2.0f, 2.0f, 4.0f, 4.0f), "grass ground: no piece reaches under the floor");
+            const float Far[8] = { 20.0f, 20.0f, 30.0f, 20.0f, 30.0f, 30.0f, 20.0f, 30.0f };
+            N = GrassSubtract(Lawn, 4, Far, 4, Pieces, Counts, GrassPieceMost);
+            Check(N == 1 && fabsf(Area(N) - 100.0f) < 1e-3f, "grass ground: a floor elsewhere leaves the lawn whole");
+            const float All[8] = { -1.0f, -1.0f, 11.0f, -1.0f, 11.0f, 11.0f, -1.0f, 11.0f };
+            N = GrassSubtract(Lawn, 4, All, 4, Pieces, Counts, GrassPieceMost);
+            Check(N == 0, "grass ground: a floor over all of it leaves nothing");
+            // A path across the lawn, its corners the other way round.
+            const float Path[8] = { 4.0f, -5.0f, 4.0f, 15.0f, 6.0f, 15.0f, 6.0f, -5.0f };
+            N = GrassSubtract(Lawn, 4, Path, 4, Pieces, Counts, GrassPieceMost);
+            Check(N == 2, "grass ground: a path across the lawn leaves its two sides");
+            CheckNear(Area(N), 80.0f, 1e-3f, "grass ground: the two sides keep the lawn's area less the path's");
+            Check(!Under(N, 4.0f, 0.0f, 6.0f, 10.0f), "grass ground: no piece reaches under the path");
+        }
         Check(ReflectionsOfOldWater("Off") == Reflections_Default &&
               ReflectionsOfOldWater("Low") == Reflections_Default &&
               ReflectionsOfOldWater(" medium") == Reflections_High &&
-              ReflectionsOfOldWater("High") == Reflections_High && ReflectionsOfOldWater("RT") == Reflections_Rt &&
+              ReflectionsOfOldWater("High") == Reflections_High && ReflectionsOfOldWater("RT") == Reflections_RtHigh &&
               ReflectionsOfOldWater("") == Reflections_Default &&
               ReflectionsOfOldWater((const char*)0) == Reflections_Default,
               "reflections: a file without the key - Medium and High are the picture's, RT the rays', the rest none");
@@ -5119,16 +5532,41 @@ static void TestPom()
         Check(GrassStep(Grass_High, 1) == Grass_Off && GrassStep(Grass_Off, -1) == Grass_High &&
                   GrassStep(Grass_Medium, 1) == Grass_High,
               "grass: the menu steps round both ways, High the last");
-        Check(GrassReachOf(Grass_Low) == 1.0f && GrassBladesOf(Grass_Low) == GrassBladesPerRoot &&
-                  GrassReachOf(Grass_Medium) == 1.5f && GrassBladesOf(Grass_Medium) > GrassBladesOf(Grass_Low) &&
-                  GrassReachOf(Grass_High) == 2.0f && GrassBladesOf(Grass_High) > GrassBladesOf(Grass_Medium),
-              "grass: Low as it was made; Medium denser and half as far again; High denser still and twice as far");
-        Check(GrassClumpsOf(Grass_Medium) == 1 && GrassClumpsOf(Grass_High) == 2 &&
-                  GrassBladesOf(Grass_High) == GrassClumpsOf(Grass_High) * (GrassBladesPerRoot + 2),
-              "grass: High two clumps to a root's cell");
-        Check(GrassThinFarOf(Grass_High) > 1.0f && GrassThinFarOf(Grass_Medium) == 1.0f &&
-                  GrassThinFarOf(Grass_Low) == 1.0f,
-              "grass: High's further blades thinning out sooner - the others' as they were");
+        Check(GrassReachOf(Grass_Low) == 1.0f && GrassReachOf(Grass_Medium) == 1.5f && GrassReachOf(Grass_High) == 2.0f,
+              "grass: Low as far as the grass as it was made, Medium half as far again, High twice");
+        bool bSameGrass = GrassBladesOf(Grass_Off) == 0 && GrassThinFarOf(Grass_High) == 2.5f;
+        for (int L = Grass_Low; L < Grass_Count; L++)
+            bSameGrass = bSameGrass && GrassClumpsOf((EGrass)L) == 2 &&
+                         GrassBladesOf((EGrass)L) == GrassClumpsOf((EGrass)L) * (GrassBladesPerRoot + 2) &&
+                         GrassThinFarOf((EGrass)L) > 1.0f &&
+                         fabsf(GrassReachOf((EGrass)L) / GrassThinFarOf((EGrass)L) -
+                               GrassReachOf(Grass_High) / GrassThinFarOf(Grass_High)) < 1e-6f;
+        Check(bSameGrass, "grass: Low and Medium High's grass near the eye - two clumps to a root's cell, the further "
+                          "blades thinning out where High's do - only the grass as it was made reaching less far");
+        Check(ParseTrees("Off") == Trees_Off && ParseTrees(" low") == Trees_Low && ParseTrees("MEDIUM") == Trees_Medium &&
+                  ParseTrees("High") == Trees_High,
+              "trees: the levels read in any case");
+        Check(ParseTrees("True") < 0 && ParseTrees("Lush") < 0, "trees: any other word unknown");
+        {
+            bool bNames = true;
+            for (int L = 0; L < Trees_Count; L++)
+            {
+                char N[16];
+                TreesName(L, N, 16);
+                bNames = bNames && ParseTrees(N) == L;
+            }
+            Check(bNames, "trees: each level read back as it is written");
+        }
+        Check(TreeFullReachOf(Trees_High) == 10.0f && TreeLeastShareOf(Trees_High) == 0.12f &&
+                  TreeThinPixelsOf(Trees_High) == 0.0f,
+              "trees: High's far plants as they always were - every leaf within ten crowns' reach, 0.12 of them at the "
+              "least, the bark whole at every distance");
+        Check(TreeFullReachOf(Trees_Low) < TreeFullReachOf(Trees_Medium) &&
+                  TreeFullReachOf(Trees_Medium) < TreeFullReachOf(Trees_High) &&
+                  TreeLeastShareOf(Trees_Low) < TreeLeastShareOf(Trees_Medium) &&
+                  TreeLeastShareOf(Trees_Medium) < TreeLeastShareOf(Trees_High) &&
+                  TreeThinPixelsOf(Trees_Low) > TreeThinPixelsOf(Trees_Medium) && TreeThinPixelsOf(Trees_Medium) > 0.0f,
+              "trees: Low fewer leaves than Medium, from nearer on, and only the thicker wood from nearer");
         {
             // The trees' wind (TreeGen.h's SwayOf): a branch's first node sways as the node it grows from - its foot
             // keeps to it - in both ways of growing; and the sums go through halfs nearly whole.
@@ -6099,11 +6537,11 @@ static void TestGrass()
         Check(R.Aa == AaChoice_Auto && R.Upscale == Upscaling_NativeAA && R.ShadowQ == ShadowQuality_High && R.bShadows &&
               R.Hdr == Hdr_Ten && R.Ao == Ao_Ssao && R.Water == Water_High && R.Reflections == Reflections_High &&
               R.Geometry == Geometry_Pom && R.bSoft && R.bVolumetric && R.bDof && R.bEndless && R.bFire && R.bFogRooms &&
-              R.Flashlight == Flashlight_Fixed && R.ForceField == ForceField_Volume && R.Grass == Grass_High && R.Trees == Trees_Mixed &&
+              R.Flashlight == Flashlight_Fixed && R.ForceField == ForceField_Volume && R.Grass == Grass_High && R.Trees == Trees_High &&
               R.bWind && !R.bBlur && !R.bRays && !R.bAberr && !R.bVign && !R.bGrain && R.Bloom == Bloom_Off &&
               R.Flare == LensFlare_Off && !R.bFrameGen && !R.bVsync && R.FpsLimit == FpsLimit_Auto,
               "presets: Recommended, line by line");
-        Check(I.ShadowQ == ShadowQuality_Rt && I.Hdr == Hdr_On && I.Ao == Ao_Rt && I.Reflections == Reflections_RtHalf &&
+        Check(I.ShadowQ == ShadowQuality_Rt && I.Hdr == Hdr_On && I.Ao == Ao_Rt && I.Reflections == Reflections_RtMedium &&
               I.Geometry == Geometry_Tess && I.Grass == R.Grass && I.Trees == R.Trees && I.bWind == R.bWind &&
               I.bVolumetric == R.bVolumetric && I.Water == R.Water && I.Flashlight == Flashlight_Everybody,
               "presets: INeverAskedForThis - the rays, HDR and the displacement mapping, the rest Recommended's");
@@ -6254,6 +6692,1957 @@ static void TestGrass()
     Check(WindStrength(123.4f, 0x1234567u) != WindStrength(123.4f, 0x7654321u), "wind: each level its own");
 }
 
+// ---------------------------------------------------------------------------
+// The models rounded (MeshRound.h)
+// ---------------------------------------------------------------------------
+
+struct FTestMesh
+{
+    RdxSphere::TList<RdxMeshRound::FV> P;
+    RdxSphere::TList<int>              C;
+    int Add(float X, float Y, float Z)
+    {
+        P.Add(RdxMeshRound::V(X, Y, Z));
+        return P.Num - 1;
+    }
+    void Face(int A, int B, int D)
+    {
+        C.Add(A);
+        C.Add(B);
+        C.Add(D);
+    }
+    RdxMeshRound::FPose Pose() const
+    {
+        RdxMeshRound::FPose R;
+        R.Base   = (const char*)P.Data;
+        R.Stride = (int)sizeof(RdxMeshRound::FV);
+        return R;
+    }
+};
+
+// The most two faces of one smooth surface turn by at their edge, as the spherifier's angle has it by default.
+static const float TestTurn = 180.0f - (float)RdxMath::SpherifierAngleDefault;
+
+// A test mesh as a model and its shape, posed as it stands - with no cap on the move unless one is given.
+struct FTestShape
+{
+    RdxMeshRound::FModel M;
+    RdxMeshRound::FShape S;
+    bool Make(const FTestMesh& T, const unsigned char* Round = nullptr, float Turn = TestTurn, float Cap = 1e6f)
+    {
+        if (!M.Make(T.C.Data, T.C.Num / 3, T.P.Num) || !S.Make(M, Round, T.Pose(), Turn, Cap))
+            return false;
+        S.Pose(T.Pose(), 1);
+        return true;
+    }
+};
+
+// A point of face F's rounded surface at the shares B0, B1, B2 of its corners, with Shape of the curve.
+static RdxMeshRound::FV RoundedAt(RdxMeshRound::FShape& S, int F, float B0, float B1, float B2, float Shape)
+{
+    using namespace RdxMeshRound;
+    const int* const C  = S.M->Corner.Data;
+    const FV         P0 = S.P.At(C[F * 3]), P1 = S.P.At(C[F * 3 + 1]), P2 = S.P.At(C[F * 3 + 2]);
+    const FEdgeTerms E[3] = { S.EdgeTerms(F, 0), S.EdgeTerms(F, 1), S.EdgeTerms(F, 2) };
+    return P0 * B0 + P1 * B1 + P2 * B2 + PatchMoveAt(E, B0, B1, B2) * Shape;
+}
+
+// Every edge two faces share has the very same curve from both: the terms of one face's way along it are the other's
+// the other way round. Each worked out afresh, not the ones kept for the other face.
+static bool TermsAgree(RdxMeshRound::FShape& S)
+{
+    const int* const C = S.M->Corner.Data;
+    for (int F = 0; F < S.M->Faces; F++)
+        for (int e = 0; e < 3; e++)
+        {
+            const int A = S.Weld[C[F * 3 + e]], B = S.Weld[C[F * 3 + (e + 1) % 3]];
+            for (int G = F + 1; G < S.M->Faces; G++)
+                for (int k = 0; k < 3; k++)
+                {
+                    const int GA = S.Weld[C[G * 3 + k]], GB = S.Weld[C[G * 3 + (k + 1) % 3]];
+                    if (!(GA == B && GB == A))
+                        continue;
+                    S.Pose(S.P, S.Stamp + 1);
+                    const RdxMeshRound::FEdgeTerms X = S.EdgeTerms(F, e);
+                    S.Pose(S.P, S.Stamp + 1);
+                    const RdxMeshRound::FEdgeTerms Y = S.EdgeTerms(G, k);
+                    for (int q = 0; q < RdxMeshRound::EDGE_SLOTS; q++)
+                    {
+                        const int o = (q + 2) % RdxMeshRound::EDGE_SLOTS;
+                        if (memcmp(&X.T[q], &Y.T[o], sizeof(X.T[q])) != 0 || X.Room[q] != Y.Room[o])
+                            return false;
+                    }
+                }
+        }
+    return true;
+}
+
+// The most any edge's curve stands off its straight edge, as a share of the edge's length (Long: in units instead).
+static float MostBend(RdxMeshRound::FShape& S, bool Long = false)
+{
+    const int* const C    = S.M->Corner.Data;
+    float            Most = 0.0f;
+    for (int F = 0; F < S.M->Faces; F++)
+        for (int e = 0; e < 3; e++)
+        {
+            const RdxMeshRound::FEdgeTerms E = S.EdgeTerms(F, e);
+            const float L = RdxMeshRound::Length(S.P.At(C[F * 3 + (e + 1) % 3]) - S.P.At(C[F * 3 + e]));
+            for (int t = 1; t < 32; t++)
+            {
+                const float D = RdxMeshRound::Length(RdxMeshRound::EdgeCurveAt(E, (float)t / 32.0f));
+                Most          = fmaxf(Most, Long ? D : D / fmaxf(L, 1e-6f));
+            }
+        }
+    return Most;
+}
+
+// A prism of N sides round the upright, R from its axis: its side in rings at the heights Z[0 .. Rings), each ring of N
+// quads to the next, and a lid of a fan at each end (Bottom, Top: 0 none). The vertex of side i at ring j is j * N + i.
+static void TestPrism(FTestMesh& M, int N, float R, const float* Z, int Rings, bool Bottom, bool Top,
+                      const float* Radius = nullptr)
+{
+    for (int j = 0; j < Rings; j++)
+        for (int i = 0; i < N; i++)
+        {
+            const float A  = 2.0f * 3.14159265f * (float)i / (float)N;
+            const float Rr = Radius ? Radius[j] : R;
+            M.Add(Rr * cosf(A), Rr * sinf(A), Z[j]);
+        }
+    for (int j = 0; j + 1 < Rings; j++)
+        for (int i = 0; i < N; i++)
+        {
+            const int B0 = j * N + i, B1 = j * N + (i + 1) % N;
+            M.Face(B0, B1, B1 + N);
+            M.Face(B0, B1 + N, B0 + N);
+        }
+    if (Bottom)
+    {
+        const int Low = M.Add(0.0f, 0.0f, Z[0]);
+        for (int i = 0; i < N; i++)
+            M.Face(Low, (i + 1) % N, i);
+    }
+    if (Top)
+    {
+        const int High = M.Add(0.0f, 0.0f, Z[Rings - 1]);
+        for (int i = 0; i < N; i++)
+            M.Face(High, (Rings - 1) * N + i, (Rings - 1) * N + (i + 1) % N);
+    }
+}
+
+static void TestMeshRound()
+{
+    using namespace RdxMeshRound;
+    printf("models rounded\n");
+    const float Shape = 1.0f;
+    CheckNear(AngleOf(1.0f, 1.0f), 0.785398f, 1e-4f, "models rounded: an angle of 45 degrees");
+    CheckNear(AngleOf(0.5f, -0.866025f), 2.617994f, 1e-4f, "models rounded: an angle of 150 degrees");
+    CheckNear(AngleOf(0.0f, -2.0f), 3.141593f, 1e-4f, "models rounded: a straight angle");
+    // The setting's angle: held to its range, on its five-degree steps; the distance held to its range.
+    Check(RdxMath::SpherifierAngleOf(105) == 105 && RdxMath::SpherifierAngleOf(107) == 105 &&
+              RdxMath::SpherifierAngleOf(108) == 110 && RdxMath::SpherifierAngleOf(10) == 90 &&
+              RdxMath::SpherifierAngleOf(400) == 175,
+          "models rounded: the angle setting is held to 90..175 in steps of five");
+    Check(RdxMath::SpherifierDistanceOf(8) == 8 && RdxMath::SpherifierDistanceOf(0) == 1 &&
+              RdxMath::SpherifierDistanceOf(-3) == 1 && RdxMath::SpherifierDistanceOf(40) == 16,
+          "models rounded: the distance setting is held to 1..16");
+    // The presets switch it, nothing more: off in Vanilla, on in the other two.
+    Check(RdxMath::PresetPicture(RdxMath::Preset_Recommended).bSpherifier &&
+              RdxMath::PresetPicture(RdxMath::Preset_INeverAskedForThis).bSpherifier &&
+              !RdxMath::PresetPicture(RdxMath::Preset_Vanilla).bSpherifier,
+          "models rounded: the spherifier is on in Recommended and INeverAskedForThis, off in Vanilla");
+    // A flat polygon of several faces moved along its plane as one (PolyPlaneMoveAt): on its outline as the outline's own
+    // curve there, along the plane alone; nothing at a corner; and smoothly on from the outline inside.
+    {
+        const FV Ends[8] = { V(0.0f, 0.0f, 0.0f),   V(10.0f, 0.0f, 0.0f), V(10.0f, 0.0f, 0.0f), V(10.0f, 10.0f, 0.0f),
+                             V(10.0f, 10.0f, 0.0f), V(0.0f, 10.0f, 0.0f), V(0.0f, 10.0f, 0.0f), V(0.0f, 0.0f, 0.0f) };
+        FEdgeTerms Terms[4];
+        for (int g = 0; g < 4; g++)
+        {
+            // Each bend out of the square along its plane, and up off it.
+            const FV Way = Ends[g * 2 + 1] - Ends[g * 2], Out = V(Way.Y, -Way.X, 0.0f) * 0.1f;
+            for (int k = 0; k < EDGE_SLOTS; k++)
+            {
+                Terms[g].T[k]    = (k == 0 || k == 2) ? Out + V(0.0f, 0.0f, 0.5f) : V(0.0f, 0.0f, 0.0f);
+                Terms[g].Room[k] = 0.5f;
+            }
+        }
+        const FV Up    = V(0.0f, 0.0f, 1.0f);
+        FV       Curve = EdgeCurveAt(Terms[0], 0.3f);
+        Curve          = Curve - Up * Dot(Curve, Up);
+        Check(Length(PolyPlaneMoveAt(Terms, Ends, 4, Up, V(3.0f, 0.0f, 0.0f)) - Curve) < 1e-5f,
+              "models rounded: a flat polygon's one move is its outline's own on the outline, along its plane");
+        Check(Length(PolyPlaneMoveAt(Terms, Ends, 4, Up, V(10.0f, 10.0f, 0.0f))) < 1e-6f,
+              "models rounded: ... nothing at a corner");
+        Check(Length(PolyPlaneMoveAt(Terms, Ends, 4, Up, V(3.0f, 0.01f, 0.0f)) - Curve) < 0.01f * Length(Curve) + 1e-4f,
+              "models rounded: ... and goes on smoothly from the outline inside");
+        const FV Middle = PolyPlaneMoveAt(Terms, Ends, 4, Up, V(5.0f, 5.0f, 0.0f));
+        Check(fabsf(Dot(Middle, Up)) < 1e-6f && Length(Middle) < 0.5f * Length(Curve),
+              "models rounded: ... along its plane only, and its sides' opposite bows meet in its middle");
+    }
+    // A box: every edge a crease along a straight line, the faces' own diagonals flat - nothing bows.
+    {
+        FTestMesh M;
+        for (int i = 0; i < 8; i++)
+            M.Add((i & 1) ? 10.0f : -10.0f, (i & 2) ? 10.0f : -10.0f, (i & 4) ? 10.0f : -10.0f);
+        const int Q[6][4] = { { 0, 2, 3, 1 }, { 4, 5, 7, 6 }, { 0, 1, 5, 4 }, { 2, 6, 7, 3 }, { 0, 4, 6, 2 }, { 1, 3, 7, 5 } };
+        for (int q = 0; q < 6; q++)
+        {
+            M.Face(Q[q][0], Q[q][1], Q[q][2]);
+            M.Face(Q[q][0], Q[q][2], Q[q][3]);
+        }
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a box makes a shape");
+        Check(T.S.Fans == 24, "models rounded: a box's corners fall into a fan for each face at each corner");
+        Check(MostBend(T.S) < 1e-5f, "models rounded: nothing of a box bows");
+        Check(T.M.FindFace(Q[2][2], Q[2][0], Q[2][1]) == 4 && T.M.FindFace(0, 7, 3) < 0,
+              "models rounded: a face is found by its three vertices in any order, and no other");
+        // Known by how far apart its vertices are numbered: face 4 is 0, 1, 5 - one and five after the first.
+        const int* First = nullptr;
+        const int  Count = T.M.Signature(1, 5, &First);
+        bool       Has   = false;
+        for (int i = 0; i < Count; i++)
+            Has = Has || First[i] == 4;
+        Check(Count >= 1 && Has, "models rounded: a face is found by how far apart its vertices are numbered");
+        Check(T.M.Signature(3, 2, &First) == 0, "models rounded: ... and no face by numbers that cannot be");
+        const FV N = T.M.PlainNormal(M.Pose(), 7);
+        CheckNear(N.X, 0.57735f, 1e-4f, "models rounded: a box corner's plain normal leans out between its faces");
+        int Inner = 0;
+        for (int E = 0; E < T.S.Edges; E++)
+            Inner += (T.S.EdgeKind[E] == FShape::Edge_Inner) ? 1 : 0;
+        Check(Inner == 6, "models rounded: a box's faces' own diagonals are inner edges, its edges creases");
+    }
+    // A square pot, wider at the top, with a floor: a box's turns, sloping - nothing bows either.
+    {
+        FTestMesh M;
+        for (int i = 0; i < 4; i++)
+        {
+            const float X = (i & 1) ? 1.0f : -1.0f, Y = (i & 2) ? 1.0f : -1.0f;
+            M.Add(X * 8.0f, Y * 8.0f, 0.0f);
+            M.Add(X * 12.0f, Y * 12.0f, 20.0f);
+        }
+        // Bottom corners 0, 2, 4, 6 at (-,-) (+,-) (-,+) (+,+), each with its top corner after it.
+        const int Ring[4] = { 0, 2, 6, 4 };
+        for (int k = 0; k < 4; k++)
+        {
+            const int B0 = Ring[k], B1 = Ring[(k + 1) % 4];
+            M.Face(B0, B1, B1 + 1);
+            M.Face(B0, B1 + 1, B0 + 1);
+        }
+        M.Face(0, 6, 2);
+        M.Face(0, 4, 6);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a square pot makes a shape");
+        Check(MostBend(T.S) < 1e-5f, "models rounded: a square pot keeps its flat sides");
+    }
+    // A can of twelve sides with its lids: the side round, the rims round in the lids' planes, the lids flat, the side
+    // straight from rim to rim.
+    {
+        FTestMesh   M;
+        const int   N = 12;
+        const float R = 10.0f, H = 30.0f;
+        const float Z[2] = { 0.0f, H };
+        TestPrism(M, N, R, Z, 2, true, true);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a can makes a shape");
+        FShape& S = T.S;
+        Check(TermsAgree(S), "models rounded: both faces of each of a can's edges bend it alike");
+        // Faces: 2 N side, then N bottom, then N top (corners: middle, ring i, ring i + 1).
+        float RimWorst = 0.0f, RimLift = 0.0f, Upright = 0.0f, Lid = 0.0f, SideWorst = 0.0f, FlatWorst = 0.0f;
+        for (int i = 0; i < N; i++)
+        {
+            const int Side = i * 2, Cap = 3 * N + i;
+            // The top rim: the lid's edge from corner 1 to 2.
+            const FV    Mid = RoundedAt(S, Cap, 0.0f, 0.5f, 0.5f, Shape);
+            const float Rr  = sqrtf(Mid.X * Mid.X + Mid.Y * Mid.Y);
+            RimWorst        = fmaxf(RimWorst, fabsf(Rr - R) / R);
+            RimLift         = fmaxf(RimLift, fabsf(Mid.Z - H));
+            // The side's upright edge: the first side face's from corner 1 (B1) to 2 (B1 + N).
+            const FEdgeTerms U  = S.EdgeTerms(Side, 1);
+            const FEdgeTerms Sp = S.EdgeTerms(Cap, 0);
+            for (int k = 0; k < EDGE_SLOTS; k++)
+            {
+                Upright = fmaxf(Upright, Length(U.T[k]));
+                // The lid's spokes bend in the lid's plane alone, as its rim does.
+                Lid = fmaxf(Lid, fabsf(Sp.T[k].Z));
+            }
+            Lid                 = fmaxf(Lid, fabsf(RoundedAt(S, Cap, 0.4f, 0.3f, 0.3f, Shape).Z - H));
+            // The side at half height, across a face: on the circle within a little.
+            for (int t = 1; t < 8; t++)
+            {
+                const float s = (float)t / 8.0f;
+                const FV    P = RoundedAt(S, Side, 0.5f - 0.5f * s, 0.5f * s, 0.5f, Shape);
+                const FV    F = RoundedAt(S, Side, 0.5f - 0.5f * s, 0.5f * s, 0.5f, 0.0f);
+                SideWorst     = fmaxf(SideWorst, fabsf(sqrtf(P.X * P.X + P.Y * P.Y) - R) / R);
+                FlatWorst     = fmaxf(FlatWorst, fabsf(sqrtf(F.X * F.X + F.Y * F.Y) - R) / R);
+            }
+        }
+        Check(RimWorst < 0.004f, "models rounded: a can's rim bows onto its circle");
+        Check(RimLift < 1e-3f, "models rounded: a can's rim bows in the lid's plane");
+        Check(Upright < 1e-3f, "models rounded: a can's side stays straight from rim to rim");
+        Check(Lid < 1e-3f, "models rounded: a can's lid stays flat");
+        Check(SideWorst < 0.006f && FlatWorst > 0.03f, "models rounded: a can's side comes out round");
+    }
+    // A bottle: twelve sides, a long side between a short bevel at its foot and a short shoulder up to a flat top. The
+    // side stays straight from bevel to shoulder - no barrel - and round across; the shoulder rounds out.
+    {
+        FTestMesh   M;
+        const int   N = 12;
+        const float R = 10.0f;
+        const float Z[4]      = { 0.0f, 2.0f, 40.0f, 43.0f };
+        const float Radius[4] = { 8.5f, 10.0f, 10.0f, 7.0f };
+        TestPrism(M, N, R, Z, 4, true, true, Radius);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a bottle makes a shape");
+        FShape& S = T.S;
+        Check(TermsAgree(S), "models rounded: both faces of each of a bottle's edges bend it alike");
+        // The side's faces are the second ring of quads: faces 2 N .. 4 N, a quad's first triangle B0, B1, B1 + N.
+        float Barrel = 0.0f, Round = 0.0f, Flat = 0.0f;
+        for (int i = 0; i < N; i++)
+        {
+            const int F = 2 * N + i * 2;
+            // Up the side's upright edge, from a fifth to four fifths of its height: on the side's straight line.
+            const FV A = S.P.At(N + (i + 1) % N), B = S.P.At(2 * N + (i + 1) % N);
+            for (int t = 1; t < 5; t++)
+            {
+                const float u = 0.2f + 0.15f * (float)t;
+                const FV    P = RoundedAt(S, F, 0.0f, 1.0f - u, u, Shape);
+                const FV    L = A * (1.0f - u) + B * u;
+                Barrel        = fmaxf(Barrel, Length(P - L));
+            }
+            // Across the face's middle, below half height: round.
+            const FV P  = RoundedAt(S, F, 0.5f, 0.1f, 0.4f, Shape);
+            const FV Fl = RoundedAt(S, F, 0.5f, 0.1f, 0.4f, 0.0f);
+            Round       = fmaxf(Round, fabsf(sqrtf(P.X * P.X + P.Y * P.Y) - R) / R);
+            Flat        = fmaxf(Flat, fabsf(sqrtf(Fl.X * Fl.X + Fl.Y * Fl.Y) - R) / R);
+        }
+        Check(Barrel < 0.02f, "models rounded: a bottle's long side stays straight between its short bevel and shoulder");
+        Check(Round < 0.01f && Flat > 0.03f, "models rounded: ... and round across");
+        // The shoulder's quads (third ring, faces 4 N .. 6 N): the middle of a shoulder's upright edge stands out of
+        // the straight edge, rounding it.
+        const FV A = S.P.At(2 * N + 1), B = S.P.At(3 * N + 1);
+        const FV P = RoundedAt(S, 4 * N, 0.0f, 0.5f, 0.5f, Shape);
+        Check(Length(P - (A + B) * 0.5f) > 0.05f, "models rounded: ... while its shoulder rounds");
+    }
+    // A ball of 16 x 8: smooth all over, every point nearer its sphere than the flat faces were.
+    {
+        FTestMesh   M;
+        const int   Around = 16, Up = 8;
+        const float R = 20.0f;
+        const int   South = M.Add(0.0f, 0.0f, -R);
+        for (int j = 1; j < Up; j++)
+            for (int i = 0; i < Around; i++)
+            {
+                const float Th = 3.14159265f * (float)j / (float)Up - 1.5707963f;
+                const float Ph = 2.0f * 3.14159265f * (float)i / (float)Around;
+                M.Add(R * cosf(Th) * cosf(Ph), R * cosf(Th) * sinf(Ph), R * sinf(Th));
+            }
+        const int North = M.Add(0.0f, 0.0f, R);
+        auto      At    = [&](int j, int i) { return 1 + (j - 1) * Around + (i % Around); };
+        for (int i = 0; i < Around; i++)
+        {
+            M.Face(South, At(1, i + 1), At(1, i));
+            M.Face(North, At(Up - 1, i), At(Up - 1, i + 1));
+            for (int j = 1; j < Up - 1; j++)
+            {
+                M.Face(At(j, i), At(j, i + 1), At(j + 1, i + 1));
+                M.Face(At(j, i), At(j + 1, i + 1), At(j + 1, i));
+            }
+        }
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a ball makes a shape");
+        FShape& S = T.S;
+        Check(S.Fans == M.P.Num, "models rounded: a ball has one fan at each vertex");
+        Check(TermsAgree(S), "models rounded: both faces of each of a ball's edges bend it alike");
+        float       Worst = 0.0f, FlatWorst = 0.0f;
+        const float Bs[6][3] = { { 0.5f, 0.5f, 0.0f }, { 0.0f, 0.5f, 0.5f }, { 0.5f, 0.0f, 0.5f },
+                                 { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f }, { 0.6f, 0.2f, 0.2f }, { 0.2f, 0.6f, 0.2f } };
+        for (int F = 0; F < T.M.Faces; F++)
+            for (int b = 0; b < 6; b++)
+            {
+                Worst     = fmaxf(Worst, fabsf(Length(RoundedAt(S, F, Bs[b][0], Bs[b][1], Bs[b][2], Shape)) - R) / R);
+                FlatWorst = fmaxf(FlatWorst, fabsf(Length(RoundedAt(S, F, Bs[b][0], Bs[b][1], Bs[b][2], 0.0f)) - R) / R);
+            }
+        Check(Worst < 0.01f && FlatWorst > 0.03f, "models rounded: a ball comes out round");
+        // Its plain normals lean as a ball's do: out from its middle.
+        float Lean = 1.0f;
+        for (int v = 0; v < M.P.Num; v++)
+        {
+            const FV N = T.M.PlainNormal(M.Pose(), v), P = M.P[v];
+            Lean       = fminf(Lean, Dot(N, P * (1.0f / R)));
+        }
+        Check(Lean > 0.98f, "models rounded: a ball's plain normals point out from its middle");
+        // Moved and turned as a whole, it bends the same, turned with it - read a stride apart, as the engine's samples.
+        struct FSample
+        {
+            FV    At;
+            float Rest[19];
+        };
+        RdxSphere::TList<FSample> Turned;
+        Turned.Resize(M.P.Num);
+        const float Ca = cosf(0.7f), Sa = sinf(0.7f);
+        for (int v = 0; v < M.P.Num; v++)
+        {
+            const FV& P  = M.P[v];
+            Turned[v].At = V(Ca * P.X - Sa * P.Z + 100.0f, P.Y - 50.0f, Sa * P.X + Ca * P.Z + 300.0f);
+        }
+        const FEdgeTerms Before = S.EdgeTerms(5, 1);
+        FPose            Moved;
+        Moved.Base   = (const char*)Turned.Data;
+        Moved.Stride = (int)sizeof(FSample);
+        S.Pose(Moved, 2);
+        const FEdgeTerms After = S.EdgeTerms(5, 1);
+        CheckNear(Length(After.T[0]), Length(Before.T[0]), 1e-3f, "models rounded: a ball moved and turned bends as much");
+        CheckNear(After.T[0].Y, Before.T[0].Y, 1e-3f, "models rounded: ... turned with it");
+        CheckNear(After.T[0].X, Ca * Before.T[0].X - Sa * Before.T[0].Z, 1e-3f, "models rounded: ... the same way");
+        // Bent once at rest: the moved, turned and twice as large ball fits it, and takes its terms turned and doubled.
+        S.Pose(M.Pose(), 3);
+        S.MakeRest();
+        Check(S.bRest, "models rounded: a ball's rest is made");
+        for (int v = 0; v < M.P.Num; v++)
+        {
+            const FV& P  = M.P[v];
+            Turned[v].At = V(2.0f * (Ca * P.X - Sa * P.Z) + 100.0f, 2.0f * P.Y - 50.0f, 2.0f * (Sa * P.X + Ca * P.Z) + 300.0f);
+        }
+        S.Pose(Moved, 4);
+        const FEdgeTerms Fresh = S.EdgeTerms(5, 1);
+        S.Pose(Moved, 5);
+        Check(S.Fit(), "models rounded: a ball moved, turned and scaled fits its rest");
+        const FEdgeTerms Kept = S.EdgeTerms(5, 1);
+        float            Off  = 0.0f;
+        for (int k = 0; k < EDGE_SLOTS; k++)
+            Off += Length(Kept.T[k] - Fresh.T[k]);
+        CheckNear(Off, 0.0f, 2e-3f * Length(Fresh.T[0]), "models rounded: ... and bends as worked out afresh");
+        // A part of it moved in itself - one vertex, a hair more than the fit allows - and it does not fit.
+        Turned[At(4, 3)].At = Turned[At(4, 3)].At + V(0.0f, 0.0f, 0.1f);
+        S.Pose(Moved, 6);
+        Check(!S.Fit(), "models rounded: a ball with one vertex out of its rest does not fit it");
+    }
+    // A face that is not drawn keeps the edges it shares: neither side bows them; and an open edge at a sharp corner of
+    // its outline stays straight.
+    {
+        FTestMesh M;
+        M.Add(0.0f, 0.0f, 0.0f);
+        M.Add(10.0f, 0.0f, 0.0f);
+        M.Add(0.0f, 10.0f, 1.0f);
+        M.Add(10.0f, 10.0f, 3.0f);
+        M.Face(0, 1, 2);
+        M.Face(1, 3, 2);
+        const unsigned char Round[2] = { 1, 0 };
+        FTestShape T;
+        Check(T.Make(M, Round), "models rounded: a bent sheet makes a shape");
+        Check(MostBend(T.S) < 1e-6f, "models rounded: an edge beside a face not drawn, and an open one at sharp "
+                                     "corners, stay straight");
+    }
+    // A hexagonal opening in a flat ring: free, its outline turning softly (60 degrees) at every corner - it rounds into
+    // a circle in the ring's plane; the ring's outer outline, a hexagon as well, too.
+    {
+        FTestMesh M;
+        for (int i = 0; i < 6; i++)
+        {
+            const float A = 2.0f * 3.14159265f * (float)i / 6.0f;
+            M.Add(4.0f * cosf(A), 4.0f * sinf(A), 0.0f);
+            M.Add(10.0f * cosf(A), 10.0f * sinf(A), 0.0f);
+        }
+        for (int i = 0; i < 6; i++)
+        {
+            const int I0 = 2 * i, I1 = 2 * ((i + 1) % 6);
+            M.Face(I0, I0 + 1, I1 + 1);
+            M.Face(I0, I1 + 1, I1);
+        }
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a ring makes a shape");
+        // The inner outline's edge (I0 to I1) is the second quad triangle's edge from corner 2 to 0, I1 to I0.
+        float Worst = 0.0f, Lift = 0.0f;
+        for (int i = 0; i < 6; i++)
+        {
+            const FV P = RoundedAt(T.S, 2 * i + 1, 0.5f, 0.0f, 0.5f, Shape);
+            Worst      = fmaxf(Worst, fabsf(sqrtf(P.X * P.X + P.Y * P.Y) - 4.0f) / 4.0f);
+            Lift       = fmaxf(Lift, fabsf(P.Z));
+        }
+        Check(Worst < 0.04f && Lift < 1e-4f, "models rounded: a free hexagonal opening rounds into a circle in its plane");
+        Check(TermsAgree(T.S), "models rounded: ... both faces of each inner edge bending it alike");
+    }
+    // A knob laid on a plate: an eight-sided cylinder standing on a square plate, its foot an open outline lying on the
+    // plate - the foot rounds in the plate's plane and stays on it, the knob's side rounds; the plate's own square
+    // outline, turning sharply, stays.
+    {
+        FTestMesh   M;
+        const float Plate[4][2] = { { -10.0f, -10.0f }, { 10.0f, -10.0f }, { 10.0f, 10.0f }, { -10.0f, 10.0f } };
+        for (int k = 0; k < 4; k++)
+            M.Add(Plate[k][0], Plate[k][1], 0.0f);
+        M.Face(0, 1, 2);
+        M.Face(0, 2, 3);
+        const float Z[2] = { 0.0f, 3.0f };
+        FTestMesh   K;
+        TestPrism(K, 8, 3.0f, Z, 2, false, true);
+        const int Base = M.P.Num;
+        for (int v = 0; v < K.P.Num; v++)
+            M.Add(K.P[v].X, K.P[v].Y, K.P[v].Z);
+        for (int c = 0; c < K.C.Num; c += 3)
+            M.Face(Base + K.C[c], Base + K.C[c + 1], Base + K.C[c + 2]);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a knob on a plate makes a shape");
+        // The foot: the knob's first ring of side faces, edge from corner 0 to 1 (B0 to B1, at the plate).
+        float Foot = 0.0f, Side = 0.0f;
+        for (int i = 0; i < 8; i++)
+        {
+            const FEdgeTerms E = T.S.EdgeTerms(2 + i * 2, 0);
+            for (int k = 0; k < EDGE_SLOTS; k++)
+                Foot = fmaxf(Foot, fabsf(E.T[k].Z));
+            Foot = fmaxf(Foot, fabsf(RoundedAt(T.S, 2 + i * 2, 0.5f, 0.5f, 0.0f, Shape).Z));
+            const FV P         = RoundedAt(T.S, 2 + i * 2, 0.5f, 0.05f, 0.45f, Shape);
+            const FV F         = RoundedAt(T.S, 2 + i * 2, 0.5f, 0.05f, 0.45f, 0.0f);
+            Side               = fmaxf(Side, Length(P - F));
+        }
+        Check(Foot < 1e-5f, "models rounded: a knob's foot laid on a plate rounds on the plate's plane");
+        Check(Side > 0.01f, "models rounded: ... while its side rounds");
+        Check(MostBend(T.S) < 1.0f && Length(T.S.EdgeTerms(0, 0).T[0]) < 1e-6f,
+              "models rounded: ... and the plate's sharp square outline stays");
+    }
+    // A sharp cone of eight sides: its tip's fan looks along the cone, nearly down its edges - no edge bends by more than
+    // an end bending by half a soft turn gives, however the fans fall.
+    {
+        FTestMesh M;
+        const int Tip = M.Add(0.0f, 0.0f, 30.0f);
+        for (int i = 0; i < 8; i++)
+        {
+            const float A = 2.0f * 3.14159265f * (float)i / 8.0f;
+            M.Add(5.0f * cosf(A), 5.0f * sinf(A), 0.0f);
+        }
+        for (int i = 0; i < 8; i++)
+            M.Face(Tip, 1 + i, 1 + (i + 1) % 8);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a sharp cone makes a shape");
+        Check(MostBend(T.S) <= 2.0f * BendTop * EndSinOf(TestTurn) + 1e-4f,
+              "models rounded: no edge of a sharp cone bends like a spike");
+    }
+    // A long wall round a soft corner (a polygon of two long sides, 30 degrees apart, standing 20 high): with a cap of 8
+    // the bend is done near the corner - no point of it moves more than about 8, and half way along the walls are where
+    // they were.
+    {
+        FTestMesh   M;
+        const float L = 1000.0f, Ca = cosf(0.2618f), Sa = sinf(0.2618f);
+        const int   A0 = M.Add(-L, 0.0f, 0.0f), A1 = M.Add(-L, 0.0f, 20.0f);
+        const int   B0 = M.Add(0.0f, 0.0f, 0.0f), B1 = M.Add(0.0f, 0.0f, 20.0f);
+        const int   C0 = M.Add(L * Ca, L * Sa, 0.0f), C1 = M.Add(L * Ca, L * Sa, 20.0f);
+        M.Face(A0, B0, B1);
+        M.Face(A0, B1, A1);
+        M.Face(B0, C0, C1);
+        M.Face(B0, C1, B1);
+        FTestShape T;
+        Check(T.Make(M, nullptr, TestTurn, 8.0f), "models rounded: a long wall round a soft corner makes a shape");
+        const float Most = MostBend(T.S, true);
+        const FV    Half = RoundedAt(T.S, 0, 0.5f, 0.5f, 0.0f, Shape);
+        Check(Most < 8.5f && Most > 1.0f, "models rounded: a long wall's bend at a soft corner moves it by about the cap");
+        Check(fabsf(Half.Y) < 0.01f, "models rounded: ... and half way along the wall stands where it was");
+    }
+    // Two vertices at one place are one: the fans and the bends go across them - and so are two a hair apart.
+    {
+        FTestMesh M;
+        M.Add(0.0f, 0.0f, 0.0f);
+        M.Add(10.0f, 0.0f, 2.0f);
+        M.Add(0.0f, 10.0f, 2.0f);
+        M.Add(10.0f, 0.0f, 2.0f);           // 3 at 1's place
+        M.Add(0.0f, 10.0f, 2.0f + 1e-5f);   // 4 a hair from 2's place
+        M.Add(10.0f, 10.0f, 6.0f);
+        M.Face(0, 1, 2);
+        M.Face(3, 5, 4);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a sheet split at a seam makes a shape");
+        Check(T.S.Weld[3] == 1 && T.S.Weld[4] == 2 && T.S.EdgeKind[T.S.EdgeOf[1]] == FShape::Edge_Soft,
+              "models rounded: the seam's vertices are welded, its faces across each other");
+        Check(TermsAgree(T.S), "models rounded: the seam bends alike from both sides");
+    }
+    // A hexagonal prism - the cooler's recess, a six-sided pillar: its faces meet at 120 degrees, a turn of 60. Rounded at
+    // the default angle, the side comes out round and the rims round in the lids' planes; at an angle sharper than 120 is
+    // wide (130: a turn of at most 50), it stays a hexagon.
+    {
+        FTestMesh   M;
+        const float R = 10.0f, H = 6.0f;
+        const float Z[2] = { 0.0f, H };
+        TestPrism(M, 6, R, Z, 2, true, true);
+        FTestShape T;
+        Check(T.Make(M), "models rounded: a hexagonal prism makes a shape");
+        Check(TermsAgree(T.S), "models rounded: both faces of each of a hexagon's edges bend it alike");
+        // The side's middle across a face, against the circle through its corners: the flat face stands 13 per cent
+        // inside it; rounded, the middle comes out to within a few per cent of it.
+        const FV    Mid  = RoundedAt(T.S, 0, 0.5f, 0.25f, 0.25f, Shape);
+        const FV    Flat = RoundedAt(T.S, 0, 0.5f, 0.25f, 0.25f, 0.0f);
+        const float Out = sqrtf(Mid.X * Mid.X + Mid.Y * Mid.Y) / R, In = sqrtf(Flat.X * Flat.X + Flat.Y * Flat.Y) / R;
+        Check(In < 0.88f && Out > 0.95f && Out < 1.01f, "models rounded: a hexagon's side comes out round");
+        // The top lid's triangle (middle, ring i, ring i + 1) is face 18 on: its edge from corner 1 to 2 is the rim.
+        const FV Rim = RoundedAt(T.S, 18, 0.0f, 0.5f, 0.5f, Shape);
+        Check(fabsf(Rim.Z - H) < 1e-3f && sqrtf(Rim.X * Rim.X + Rim.Y * Rim.Y) / R > 0.95f,
+              "models rounded: a hexagon's rim bows round in its lid's plane");
+        FTestShape Sharp;
+        Check(Sharp.Make(M, nullptr, 50.0f), "models rounded: a hexagonal prism makes a shape at a sharper angle");
+        Check(MostBend(Sharp.S) < 1e-5f, "models rounded: a hexagon stays one where the angle is set sharper than 120");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The level rounded (LevelRound.h)
+// ---------------------------------------------------------------------------
+
+// A level made of polygons for the tests: places, and polygons by their places in order round them (their normals
+// from that order).
+struct FTestLevel
+{
+    RdxSphere::TList<RdxSphere::FV3>     Pts;
+    RdxSphere::TList<RdxSphere::FPolyIn> Polys;
+    void Poly(const RdxSphere::FV3* Q, int N)
+    {
+        RdxSphere::FPolyIn P;
+        P.First = Pts.Num;
+        P.Count = N;
+        for (int k = 0; k < N; k++)
+            Pts.Add(Q[k]);
+        // Newell's normal.
+        double X = 0.0, Y = 0.0, Z = 0.0;
+        for (int k = 0; k < N; k++)
+        {
+            const RdxSphere::FV3& A = Q[k];
+            const RdxSphere::FV3& B = Q[(k + 1) % N];
+            X += (A.Y - B.Y) * (A.Z + B.Z);
+            Y += (A.Z - B.Z) * (A.X + B.X);
+            Z += (A.X - B.X) * (A.Y + B.Y);
+        }
+        const double L = sqrt(X * X + Y * Y + Z * Z);
+        P.Nx  = X / L;
+        P.Ny  = Y / L;
+        P.Nz  = Z / L;
+        P.W   = P.Nx * Q[0].X + P.Ny * Q[0].Y + P.Nz * Q[0].Z;
+        P.Use = RdxSphere::Use_Wall;
+        Polys.Add(P);
+    }
+    // A pillar of N sides, R from its axis, H high, standing on the floor: its sides, its top and its foot's polygon.
+    void Pillar(int N, double R, double H)
+    {
+        for (int i = 0; i < N; i++)
+        {
+            const double A0 = 2.0 * RdxSphere::Pi * i / N, A1 = 2.0 * RdxSphere::Pi * (i + 1) / N;
+            const RdxSphere::FV3 Q[4] = { RdxSphere::V3(R * cos(A0), R * sin(A0), 0.0),
+                                          RdxSphere::V3(R * cos(A1), R * sin(A1), 0.0),
+                                          RdxSphere::V3(R * cos(A1), R * sin(A1), H),
+                                          RdxSphere::V3(R * cos(A0), R * sin(A0), H) };
+            Poly(Q, 4);
+        }
+        RdxSphere::FV3 Top[64], Foot[64];
+        for (int i = 0; i < N; i++)
+        {
+            const double A = 2.0 * RdxSphere::Pi * i / N;
+            Top[i]          = RdxSphere::V3(R * cos(A), R * sin(A), H);
+            Foot[N - 1 - i] = RdxSphere::V3(R * cos(A), R * sin(A), 0.0);
+        }
+        Poly(Top, N);
+        Poly(Foot, N);
+    }
+};
+
+// Whether the triangles of the result close up: every edge between two of their places used by exactly two triangles.
+static bool LevelClosed(const RdxSphere::FResult& R)
+{
+    struct FEdge
+    {
+        int A, B, Count;
+    };
+    RdxSphere::TList<FEdge> Edges;
+    for (int t = 0; t < R.Tri.Num / 3; t++)
+        for (int k = 0; k < 3; k++)
+        {
+            const int A = R.Tri[t * 3 + k], B = R.Tri[t * 3 + (k + 1) % 3];
+            const int Lo = (A < B) ? A : B, Hi = (A < B) ? B : A;
+            int       e  = 0;
+            while (e < Edges.Num && !(Edges[e].A == Lo && Edges[e].B == Hi))
+                e++;
+            if (e == Edges.Num)
+            {
+                FEdge New = { Lo, Hi, 0 };
+                Edges.Add(New);
+            }
+            Edges[e].Count++;
+        }
+    for (int e = 0; e < Edges.Num; e++)
+        if (Edges[e].Count != 2)
+            return false;
+    return Edges.Num > 0;
+}
+
+using RdxLevelRound::PackedMoveAt;
+
+static void TestLevelRound()
+{
+    printf("level rounded\n");
+    const double Angle = (double)RdxMath::SpherifierAngleDefault;
+    // A pillar of twelve sides: its sides come out round, its top and foot stay in their planes, rounding with them; the
+    // whole stays closed, and nothing moves further than the cap.
+    {
+        FTestLevel        L;
+        RdxSphere::FResult R;
+        const double       Rad = 64.0, H = 128.0;
+        L.Pillar(12, Rad, H);
+        Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R),
+              "level rounded: a pillar is made");
+        bool bAll = true;
+        for (int p = 0; p < L.Polys.Num; p++)
+            bAll = bAll && R.PolyTris[p] > 0;
+        Check(bAll && R.Touched == 14, "level rounded: every polygon of a pillar moves");
+        Check(LevelClosed(R), "level rounded: a pillar rounded stays closed - nothing opens between its polygons");
+        double Worst = 0.0, FlatWorst = 0.0, Lid = 0.0;
+        for (int p = 0; p < 12; p++)
+            for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p]; t++)
+                for (int k = 0; k < 3; k++)
+                {
+                    const RdxSphere::FV3& M = R.Moved[R.Tri[t * 3 + k]];
+                    const RdxSphere::FV3& O = R.Orig[R.Tri[t * 3 + k]];
+                    Worst     = fmax(Worst, fabs(sqrt(M.X * M.X + M.Y * M.Y) - Rad) / Rad);
+                    FlatWorst = fmax(FlatWorst, fabs(sqrt(O.X * O.X + O.Y * O.Y) - Rad) / Rad);
+                }
+        for (int p = 12; p < 14; p++)
+            for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p]; t++)
+                for (int k = 0; k < 3; k++)
+                {
+                    const RdxSphere::FV3& M = R.Moved[R.Tri[t * 3 + k]];
+                    Lid = fmax(Lid, fmin(fabs(M.Z), fabs(M.Z - H)));
+                }
+        Check(Worst < 0.006 && FlatWorst > 0.02, "level rounded: a pillar's sides come out round");
+        Check(Lid < 1e-3, "level rounded: a pillar's top and foot stay in their planes");
+        Check(R.LargestMove <= 8.0 + 1e-4 && R.LargestMove > 0.5, "level rounded: no point moves further than the cap");
+        // Its light sides: each side polygon along its two soft edges, with the polygon across, taking that one's light
+        // in half its own width; the top and foot along none (their edges with the sides are creases).
+        const double Width  = 2.0 * Rad * sin(RdxSphere::Pi / 12.0);
+        bool         bSides = R.PolySideCount.Num == 14;
+        for (int p = 0; p < 12 && bSides; p++)
+        {
+            bSides = R.PolySideCount[p] == 2;
+            for (int i = R.PolySideFirst[p]; i < R.PolySideFirst[p] + R.PolySideCount[p] && bSides; i++)
+            {
+                const RdxSphere::FLightSide& Sd = R.LightSides[i];
+                const RdxSphere::FLightPart& Pt = R.LightParts[Sd.PartFirst];
+                bSides = Sd.PartCount == 1 && (Pt.Other == (p + 1) % 12 || Pt.Other == (p + 11) % 12) &&
+                         fabs(Pt.Reach - 0.5 * Width) < 1e-3 && fabs(Pt.Depth - Width) < 1e-3 && fabs(Pt.T0) < 1e-6 &&
+                         fabs(Pt.T1 - H) < 1e-6 && fabs(RdxSphere::Dot(Sd.Into, Sd.Into) - 1.0) < 1e-9;
+                // The way into the polygon points from the side to its other soft edge.
+                const RdxSphere::FV3 Mid = (L.Pts[L.Polys[p].First] + L.Pts[L.Polys[p].First + 2]) * 0.5;
+                bSides = bSides && RdxSphere::Dot(Mid - Sd.A, Sd.Into) > 0.4 * Width;
+            }
+        }
+        Check(bSides && R.PolySideCount[12] == 0 && R.PolySideCount[13] == 0,
+              "level rounded: a pillar's sides take the light across their soft edges in, half their width deep");
+        // The card's copy, read as the relief's shader reads it: every place on the sides moves as the CPU moves it
+        // (MoveOnPolygon), and a place off the pillar on none.
+        RdxSphere::TList<unsigned int> Words;
+        const bool                     bPacked = RdxLevelRound::PackRound(R, Words);
+        double                         Off     = 0.0;
+        bool                           bSame   = bPacked;
+        for (int p = 0; p < 12 && bSame; p++)
+        {
+            const RdxSphere::FV3* const Q = &L.Pts[L.Polys[p].First];
+            for (int i = 1; i < 10 && bSame; i++)
+                for (int j = 1; j < 10 && bSame; j++)
+                {
+                    const RdxSphere::FV3 P = Q[0] + (Q[1] - Q[0]) * (i / 10.0) + (Q[3] - Q[0]) * (j / 10.0);
+                    RdxSphere::FV3       Cpu = RdxSphere::V3(0.0, 0.0, 0.0), Gpu = Cpu;
+                    bSame = RdxLevelRound::MoveOnPolygon(R, p, P, 2.0, Cpu) && PackedMoveAt(Words, P, Gpu);
+                    if (bSame)
+                        Off = fmax(Off, RdxSphere::Length(Cpu - Gpu));
+                }
+        }
+        RdxSphere::FV3 None;
+        Check(bSame && Off < 1e-3 && !PackedMoveAt(Words, RdxSphere::V3(0.0, 0.0, 0.5 * H), None),
+              "level rounded: the card's copy moves a place as the polygon does, and one off the polygons not at all");
+    }
+    // The relief's floor (PackRound, PackedPieceMoveAt): a pillar whose sides the relief may be drawn on - a place
+    // well inside any of their drawn triangles moves on the card to where that triangle is drawn, and one off the
+    // pillar onto none.
+    {
+        FTestLevel         L;
+        RdxSphere::FResult R;
+        L.Pillar(12, 64.0, 128.0);
+        for (int p = 0; p < 12; p++)
+            L.Polys[p].Use |= RdxSphere::Use_Relief;
+        RdxSphere::TList<unsigned int> Words;
+        bool bSame = RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R) &&
+                     RdxLevelRound::PackRound(R, Words);
+        double Off = 0.0;
+        int    Samples = 0;
+        for (int p = 0; p < 12 && bSame; p++)
+        {
+            const RdxSphere::FV3 Np = RdxSphere::V3(L.Polys[p].Nx, L.Polys[p].Ny, L.Polys[p].Nz);
+            for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p] && bSame; t++)
+            {
+                const RdxSphere::FV3 O0 = R.Orig[R.Tri[t * 3]], O1 = R.Orig[R.Tri[t * 3 + 1]];
+                const RdxSphere::FV3 O2 = R.Orig[R.Tri[t * 3 + 2]];
+                const RdxSphere::FV3 Ar = RdxSphere::Cross(O1 - O0, O2 - O0);
+                if (RdxSphere::Dot(Ar, Ar) < 1e-6 * RdxSphere::Dot(O1 - O0, O1 - O0) * RdxSphere::Dot(O2 - O0, O2 - O0))
+                    continue;
+                const RdxSphere::FV3 M0 = R.Moved[R.Tri[t * 3]], M1 = R.Moved[R.Tri[t * 3 + 1]];
+                const RdxSphere::FV3 M2 = R.Moved[R.Tri[t * 3 + 2]];
+                for (int i = 1; i <= 2 && bSame; i++)
+                    for (int j = 1; i + j <= 3 && bSame; j++)
+                    {
+                        const double         B1 = i / 4.0, B2 = j / 4.0, B0 = 1.0 - B1 - B2;
+                        const RdxSphere::FV3 W  = O0 * B0 + O1 * B1 + O2 * B2;
+                        RdxSphere::FV3       Mv = RdxSphere::V3(0.0, 0.0, 0.0);
+                        bSame = RdxLevelRound::PackedPieceMoveAt(Words, W, Np, Mv);
+                        Off   = fmax(Off, RdxSphere::Length(W + Mv - (M0 * B0 + M1 * B1 + M2 * B2)));
+                        Samples++;
+                    }
+            }
+        }
+        RdxSphere::FV3 None;
+        Check(bSame && Samples > 100 && Off < 1e-3 &&
+                  !RdxLevelRound::PackedPieceMoveAt(Words, RdxSphere::V3(0.0, 0.0, 64.0), RdxSphere::V3(1.0, 0.0, 0.0),
+                                                    None),
+              "relief floor: the card moves a place of a pillar's side to where its drawn triangle has it, and one off "
+              "the pillar not at all");
+        // And its normal, what the relief is lifted along: at the middle of each rounded edge between two sides, a step
+        // in from either side, turned off each side's plane towards the other's, and the same from both - the two sides
+        // lift their shared edge alike; at a side's middle its plane's own.
+        double MostApart = 0.0, LeastTurn = 180.0, MostMid = 0.0;
+        int    Edges = 0;
+        for (int p = 0; p < 12 && bSame; p++)
+        {
+            const RdxSphere::FPolyIn& P  = L.Polys[p];
+            const RdxSphere::FV3      Np = RdxSphere::V3(P.Nx, P.Ny, P.Nz);
+            RdxSphere::FV3            Mid = RdxSphere::V3(0.0, 0.0, 0.0);
+            for (int c = 0; c < P.Count; c++)
+                Mid = Mid + L.Pts[P.First + c] * (1.0 / P.Count);
+            RdxSphere::FV3 Mv = RdxSphere::V3(0.0, 0.0, 0.0), Nm = Np;
+            bSame     = RdxLevelRound::PackedPieceMoveAt(Words, Mid, Np, Mv, nullptr, &Nm);
+            MostMid   = fmax(MostMid, acos(fmin(1.0, RdxSphere::Dot(Nm, Np))) * 57.29578);
+            for (int c = 0; c < P.Count && bSame; c++)
+            {
+                const RdxSphere::FV3 A = L.Pts[P.First + c], B = L.Pts[P.First + (c + 1) % P.Count];
+                if (fabs(A.Z - B.Z) < 1.0)
+                    continue;
+                // The side beside it along that edge.
+                int q = -1;
+                for (int o = 0; o < 12 && q < 0; o++)
+                    for (int d = 0; d < L.Polys[o].Count && o != p && q < 0; d++)
+                        if (RdxSphere::Length(L.Pts[L.Polys[o].First + d] - B) < 1e-6 &&
+                            RdxSphere::Length(L.Pts[L.Polys[o].First + (d + 1) % L.Polys[o].Count] - A) < 1e-6)
+                            q = o;
+                if (q < 0)
+                    continue;
+                const RdxSphere::FV3 Nq = RdxSphere::V3(L.Polys[q].Nx, L.Polys[q].Ny, L.Polys[q].Nz);
+                const RdxSphere::FV3 E  = (A + B) * 0.5;
+                RdxSphere::FV3       Qm = RdxSphere::V3(0.0, 0.0, 0.0);
+                for (int d = 0; d < L.Polys[q].Count; d++)
+                    Qm = Qm + L.Pts[L.Polys[q].First + d] * (1.0 / L.Polys[q].Count);
+                RdxSphere::FV3 Np2 = Np, Nq2 = Nq;
+                bSame =RdxLevelRound::PackedPieceMoveAt(Words, E + (Mid - E) * (0.05 / RdxSphere::Length(Mid - E)), Np, Mv,
+                                                         nullptr, &Np2) &&
+                        RdxLevelRound::PackedPieceMoveAt(Words, E + (Qm - E) * (0.05 / RdxSphere::Length(Qm - E)), Nq, Mv,
+                                                         nullptr, &Nq2);
+                MostApart = fmax(MostApart, acos(fmin(1.0, RdxSphere::Dot(Np2, Nq2))) * 57.29578);
+                LeastTurn = fmin(LeastTurn, acos(fmin(1.0, RdxSphere::Dot(Np2, Np))) * 57.29578);
+                Edges++;
+            }
+        }
+        Check(bSame && Edges == 24 && MostApart < 1.0 && LeastTurn > 5.0 && MostMid < 0.5,
+              "relief floor: a pillar's rounded edge turns the relief's lift off either side towards the other, alike from "
+              "both, and a side's middle lifts along its plane");
+    }
+    // The relief's outline (ChordsOf): a pillar's top that the relief may be drawn on gets a record for each of its edges,
+    // from its corner to the next along the sides its triangles are drawn with; and the card's copy moves a place on
+    // such an edge as those sides do - onto the straight side between the two points round it, not onto the curve.
+    {
+        FTestLevel         L;
+        RdxSphere::FResult R;
+        L.Pillar(12, 64.0, 128.0);
+        L.Polys[12].Use |= RdxSphere::Use_Relief;
+        Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R) &&
+              R.PolyChordFirst.Num == L.Polys.Num, "relief outline: a pillar with a top for the relief is made");
+        bool bRing = true;
+        for (int p = 0; p < L.Polys.Num; p++)
+            bRing = bRing && (p == 12 || R.PolyChordFirst[p] == -1);
+        const int First = R.PolyChordFirst[12];
+        bRing           = bRing && First >= 0 && First + 12 == R.ChordFirst.Num;
+        // The top's triangles' sides that no other of them has, moved: each record's point lies on one of them, and
+        // the records go once round.
+        RdxSphere::TList<int> Ring;
+        for (int t = R.PolyFirst[12]; bRing && t < R.PolyFirst[12] + R.PolyTris[12]; t++)
+            for (int k = 0; k < 3; k++)
+            {
+                const int A = R.Tri[t * 3 + k], B = R.Tri[t * 3 + (k + 1) % 3];
+                bool      bBack = false;
+                for (int u = R.PolyFirst[12]; u < R.PolyFirst[12] + R.PolyTris[12] && !bBack; u++)
+                    for (int j = 0; j < 3 && !bBack; j++)
+                        bBack = R.Tri[u * 3 + j] == B && R.Tri[u * 3 + (j + 1) % 3] == A;
+                if (!bBack)
+                    Ring.Add(A);
+            }
+        int Points = 0;
+        for (int k = 0; k < 12 && bRing; k++)
+        {
+            const int            e = First + k, F0 = R.ChordFirst[e], N = R.ChordCount[e];
+            const RdxSphere::FV3 A = R.ChordEnds[2 * e], B = R.ChordEnds[2 * e + 1];
+            bRing = N >= 2 && R.ChordT[F0] == 0.0f && R.ChordT[F0 + N - 1] == 1.0f;
+            for (int i = 0; i < N && bRing; i++)
+            {
+                bRing = i == 0 || R.ChordT[F0 + i] >= R.ChordT[F0 + i - 1];
+                const RdxSphere::FV3 Moved = A + (B - A) * R.ChordT[F0 + i] + R.ChordMove[F0 + i];
+                bool                 bOn   = false;
+                for (int r = 0; r < Ring.Num && !bOn; r++)
+                    bOn = RdxSphere::Length(R.Moved[Ring[r]] - Moved) < 1e-3;
+                bRing = bRing && bOn;
+            }
+            Points += N - 1;
+        }
+        Check(bRing && Points == Ring.Num,
+              "relief outline: each edge of the pillar's top is a record of its triangles' sides from corner to corner");
+        // The card's copy, at each record's points and halfway between them; and where the curve itself would put the
+        // halfway place, off the straight side.
+        RdxSphere::TList<unsigned int> Words;
+        bool   bSame = bRing && RdxLevelRound::PackRound(R, Words);
+        double Off = 0.0, Bow = 0.0;
+        for (int k = 0; k < 12 && bSame; k++)
+        {
+            const int            e = First + k, F0 = R.ChordFirst[e], N = R.ChordCount[e];
+            const RdxSphere::FV3 A = R.ChordEnds[2 * e], B = R.ChordEnds[2 * e + 1];
+            for (int i = 0; i + 1 < N && bSame; i++)
+            {
+                const RdxSphere::FV3 P0 = A + (B - A) * R.ChordT[F0 + i], P1 = A + (B - A) * R.ChordT[F0 + i + 1];
+                const RdxSphere::FV3 M0 = R.ChordMove[F0 + i], M1 = R.ChordMove[F0 + i + 1];
+                RdxSphere::FV3       G0 = RdxSphere::V3(0.0, 0.0, 0.0), Gh = G0, Curve = G0;
+                bSame = RdxLevelRound::PackedChordAt(Words, (unsigned int)e, P0, G0) &&
+                        RdxLevelRound::PackedChordAt(Words, (unsigned int)e, (P0 + P1) * 0.5, Gh);
+                if (!bSame)
+                    break;
+                Off = fmax(Off, fmax(RdxSphere::Length(G0 - M0), RdxSphere::Length(Gh - (M0 + M1) * 0.5)));
+                if (PackedMoveAt(Words, (P0 + P1) * 0.5, Curve))
+                    Bow = fmax(Bow, RdxSphere::Length(Curve - Gh));
+            }
+        }
+        RdxSphere::FV3       None;
+        const RdxSphere::FV3 A0 = R.ChordEnds[2 * First], B0 = R.ChordEnds[2 * First + 1];
+        const RdxSphere::FV3 Mid0 = (A0 + B0) * 0.5, Away = Mid0 * (1.0 + 2.0 / RdxSphere::Length(Mid0 - RdxSphere::V3(0.0, 0.0, Mid0.Z)));
+        Check(bSame && Off < 1e-3 && Bow > 1e-4 && Bow <= (double)RdxLevelRound::Sag + 0.05 &&
+                  !RdxLevelRound::PackedChordAt(Words, (unsigned int)First, RdxSphere::V3(Away.X, Away.Y, Mid0.Z), None) &&
+                  !RdxLevelRound::PackedChordAt(Words, (unsigned int)R.ChordFirst.Num, Mid0, None),
+              "relief outline: the card's copy puts a place of the edge on the triangles' side, off the curve, and none "
+              "off the edge or of no record");
+    }
+    // A pillar one side of which is two polygons, one over the other: its neighbours' sides along it in two runs, each
+    // with its own polygon across.
+    {
+        FTestLevel        L;
+        RdxSphere::FResult R;
+        const int    N = 12;
+        const double Rad = 64.0, H = 128.0;
+        auto At = [&](int i, double Z) { return RdxSphere::V3(Rad * cos(2.0 * RdxSphere::Pi * i / N),
+                                                              Rad * sin(2.0 * RdxSphere::Pi * i / N), Z); };
+        for (int i = 0; i < N; i++)
+        {
+            if (i == 0)
+            {
+                const RdxSphere::FV3 Low[4] = { At(0, 0.0), At(1, 0.0), At(1, 0.5 * H), At(0, 0.5 * H) };
+                const RdxSphere::FV3 High[4] = { At(0, 0.5 * H), At(1, 0.5 * H), At(1, H), At(0, H) };
+                L.Poly(Low, 4);
+                L.Poly(High, 4);
+                continue;
+            }
+            const RdxSphere::FV3 Q[4] = { At(i, 0.0), At(i + 1, 0.0), At(i + 1, H), At(i, H) };
+            L.Poly(Q, 4);
+        }
+        RdxSphere::FV3 Top[N], Foot[N];
+        for (int i = 0; i < N; i++)
+        {
+            Top[i]          = At(i, H);
+            Foot[N - 1 - i] = At(i, 0.0);
+        }
+        L.Poly(Top, N);
+        L.Poly(Foot, N);
+        const bool bMade = RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        // Polygon 2 is the side after the split one: its side along the split one, in two runs.
+        bool bRuns = false;
+        if (bMade && R.PolySideCount.Num == L.Polys.Num && R.PolySideCount[2] == 2)
+            for (int i = R.PolySideFirst[2]; i < R.PolySideFirst[2] + 2; i++)
+            {
+                const RdxSphere::FLightSide& Sd = R.LightSides[i];
+                if (Sd.PartCount != 2)
+                    continue;
+                const RdxSphere::FLightPart& P0 = R.LightParts[Sd.PartFirst];
+                const RdxSphere::FLightPart& P1 = R.LightParts[Sd.PartFirst + 1];
+                bRuns = ((P0.Other == 0 && P1.Other == 1) || (P0.Other == 1 && P1.Other == 0)) && fabs(P0.T0) < 1e-6 &&
+                        fabs(P0.T1 - 0.5 * H) < 1e-6 && fabs(P1.T0 - 0.5 * H) < 1e-6 && fabs(P1.T1 - H) < 1e-6;
+            }
+        Check(bMade && R.TPoints == 2 && bRuns,
+              "level rounded: a side along two polygons across takes each one's light in along its own run");
+        // The two halves: each along its two soft edges, nothing along the edge between them (in one plane).
+        Check(R.PolySideCount[0] == 2 && R.PolySideCount[1] == 2, "level rounded: ... and the halves along their own");
+    }
+    // A big tower of twelve sides, 600 from its axis: its sides would stand out 20 - held to the cap of 8.
+    {
+        FTestLevel        L;
+        RdxSphere::FResult R;
+        L.Pillar(12, 600.0, 256.0);
+        const bool bMade = RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        Check(bMade && R.LargestMove <= 8.0 + 1e-4 && LevelClosed(R),
+              "level rounded: a big tower's sides held to the cap, closed");
+        Check(R.Tri.Num / 3 < 12000, "level rounded: ... in no more pieces than the capped curve needs");
+    }
+    // A box: every corner a right angle - nothing moves, every polygon left to the engine.
+    {
+        FTestLevel L;
+        RdxSphere::FResult R;
+        const double S = 100.0;
+        const RdxSphere::FV3 C[8] = { RdxSphere::V3(0, 0, 0), RdxSphere::V3(S, 0, 0), RdxSphere::V3(S, S, 0),
+                                      RdxSphere::V3(0, S, 0), RdxSphere::V3(0, 0, S), RdxSphere::V3(S, 0, S),
+                                      RdxSphere::V3(S, S, S), RdxSphere::V3(0, S, S) };
+        const int F[6][4] = { { 3, 2, 1, 0 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 },
+                              { 3, 0, 4, 7 } };
+        for (int f = 0; f < 6; f++)
+        {
+            const RdxSphere::FV3 Q[4] = { C[F[f][0]], C[F[f][1]], C[F[f][2]], C[F[f][3]] };
+            L.Poly(Q, 4);
+        }
+        Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R) && R.Touched == 0,
+              "level rounded: nothing of a box moves");
+    }
+    // A pillar whose foot polygon is split in two by a cut through two of its corners' middles - its corners lie on the
+    // sides' bottom edges then, T-junctions: they are put into those edges, and the whole stays closed.
+    {
+        FTestLevel        L;
+        RdxSphere::FResult R;
+        const int    N = 12;
+        const double Rad = 64.0, H = 128.0;
+        for (int i = 0; i < N; i++)
+        {
+            const double A0 = 2.0 * RdxSphere::Pi * i / N, A1 = 2.0 * RdxSphere::Pi * (i + 1) / N;
+            const RdxSphere::FV3 Q[4] = { RdxSphere::V3(Rad * cos(A0), Rad * sin(A0), 0.0),
+                                          RdxSphere::V3(Rad * cos(A1), Rad * sin(A1), 0.0),
+                                          RdxSphere::V3(Rad * cos(A1), Rad * sin(A1), H),
+                                          RdxSphere::V3(Rad * cos(A0), Rad * sin(A0), H) };
+            L.Poly(Q, 4);
+        }
+        RdxSphere::FV3 Top[N];
+        for (int i = 0; i < N; i++)
+            Top[i] = RdxSphere::V3(Rad * cos(2.0 * RdxSphere::Pi * i / N), Rad * sin(2.0 * RdxSphere::Pi * i / N), H);
+        L.Poly(Top, N);
+        // The foot cut from the middle of side 0's bottom edge to the middle of side 6's: two halves, each with two
+        // corners on the sides' edges.
+        auto Corner = [&](int i) { return RdxSphere::V3(Rad * cos(2.0 * RdxSphere::Pi * i / N),
+                                                        Rad * sin(2.0 * RdxSphere::Pi * i / N), 0.0); };
+        const RdxSphere::FV3 M0 = (Corner(0) + Corner(1)) * 0.5, M6 = (Corner(6) + Corner(7)) * 0.5;
+        RdxSphere::FV3 HalfA[16], HalfB[16];
+        int            NA = 0, NB = 0;
+        // Seen from below (the foot faces down): the corners in the other order.
+        HalfA[NA++] = M0;
+        for (int i = 0; i >= -5; i--)
+            HalfA[NA++] = Corner((i + N) % N);
+        HalfA[NA++] = M6;
+        HalfB[NB++] = M6;
+        for (int i = 6; i >= 1; i--)
+            HalfB[NB++] = Corner(i);
+        HalfB[NB++] = M0;
+        L.Poly(HalfA, NA);
+        L.Poly(HalfB, NB);
+        Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R),
+              "level rounded: a pillar with a cut foot is made");
+        Check(R.TPoints == 2, "level rounded: the cut foot's two corners are put into the sides' edges");
+        Check(LevelClosed(R), "level rounded: ... and the pillar stays closed");
+    }
+    // A glass table: a rim of twelve sides four units wide - its inner and outer walls, its top and its foot - a glass
+    // across the inner walls' middle, and a leg standing out under side 0's foot, the foot cut round the leg's top. The
+    // glass goes along with the walls at every side, and side 0 bows as the others do: the rim is a closed ring, which
+    // the leg under it does not hold flat there.
+    {
+        FTestLevel         L;
+        RdxSphere::FResult R;
+        const int    N = 12;
+        const double Ri = 32.0, Ro = 36.0, Z0 = 0.0, Z1 = 4.0, Zg = 2.0, Zl = -10.0;
+        auto At = [&](double Rad, int i, double Z)
+        {
+            const double A = 2.0 * RdxSphere::Pi * i / N;
+            return RdxSphere::V3(Rad * cos(A), Rad * sin(A), Z);
+        };
+        for (int i = 0; i < N; i++)
+        {
+            // The inner wall faces the middle, the outer away from it, the top up and the foot down.
+            const RdxSphere::FV3 In[4]   = { At(Ri, i + 1, Z0), At(Ri, i, Z0), At(Ri, i, Z1), At(Ri, i + 1, Z1) };
+            const RdxSphere::FV3 Out[4]  = { At(Ro, i, Z0), At(Ro, i + 1, Z0), At(Ro, i + 1, Z1), At(Ro, i, Z1) };
+            const RdxSphere::FV3 Top[4]  = { At(Ri, i, Z1), At(Ro, i, Z1), At(Ro, i + 1, Z1), At(Ri, i + 1, Z1) };
+            const RdxSphere::FV3 Foot[4] = { At(Ri, i + 1, Z0), At(Ro, i + 1, Z0), At(Ro, i, Z0), At(Ri, i, Z0) };
+            L.Poly(In, 4);
+            L.Poly(Out, 4);
+            L.Poly(Top, 4);
+            if (i > 0)
+                L.Poly(Foot, 4);
+        }
+        // Side 0 by how far out from the middle (U) and along it (V): its foot in four round the leg's top, which reaches
+        // from a unit past the inner edge to a unit short of the outer, three units either way along.
+        const double Ca = cos(RdxSphere::Pi / N), Sa = sin(RdxSphere::Pi / N), Ui = Ri * Ca, Uo = Ro * Ca;
+        auto Side = [&](double U, double V, double Z)
+        { return RdxSphere::V3(U * Ca - V * Sa, U * Sa + V * Ca, Z); };
+        const RdxSphere::FV3 Pieces[4][4] = {
+            { Side(Ui, -Ri * Sa, Z0), Side(Ui, -3.0, Z0), Side(Uo, -3.0, Z0), Side(Uo, -Ro * Sa, Z0) },
+            { Side(Ui, 3.0, Z0), Side(Ui, Ri * Sa, Z0), Side(Uo, Ro * Sa, Z0), Side(Uo, 3.0, Z0) },
+            { Side(Ui, -3.0, Z0), Side(Ui, 3.0, Z0), Side(Ui + 1.0, 3.0, Z0), Side(Ui + 1.0, -3.0, Z0) },
+            { Side(Uo - 1.0, -3.0, Z0), Side(Uo - 1.0, 3.0, Z0), Side(Uo, 3.0, Z0), Side(Uo, -3.0, Z0) } };
+        for (int k = 0; k < 4; k++)
+            L.Poly(Pieces[k], 4);
+        const double LegU[4] = { Ui + 1.0, Uo - 1.0, Uo - 1.0, Ui + 1.0 }, LegV[4] = { -3.0, -3.0, 3.0, 3.0 };
+        for (int k = 0; k < 4; k++)
+        {
+            const RdxSphere::FV3 Q[4] = { Side(LegU[k], LegV[k], Zl), Side(LegU[(k + 1) % 4], LegV[(k + 1) % 4], Zl),
+                                          Side(LegU[(k + 1) % 4], LegV[(k + 1) % 4], Z0), Side(LegU[k], LegV[k], Z0) };
+            L.Poly(Q, 4);
+        }
+        const RdxSphere::FV3 LegFoot[4] = { Side(LegU[3], LegV[3], Zl), Side(LegU[2], LegV[2], Zl),
+                                            Side(LegU[1], LegV[1], Zl), Side(LegU[0], LegV[0], Zl) };
+        L.Poly(LegFoot, 4);
+        RdxSphere::FV3 Glass[N];
+        for (int i = 0; i < N; i++)
+            Glass[i] = At(Ri, i, Zg);
+        const int GlassPoly = L.Polys.Num;
+        L.Poly(Glass, N);
+        L.Polys[GlassPoly].Use |= RdxSphere::Use_Sheet;
+        Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R) &&
+                  R.PolyTris[GlassPoly] > 0,
+              "level rounded: a glass table is made, its glass with it");
+        // How far each side of the glass bows out: its places between its two corners, out from the middle.
+        double Bow[N];
+        for (int i = 0; i < N; i++)
+            Bow[i] = 0.0;
+        for (int t = R.PolyFirst[GlassPoly]; t < R.PolyFirst[GlassPoly] + R.PolyTris[GlassPoly]; t++)
+            for (int k = 0; k < 3; k++)
+            {
+                const RdxSphere::FV3& O = R.Orig[R.Tri[t * 3 + k]];
+                const RdxSphere::FV3& M = R.Moved[R.Tri[t * 3 + k]];
+                for (int i = 0; i < N; i++)
+                {
+                    const RdxSphere::FV3 A = At(Ri, i, Zg), B = At(Ri, i + 1, Zg), AB = B - A;
+                    const double         T = RdxSphere::Dot(O - A, AB) / RdxSphere::Dot(AB, AB);
+                    if (T < 0.1 || T > 0.9 || RdxSphere::Length(A + AB * T - O) > 1e-3)
+                        continue;
+                    const double Am = 2.0 * RdxSphere::Pi * (i + 0.5) / N;
+                    Bow[i] = fmax(Bow[i], RdxSphere::Dot(M - O, RdxSphere::V3(cos(Am), sin(Am), 0.0)));
+                }
+            }
+        double Least = 1e30;
+        for (int i = 1; i < N; i++)
+            Least = fmin(Least, Bow[i]);
+        Check(Least > 0.3, "level rounded: a glass table's glass bows out at its sides with the rim's walls");
+        Check(Bow[0] > 0.8 * Least, "level rounded: ... and as far over the leg as at the others - the ring is not held");
+    }
+}
+
+// The wall held back before a still polygon (LevelRound.h's HoldBehind): an eight-sided pillar, which the round bows out
+// into its circle, and a thin sign before one of its sides - standing half a unit off it with a back of its own, or
+// laid flat on it as the levels' signs are, whose back is the side itself and no polygon (the level's own geometry has
+// none there). Without the hold the side's middle comes out through the sign. Held: the side under the sign stays
+// behind it - behind its back where it has one, behind its front where it lies flat -, every place further than the
+// spread from the sign moves to the bit as without the sign, no triangle of the side turns over, and the sign itself
+// stays still.
+static void TestLevelHold()
+{
+    printf("level rounded, held behind a still polygon\n");
+    const double Angle = (double)RdxMath::SpherifierAngleDefault, Cap = 8.0, Rad = 64.0, H = 128.0;
+    const double         C = cos(RdxSphere::Pi / 8.0), S = sin(RdxSphere::Pi / 8.0), Apothem = Rad * C;
+    const RdxSphere::FV3 U = RdxSphere::V3(C, S, 0.0), T = RdxSphere::V3(-S, C, 0.0), Z = RdxSphere::V3(0.0, 0.0, 1.0);
+    const double Half = 12.0, Z0 = 52.0, Z1 = 76.0, Thick = 2.0;
+    auto At = [&](double s, double w, double z) { return U * s + T * w + Z * z; };
+    // A quad facing Out: its corners turned round if they come the other way.
+    auto Quad = [&](FTestLevel& L, RdxSphere::FV3 A, RdxSphere::FV3 B, RdxSphere::FV3 Cc, RdxSphere::FV3 D,
+                    RdxSphere::FV3 Out) {
+        RdxSphere::FV3 Q[4] = { A, B, Cc, D };
+        if (RdxSphere::Dot(RdxSphere::Cross(B - A, Cc - A), Out) < 0.0)
+        {
+            Q[1] = D;
+            Q[3] = B;
+        }
+        L.Poly(Q, 4);
+    };
+    FTestLevel Plain;
+    Plain.Pillar(8, Rad, H);
+    RdxSphere::FResult R0;
+    Check(RdxLevelRound::Round(Plain.Pts.Data, Plain.Pts.Num, Plain.Polys.Data, Plain.Polys.Num, Cap, Angle, R0),
+          "level held: the pillar is made without a sign");
+    // The drawn surface of side 0 under the sign: on a grid over the sign's outline, how far out the triangle there
+    // has moved it (its corners' moves, by the spot's shares of the triangle where it was).
+    auto Surface = [&](const RdxSphere::FResult& R, double& Most, int& Seen) {
+        Most = -1e9;
+        Seen = 0;
+        for (int i = 0; i <= 24; i++)
+            for (int j = 0; j <= 24; j++)
+            {
+                const double w = -Half + 2.0 * Half * i / 24.0, z = Z0 + (Z1 - Z0) * j / 24.0;
+                for (int t = R.PolyFirst[0]; t < R.PolyFirst[0] + R.PolyTris[0]; t++)
+                {
+                    const int    a = R.Tri[t * 3], b = R.Tri[t * 3 + 1], c = R.Tri[t * 3 + 2];
+                    const double Aw = RdxSphere::Dot(R.Orig[a], T), Az = R.Orig[a].Z;
+                    const double Bw = RdxSphere::Dot(R.Orig[b], T), Bz = R.Orig[b].Z;
+                    const double Cw = RdxSphere::Dot(R.Orig[c], T), Cz = R.Orig[c].Z;
+                    const double Den = (Bw - Aw) * (Cz - Az) - (Cw - Aw) * (Bz - Az);
+                    if (fabs(Den) < 1e-12)
+                        continue;
+                    const double L1 = ((w - Aw) * (Cz - Az) - (Cw - Aw) * (z - Az)) / Den;
+                    const double L2 = ((Bw - Aw) * (z - Az) - (w - Aw) * (Bz - Az)) / Den;
+                    if (L1 < -1e-9 || L2 < -1e-9 || L1 + L2 > 1.0 + 1e-9)
+                        continue;
+                    const double Out = RdxSphere::Dot(R.Moved[a] - R.Orig[a], U) * (1.0 - L1 - L2) +
+                                       RdxSphere::Dot(R.Moved[b] - R.Orig[b], U) * L1 +
+                                       RdxSphere::Dot(R.Moved[c] - R.Orig[c], U) * L2;
+                    Most = fmax(Most, Out);
+                    Seen++;
+                    break;
+                }
+            }
+    };
+    double PlainOut;
+    int    PlainSeen;
+    Surface(R0, PlainOut, PlainSeen);
+    for (int Flat = 0; Flat < 2; Flat++)
+    {
+        const double      Back = Apothem + (Flat ? 0.0 : 0.5), Front = Back + Thick;
+        const char* const Kind = Flat ? "laid flat" : "standing off";
+        char              What[200];
+        auto              Say = [&](const char* Text) {
+            snprintf(What, sizeof(What), "level held, %s: %s", Kind, Text);
+            return (const char*)What;
+        };
+        FTestLevel Signed;
+        Signed.Pillar(8, Rad, H);
+        const int SignFirst = Signed.Polys.Num;
+        Quad(Signed, At(Front, -Half, Z0), At(Front, Half, Z0), At(Front, Half, Z1), At(Front, -Half, Z1), U);
+        if (!Flat)
+            Quad(Signed, At(Back, -Half, Z0), At(Back, Half, Z0), At(Back, Half, Z1), At(Back, -Half, Z1), U * -1.0);
+        Quad(Signed, At(Back, Half, Z0), At(Front, Half, Z0), At(Front, Half, Z1), At(Back, Half, Z1), T);
+        Quad(Signed, At(Back, -Half, Z0), At(Front, -Half, Z0), At(Front, -Half, Z1), At(Back, -Half, Z1), T * -1.0);
+        Quad(Signed, At(Back, -Half, Z1), At(Back, Half, Z1), At(Front, Half, Z1), At(Front, -Half, Z1), Z);
+        Quad(Signed, At(Back, -Half, Z0), At(Back, Half, Z0), At(Front, Half, Z0), At(Front, -Half, Z0), Z * -1.0);
+        RdxSphere::FResult R1;
+        Check(RdxLevelRound::Round(Signed.Pts.Data, Signed.Pts.Num, Signed.Polys.Data, Signed.Polys.Num, Cap, Angle, R1),
+              Say("the pillar is made with the sign"));
+        Check(PlainSeen == 625 && PlainOut > Front - Apothem, Say("without the hold the side comes out through the sign"));
+        double HeldOut;
+        int    HeldSeen;
+        Surface(R1, HeldOut, HeldSeen);
+        Check(HeldSeen == 625 && HeldOut < (Flat ? Front : Back) - Apothem,
+              Say("under the sign the drawn side stays behind it, between the places too"));
+        Check(R1.HeldStopped > 0, Say("places are stopped before the sign"));
+        // Further than the rim and the spread from the sign: as without the sign, to the bit.
+        const double Spread = (RdxLevelRound::HoldRimCaps + RdxLevelRound::HoldSpreadCaps) * Cap;
+        int          Far = 0, FarSame = 0;
+        for (int v = 0; v < R1.Orig.Num; v++)
+        {
+            const RdxSphere::FV3& O  = R1.Orig[v];
+            const double          dw = fmax(0.0, fabs(RdxSphere::Dot(O, T)) - Half);
+            const double          dz = fmax(0.0, fmax(Z0 - O.Z, O.Z - Z1));
+            const double          ds = fmax(0.0, Back - RdxSphere::Dot(O, U));
+            if (sqrt(dw * dw + dz * dz + ds * ds) <= Spread + 1.0)
+                continue;
+            for (int u = 0; u < R0.Orig.Num; u++)
+                if (R0.Orig[u].X == O.X && R0.Orig[u].Y == O.Y && R0.Orig[u].Z == O.Z)
+                {
+                    Far++;
+                    FarSame += (R0.Moved[u].X == R1.Moved[v].X && R0.Moved[u].Y == R1.Moved[v].Y &&
+                                R0.Moved[u].Z == R1.Moved[v].Z) ? 1 : 0;
+                    break;
+                }
+        }
+        Check(Far > 0 && FarSame == Far, Say("further than the spread from the sign, every place moves as without it"));
+        // Side 0's triangles: none turned over.
+        int Flipped = 0;
+        for (int t = R1.PolyFirst[0]; t < R1.PolyFirst[0] + R1.PolyTris[0]; t++)
+        {
+            const RdxSphere::FV3& A = R1.Moved[R1.Tri[t * 3]];
+            const RdxSphere::FV3  N = RdxSphere::Cross(R1.Moved[R1.Tri[t * 3 + 1]] - A, R1.Moved[R1.Tri[t * 3 + 2]] - A);
+            Flipped += (RdxSphere::Dot(N, U) <= 0.0) ? 1 : 0;
+        }
+        Check(R1.PolyTris[0] > 0 && Flipped == 0, Say("no triangle of the held side turns over"));
+        bool bSignStill = true;
+        for (int p = SignFirst; p < Signed.Polys.Num; p++)
+            bSignStill = bSignStill && R1.PolyTris[p] == 0;
+        Check(bSignStill, Say("the sign itself is not moved"));
+        // A thing laid on the side - a decal: under the sign it goes with the drawn side, behind the sign; far from it,
+        // as the faces' curve moves it, to the bit.
+        const RdxSphere::FV3 Under = At(Apothem, 0.0, 0.5 * (Z0 + Z1)), Away = At(Apothem, 0.0, 12.0);
+        RdxSphere::FV3       MoveUnder, MoveAway;
+        const bool           bUnder = RdxLevelRound::MoveOnPolygon(R1, 0, Under, 2.0, MoveUnder);
+        RdxLevelRound::HoldOnPolygon(R1, 0, Under, MoveUnder);
+        const bool           bAway = RdxLevelRound::MoveOnPolygon(R1, 0, Away, 2.0, MoveAway);
+        const RdxSphere::FV3 Curve = MoveAway;
+        RdxLevelRound::HoldOnPolygon(R1, 0, Away, MoveAway);
+        Check(bUnder && RdxSphere::Dot(MoveUnder, U) < (Flat ? Front : Back) - Apothem,
+              Say("a thing laid on the side under the sign stays behind it"));
+        Check(bAway && MoveAway.X == Curve.X && MoveAway.Y == Curve.Y && MoveAway.Z == Curve.Z,
+              Say("... and far from it moves as the faces' curve moves it"));
+        printf("  %s: side 0 under the sign out by %.2f without the hold, %.2f held; %d stopped, %d eased; %d far ones "
+               "alike\n", Kind, PlainOut, HeldOut, R1.HeldStopped, R1.HeldEased, FarSame);
+    }
+}
+
+// A hard edge's fine bevel (EdgeBevel.h): one right-angled edge and one that turns by 45 degrees - the band's far line
+// stays, the edge goes to the round's middle, every point of the band lies on the round, nothing folds or goes outward;
+// an inner edge and a nearly flat one are no edges; a wall rising beside a ledge does not follow the ledge's round; a
+// plate thinner than twice the radius has no worn solid; and a box of twelve edges, its faces cut into a grid - every
+// point the radius off the box worn down by it (a quarter cylinder at each edge, an eighth of a ball at each corner),
+// the faces still meeting point for point, nothing turned over or outside the box. With RDX_BEVEL_OBJ naming a folder,
+// the boxes are written there as OBJ files for the eye: fine (a band in four slices) and as the level would be cut
+// (two slices), for radii 1, 2 and 4.
+static RdxSphere::FV3 BevelPoint(double X, double Y, double Z) { return RdxSphere::V3(X, Y, Z); }
+
+static void BevelBox(double S, double H, double R, bool bFine, int& Flipped, int& Outside, int& Seams, double& OffRound,
+                     double& Corner, const char* ObjPath)
+{
+    using RdxBevel::FEdge;
+    FEdge Edges[12];
+    int   Count = 0;
+    const double Least = 0.1, Most = 2.5;
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 2; b++)
+        {
+            const double         Y = a ? S : 0.0, Z = b ? H : 0.0, X = a ? S : 0.0, Y2 = b ? S : 0.0;
+            const RdxSphere::FV3 NZ = BevelPoint(0, 0, b ? 1 : -1), NY = BevelPoint(0, a ? 1 : -1, 0);
+            const RdxSphere::FV3 NX = BevelPoint(a ? 1 : -1, 0, 0), NY2 = BevelPoint(0, b ? 1 : -1, 0);
+            Count += RdxBevel::MakeEdge(BevelPoint(0, Y, Z), BevelPoint(S, Y, Z), NZ, NY, BevelPoint(S / 2, S / 2, Z),
+                                        Least, Most, Edges[Count]) ? 1 : 0;
+            Count += RdxBevel::MakeEdge(BevelPoint(X, 0, Z), BevelPoint(X, S, Z), NZ, NX, BevelPoint(S / 2, S / 2, Z),
+                                        Least, Most, Edges[Count]) ? 1 : 0;
+            Count += RdxBevel::MakeEdge(BevelPoint(X, Y2, 0), BevelPoint(X, Y2, H), NX, NY2, BevelPoint(X, S / 2, H / 2),
+                                        Least, Most, Edges[Count]) ? 1 : 0;
+        }
+    Check(Count == 12, "bevel: a box has twelve outward edges");
+    // The cuts across each side: the bands' lines, and a few between them.
+    auto Lines = [&](double L, double* Out) {
+        int N = 0;
+        const int In = bFine ? 4 : 2;
+        for (int k = 0; k <= In; k++)
+            Out[N++] = R * k / In;
+        for (int j = 1; j < 4; j++)
+            Out[N++] = R + (L - 2 * R) * j / 4;
+        for (int k = In; k >= 0; k--)
+            Out[N++] = L - R * k / In;
+        return N;
+    };
+    double LX[16], LY[16], LZ[16];
+    const int NX = Lines(S, LX), NY = Lines(S, LY), NZ = Lines(H, LZ);
+    // Each face: its fixed axis and side, its two axes' lines; the moved points, and two triangles a cell.
+    RdxSphere::TList<RdxSphere::FV3> Moved, Orig;
+    RdxSphere::TList<int>            Tris;
+    Flipped = Outside = Seams = 0;
+    OffRound = Corner = 0.0;
+    for (int Axis = 0; Axis < 3; Axis++)
+        for (int Side = 0; Side < 2; Side++)
+        {
+            const double*        U   = (Axis == 0) ? LY : LX;
+            const int            NU  = (Axis == 0) ? NY : NX;
+            const double*        V   = (Axis == 2) ? LY : LZ;
+            const int            NV  = (Axis == 2) ? NY : NZ;
+            const double         At  = Side ? ((Axis == 2) ? H : S) : 0.0;
+            const double         Out = Side ? 1.0 : -1.0;
+            const RdxSphere::FV3 Normal = (Axis == 0) ? BevelPoint(Out, 0, 0) : (Axis == 1) ? BevelPoint(0, Out, 0)
+                                                                                        : BevelPoint(0, 0, Out);
+            const int First = Moved.Num;
+            for (int j = 0; j < NV; j++)
+                for (int i = 0; i < NU; i++)
+                {
+                    const RdxSphere::FV3 P = (Axis == 0) ? BevelPoint(At, U[i], V[j])
+                                           : (Axis == 1) ? BevelPoint(U[i], At, V[j]) : BevelPoint(U[i], V[j], At);
+                    RdxSphere::FV3 M, N = Normal;
+                    RdxBevel::Round(Edges, Count, P, R, M, N);
+                    // The same place from another face moves the same.
+                    for (int k = 0; k < Orig.Num; k++)
+                        if (Orig[k].X == P.X && Orig[k].Y == P.Y && Orig[k].Z == P.Z &&
+                            RdxSphere::Length(Moved[k] - M) > 1e-12)
+                            Seams++;
+                    if (M.X < -1e-9 || M.Y < -1e-9 || M.Z < -1e-9 || M.X > S + 1e-9 || M.Y > S + 1e-9 ||
+                        M.Z > H + 1e-9)
+                        Outside++;
+                    // The radius off the worn box, whether moved or not.
+                    const double DX = fmax(fmax(R - M.X, M.X - (S - R)), 0.0);
+                    const double DY = fmax(fmax(R - M.Y, M.Y - (S - R)), 0.0);
+                    const double DZ = fmax(fmax(R - M.Z, M.Z - (H - R)), 0.0);
+                    OffRound = fmax(OffRound, fabs(sqrt(DX * DX + DY * DY + DZ * DZ) - R));
+                    if (P.X == 0.0 && P.Y == 0.0 && P.Z == 0.0)
+                        Corner = M.X;
+                    Orig.Add(P);
+                    Moved.Add(M);
+                }
+            for (int j = 0; j + 1 < NV; j++)
+                for (int i = 0; i + 1 < NU; i++)
+                {
+                    const int A = First + j * NU + i, B = A + 1, C = A + NU, D = C + 1;
+                    const int T[6] = { A, B, D, A, D, C };
+                    for (int t = 0; t < 2; t++)
+                    {
+                        int I0 = T[t * 3], I1 = T[t * 3 + 1], I2 = T[t * 3 + 2];
+                        // Wound so that the face's own normal is its front.
+                        const RdxSphere::FV3 N0 = RdxSphere::Cross(Orig[I1] - Orig[I0], Orig[I2] - Orig[I0]);
+                        if (RdxSphere::Dot(N0, Normal) < 0.0)
+                        {
+                            const int Keep = I1;
+                            I1 = I2;
+                            I2 = Keep;
+                        }
+                        const RdxSphere::FV3 N1 = RdxSphere::Cross(Moved[I1] - Moved[I0], Moved[I2] - Moved[I0]);
+                        if (RdxSphere::Dot(N1, Normal) <= 0.0)
+                            Flipped++;
+                        Tris.Add(I0);
+                        Tris.Add(I1);
+                        Tris.Add(I2);
+                    }
+                }
+        }
+    if (ObjPath)
+    {
+        FILE* F = nullptr;
+        if (fopen_s(&F, ObjPath, "w") == 0 && F)
+        {
+            for (int k = 0; k < Moved.Num; k++)
+                fprintf(F, "v %.6f %.6f %.6f\n", Moved[k].X, Moved[k].Y, Moved[k].Z);
+            for (int k = 0; k + 2 < Tris.Num; k += 3)
+                fprintf(F, "f %d %d %d\n", Tris[k] + 1, Tris[k + 1] + 1, Tris[k + 2] + 1);
+            fclose(F);
+        }
+    }
+}
+
+// A face cut along its edges' bands (EdgeBevel.h's CutBands): a 64-unit square, its four sides right-angled outward
+// edges, cut at the band's width and half of it from each - a five by five grid of pieces over six by six points, each
+// piece convex, the pieces' areas the square's; with one edge, three strips along it. Radius 1.
+static void TestBevelCut()
+{
+    printf("a face cut along its edges' bands\n");
+    using RdxBevel::FEdge;
+    using RdxSphere::V3;
+    const RdxSphere::FV3 Q[4] = { V3(0, 0, 0), V3(64, 0, 0), V3(64, 64, 0), V3(0, 64, 0) };
+    const RdxSphere::FV3 Up = V3(0, 0, 1), In = V3(32, 32, 0);
+    const RdxSphere::FV3 Side[4] = { V3(0, -1, 0), V3(1, 0, 0), V3(0, 1, 0), V3(-1, 0, 0) };
+    FEdge Edges[4];
+    bool  bMade = true;
+    for (int k = 0; k < 4; k++)
+        bMade = bMade && RdxBevel::MakeEdge(Q[k], Q[(k + 1) % 4], Up, Side[k], In, 0.1, 2.5, Edges[k]);
+    Check(bMade, "bevel cut: the square's four sides are outward edges");
+    RdxSphere::TList<RdxSphere::FV3> Points;
+    RdxSphere::TList<int>            Pieces;
+    // Each piece: convex (its corners turn one way round Up), and its area by the shoelace over its corners.
+    auto Look = [&](int& Count, double& Area, bool& bConvex) {
+        Count   = 0;
+        Area    = 0.0;
+        bConvex = true;
+        for (int p = 0; p < Pieces.Num; p += Pieces[p] + 1)
+        {
+            const int n = Pieces[p];
+            Count++;
+            double A = 0.0;
+            for (int k = 0; k < n; k++)
+            {
+                const RdxSphere::FV3& P0 = Points[Pieces[p + 1 + k]];
+                const RdxSphere::FV3& P1 = Points[Pieces[p + 1 + (k + 1) % n]];
+                const RdxSphere::FV3& P2 = Points[Pieces[p + 1 + (k + 2) % n]];
+                A += P0.X * P1.Y - P1.X * P0.Y;
+                bConvex = bConvex && RdxSphere::Dot(RdxSphere::Cross(P1 - P0, P2 - P1), Up) >= -1e-9;
+            }
+            Area += 0.5 * A;
+        }
+    };
+    int    Count;
+    double Area;
+    bool   bConvex;
+    Check(RdxBevel::CutBands(Q, 4, Up, Edges, 4, 1.0, Points, Pieces), "bevel cut: the square is cut");
+    Look(Count, Area, bConvex);
+    bool bOnGrid = true;
+    for (int i = 0; i < Points.Num; i++)
+    {
+        auto Grid = [](double V) {
+            const double Lines[6] = { 0.0, 0.5, 1.0, 63.0, 63.5, 64.0 };
+            for (int k = 0; k < 6; k++)
+                if (fabs(V - Lines[k]) < 1e-9)
+                    return true;
+            return false;
+        };
+        bOnGrid = bOnGrid && Grid(Points[i].X) && Grid(Points[i].Y) && Points[i].Z == 0.0;
+    }
+    Check(Count == 25 && Points.Num == 36, "bevel cut: four edges - a five by five grid of pieces over six by six points");
+    Check(fabs(Area - 64.0 * 64.0) < 1e-6 && bConvex, "bevel cut: ... each piece convex, together the whole square");
+    Check(bOnGrid, "bevel cut: ... every point on the bands' lines and the square's sides");
+    const int FourPieces = Count, FourPoints = Points.Num;
+    Check(RdxBevel::CutBands(Q, 4, Up, Edges, 1, 1.0, Points, Pieces), "bevel cut: the square is cut along one edge");
+    Look(Count, Area, bConvex);
+    Check(Count == 3 && Points.Num == 8 && fabs(Area - 64.0 * 64.0) < 1e-6 && bConvex,
+          "bevel cut: one edge - three strips along it");
+    printf("  four edges: %d pieces, %d points; one edge: %d pieces, %d points\n", FourPieces, FourPoints, Count,
+           Points.Num);
+}
+
+static void TestEdgeBevel()
+{
+    printf("a hard edge's fine bevel\n");
+    using RdxBevel::FEdge;
+    const double Least = 0.1, Most = 2.5;
+
+    // An edge along Z: face A the top (up), reaching towards -X; face B the side, at a right angle or turned by 45
+    // degrees from the top, reaching down.
+    for (int Turn = 0; Turn < 2; Turn++)
+    {
+        const double         R  = 2.0;
+        const RdxSphere::FV3 NA = BevelPoint(0, 1, 0);
+        const RdxSphere::FV3 NB = Turn ? RdxBevel::Unit(BevelPoint(1, 1, 0)) : BevelPoint(1, 0, 0);
+        FEdge E;
+        Check(RdxBevel::MakeEdge(BevelPoint(0, 0, 0), BevelPoint(0, 0, 10), NA, NB, BevelPoint(-5, 0, 5), Least, Most, E),
+              Turn ? "bevel: a 45-degree edge is an edge" : "bevel: a right-angled edge is an edge");
+        const double         Band  = RdxBevel::BandWidth(E, R);
+        const RdxSphere::FV3 Inner = BevelPoint(0, 0, 5) + E.IntoA * Band - NA * R;
+        CheckNear((float)RdxSphere::Dot(Inner, NB), (float)-R, 1e-6f, "bevel: the round's middle is the radius in from both");
+        RdxSphere::FV3 M, N;
+        RdxSphere::FV3 P = BevelPoint(0, 0, 5) + E.IntoA * (Band * 0.999999);
+        RdxBevel::Round(&E, 1, P, R, M, N);
+        Check(RdxSphere::Length(M - P) < 1e-4, "bevel: the band's far line stays where it is");
+        P = BevelPoint(0, 0, 5) + E.IntoA * (Band * 1.01);
+        Check(RdxBevel::Round(&E, 1, P, R, M, N) == 0 && RdxSphere::Length(M - P) == 0.0,
+              "bevel: past the band nothing moves");
+        Check(RdxBevel::Round(&E, 1, BevelPoint(0, 0, 5), R, M, N) == 2, "bevel: the edge itself is in the band");
+        const RdxSphere::FV3 Bisector = RdxBevel::Unit(NA + NB);
+        CheckNear((float)RdxSphere::Length(M - (Inner + Bisector * R)), 0.0f, 1e-6f,
+                  "bevel: the edge goes to the round's middle");
+        CheckNear((float)RdxSphere::Dot(N, Bisector), 1.0f, 1e-6f, "bevel: ... and its normal is halfway between");
+        // Every point of both bands on the round, the normal turning one way across, nothing outward.
+        double Worst = 0.0, LastAngle = -1.0;
+        bool   bOrder = true, bInward = true;
+        for (int s = 0; s <= 40; s++)
+        {
+            const bool   bA     = s <= 20;
+            const double Across = (bA ? (20 - s) : (s - 20)) / 20.0 * Band * 0.999999;
+            P = BevelPoint(0, 0, 5) + (bA ? E.IntoA : E.IntoB) * Across;
+            N = bA ? NA : NB;
+            RdxBevel::Round(&E, 1, P, R, M, N);
+            const RdxSphere::FV3 Off   = M - Inner;
+            const double         Along = RdxSphere::Dot(Off, E.Way);
+            Worst = fmax(Worst, fabs(sqrt(RdxSphere::Dot(Off, Off) - Along * Along) - R));
+            const double Angle = acos(fmax(-1.0, fmin(1.0, RdxSphere::Dot(N, NA))));
+            bOrder &= Angle >= LastAngle - 1e-9;
+            LastAngle = Angle;
+            bInward &= RdxSphere::Dot(M - P, NA) <= 1e-9 && RdxSphere::Dot(M - P, NB) <= 1e-9;
+        }
+        CheckNear((float)Worst, 0.0f, 1e-6f, "bevel: every point of the band lies on the round");
+        Check(bOrder, "bevel: across the band the round turns one way only - nothing folds");
+        Check(bInward, "bevel: nothing goes outward of either face");
+        // A wall rising at the ledge's end, in line with the side above the edge: not the ledge's to round.
+        P = BevelPoint(0, 1.0, 10);
+        Check(RdxBevel::Round(&E, 1, P, R, M, N) == 0, "bevel: a wall rising beside a ledge does not follow its round");
+    }
+    // An inner edge (a floor meeting a wall going up) is none, nor a nearly flat one.
+    {
+        FEdge E;
+        Check(!RdxBevel::MakeEdge(BevelPoint(0, 0, 0), BevelPoint(0, 0, 10), BevelPoint(0, 1, 0), BevelPoint(-1, 0, 0),
+                                  BevelPoint(-5, 0, 5), Least, Most, E),
+              "bevel: an inner edge is not bevelled");
+        Check(!RdxBevel::MakeEdge(BevelPoint(0, 0, 0), BevelPoint(0, 0, 10), BevelPoint(0, 1, 0),
+                                  RdxBevel::Unit(BevelPoint(0.05, 1, 0)), BevelPoint(-5, 0, 5), Least, Most, E),
+              "bevel: a nearly flat edge is not bevelled");
+    }
+    // A plate 1.5 thick: its front between its top's and its bottom's edges has no worn solid for a radius of 1.
+    {
+        FEdge E[2];
+        RdxBevel::MakeEdge(BevelPoint(0, 0, 1.5), BevelPoint(64, 0, 1.5), BevelPoint(0, 0, 1), BevelPoint(0, -1, 0),
+                           BevelPoint(32, 32, 1.5), Least, Most, E[0]);
+        RdxBevel::MakeEdge(BevelPoint(0, 0, 0), BevelPoint(64, 0, 0), BevelPoint(0, 0, -1), BevelPoint(0, -1, 0),
+                           BevelPoint(32, 32, 0), Least, Most, E[1]);
+        RdxSphere::FV3 M, N;
+        Check(RdxBevel::Round(E, 2, BevelPoint(32, 0, 0.75), 1.0, M, N) == -1,
+              "bevel: a plate thinner than twice the radius has no worn solid");
+        Check(RdxBevel::Round(E, 2, BevelPoint(32, 0, 0.3), 0.7, M, N) > 0, "bevel: ... and a radius under half its thickness rounds it");
+    }
+    // A box: every point the radius off the worn box; the faces meet point for point, nothing turns over or leaves the
+    // box; the corner goes onto the ball of the radius round the worn box's corner.
+    char*  Folder = nullptr;
+    size_t FolderLength = 0;
+    if (_dupenv_s(&Folder, &FolderLength, "RDX_BEVEL_OBJ") != 0)
+        Folder = nullptr;
+    for (int f = 0; f < 2; f++)
+        for (int r = 0; r < 3; r++)
+        {
+            const double R = (r == 0) ? 1.0 : (r == 1) ? 2.0 : 4.0;
+            char Path[512] = "";
+            if (Folder)
+                snprintf(Path, sizeof(Path), "%s\\bevel-box-r%d-%s.obj", Folder, (int)R, f ? "fine" : "slices");
+            int    Flipped, Outside, Seams;
+            double OffRound, Corner;
+            BevelBox(64.0, 32.0, R, f != 0, Flipped, Outside, Seams, OffRound, Corner, Folder ? Path : nullptr);
+            CheckNear((float)OffRound, 0.0f, 1e-6f, "bevel: every point of a box lies the radius off the worn box");
+            Check(Seams == 0, "bevel: a box's faces still meet point for point");
+            Check(Flipped == 0, "bevel: no piece of a box's faces turns over");
+            Check(Outside == 0, "bevel: nothing of a box goes outside it");
+            CheckNear((float)Corner, (float)(R * (1.0 - 1.0 / sqrt(3.0))), 1e-6f,
+                      "bevel: a box's corner goes onto the ball round the worn corner");
+        }
+    free(Folder);
+}
+
+// The probe gathered from the picture (RdxMath::Probe*; docs/tukrozodes-szonda-terv.md): the cube's faces as Direct3D
+// lays them, there and back; the nearest point a texel keeps; a point carved out once the eye sees past it; a coarser
+// level that unknown texels do not darken; and a ray marched through what a probe in a box-shaped room holds, against
+// where the ray really leaves the room.
+static void TestProbe()
+{
+    using namespace RdxMath;
+    // There and back: every texel's middle on every face, and directions of every kind.
+    bool  bBack = true;
+    float Worst = 0.0f;
+    const int Side = 16;
+    for (int f = 0; f < 6; f++)
+        for (int y = 0; y < Side; y++)
+            for (int x = 0; x < Side; x++)
+            {
+                float U, V;
+                ProbeTexelMiddle(x, y, Side, U, V);
+                const FVec3 D = ProbeDirOf(f, U, V);
+                int   F2 = -1, X2 = -1, Y2 = -1;
+                float U2 = 0.0f, V2 = 0.0f;
+                bBack = bBack && ProbeFaceOf(D, F2, U2, V2) && F2 == f;
+                ProbeTexelOf(U2, V2, Side, X2, Y2);
+                bBack = bBack && X2 == x && Y2 == y;
+                const float E = fabsf(U2 - U) + fabsf(V2 - V);
+                Worst = (E > Worst) ? E : Worst;
+            }
+    Check(bBack && Worst < 1e-5f, "probe: a texel's direction falls back in that texel, on its own face");
+    // The faces' axes: the middle of each face looks along its own axis, as Direct3D's cube is laid out.
+    {
+        const FVec3 Axis[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+        bool bAxes = true;
+        for (int f = 0; f < 6; f++)
+        {
+            const FVec3 D = ProbeDirOf(f, 0.0f, 0.0f);
+            bAxes = bAxes && D.X == Axis[f].X && D.Y == Axis[f].Y && D.Z == Axis[f].Z;
+        }
+        int   F;
+        float U, V;
+        Check(bAxes && !ProbeFaceOf(FVec3{ 0.0f, 0.0f, 0.0f }, F, U, V),
+              "probe: each face's middle looks along its own axis; a direction of no length has no face");
+    }
+    // The nearest point wins; the same one again refreshes; a further one is behind; an unknown texel takes any.
+    {
+        FProbeTexel T = { 0.0f, { 0.0f, 0.0f, 0.0f }, 0.0f, 0 };
+        ProbeGather(T, 100.0f, FVec3{ 1.0f, 0.0f, 0.0f }, 1);
+        const bool bFirst = T.Trust == 1.0f && T.Dist == 100.0f && T.Frame == 1;
+        ProbeGather(T, 50.0f, FVec3{ 0.0f, 1.0f, 0.0f }, 2);
+        const bool bNearer = T.Dist == 50.0f && T.Colour.Y == 1.0f && T.Frame == 2;
+        ProbeGather(T, 80.0f, FVec3{ 0.0f, 0.0f, 1.0f }, 3);
+        const bool bFurther = T.Dist == 50.0f && T.Colour.Y == 1.0f && T.Frame == 2;
+        ProbeGather(T, 50.5f, FVec3{ 0.5f, 0.5f, 0.0f }, 4);
+        const bool bSame = T.Dist == 50.0f && T.Colour.X == 0.5f && T.Frame == 4;
+        Check(bFirst && bNearer && bFurther && bSame,
+              "probe: a texel keeps the nearest point, refreshes the same one, and a further one does not take it");
+    }
+    Check(ProbeCarved(100.0f, 140.0f, 4.0f) && !ProbeCarved(100.0f, 102.0f, 4.0f) && !ProbeCarved(100.0f, 60.0f, 4.0f),
+          "probe: a point is carved out where the eye sees past it, and kept where something nearer covers it");
+    {
+        const FProbeTexel Four[4] = { { 30.0f, { 1.0f, 0.0f, 0.0f }, 1.0f, 5 }, { 0.0f, { 0.0f, 0.0f, 0.0f }, 0.0f, 0 },
+                                      { 20.0f, { 0.0f, 1.0f, 0.0f }, 1.0f, 7 }, { 0.0f, { 0.0f, 0.0f, 0.0f }, 0.0f, 0 } };
+        const FProbeTexel M = ProbeMipOf(Four);
+        Check(fabsf(M.Colour.X - 0.5f) < 1e-6f && fabsf(M.Colour.Y - 0.5f) < 1e-6f && M.Colour.Z == 0.0f &&
+                  M.Trust == 0.5f && M.Dist == 20.0f && M.Frame == 7,
+              "probe: a coarser texel averages the known ones only, keeps the nearest point and the latest frame");
+    }
+    // The pyramid's levels follow one another: each starts where the six faces of the one before end.
+    {
+        int  Sum    = 0;
+        bool bStart = true;
+        for (int k = 0; k < ProbeLevels; k++)
+        {
+            bStart = bStart && ProbeLevelStart(k) == Sum;
+            Sum += 6 * (ProbeSide >> k) * (ProbeSide >> k);
+        }
+        Check(bStart && ProbeEntries() == Sum && (ProbeSide >> (ProbeLevels - 1)) == 1,
+              "probe: each level of the pyramid starts where the one before ends, and the last is a texel a face");
+    }
+    // Where it stands: before the largest pane, out on the camera's side. While the camera is near it stays, however
+    // the view turns; once the camera has gone off, a pane clearly larger than its own takes it after a while.
+    {
+        const FVec3 MidA = { 100.0f, 0.0f, 50.0f }, NormA = { -1.0f, 0.0f, 0.0f };
+        const FVec3 MidB = { 0.0f, 1600.0f, 50.0f }, NormB = { 0.0f, -1.0f, 0.0f };
+        const FVec3 EyeA = { -100.0f, 0.0f, 50.0f }, EyeB = { 0.0f, 1400.0f, 50.0f };
+        FProbePlace P;
+        // No pane in sight: it stands where the camera is, and follows it once it is off by more than the follow reach.
+        const FVec3 EyeNear = { EyeA.X + 100.0f, EyeA.Y, EyeA.Z }, EyeOff = { EyeA.X + 500.0f, EyeA.Y, EyeA.Z };
+        const bool bNone = P.Choose(EyeA) && P.bPlaced && !P.bAtPane && P.Centre.X == EyeA.X && !P.Choose(EyeNear) &&
+                           P.Choose(EyeOff) && P.Centre.X == EyeOff.X && !P.bAtPane;
+        // The first pane drawn takes it at once.
+        P.Note(MidA, NormA, 100.0f);
+        const bool bFirst = P.Choose(EyeA) && P.bPlaced && P.bAtPane && P.Centre.X == MidA.X - ProbeAhead &&
+                            P.Centre.Y == 0.0f && P.Centre.Z == MidA.Z && P.PaneNormal.X == NormA.X &&
+                            P.PaneMiddle.X == MidA.X;
+        // Near it, a far larger pane does not take it - nor with its own out of sight.
+        bool bStays = true;
+        for (int f = 0; f < 100; f++)
+        {
+            if (f & 1)
+                P.Note(MidA, NormA, 100.0f);
+            P.Note(MidB, NormB, 1000.0f);
+            bStays = bStays && !P.Choose(EyeA);
+        }
+        // Gone off: a pane not clearly larger than its own still does not.
+        for (int f = 0; f < 100; f++)
+        {
+            P.Note(MidA, NormA, 100.0f);
+            P.Note(MidB, NormB, 120.0f);
+            bStays = bStays && !P.Choose(EyeB);
+        }
+        int Moved = -1;
+        for (int f = 0; f < 2 * ProbeMoveFrames && Moved < 0; f++)
+        {
+            P.Note(MidA, NormA, 100.0f);
+            P.Note(MidB, NormB, 200.0f);
+            if (P.Choose(EyeB))
+                Moved = f + 1;
+        }
+        const bool bToB = Moved == ProbeMoveFrames && P.Centre.Y == MidB.Y - ProbeAhead && P.PaneNormal.Y == NormB.Y &&
+                          P.PaneMiddle.Y == MidB.Y;
+        // Away from the new place, its own pane out of sight a moment, then back: it does not go.
+        bool bWaits = true;
+        for (int f = 0; f < ProbeMoveFrames - 1; f++)
+        {
+            P.Note(MidA, NormA, 50.0f);
+            bWaits = bWaits && !P.Choose(EyeA);
+        }
+        P.Note(MidB, NormB, 50.0f);
+        bWaits = bWaits && !P.Choose(EyeA);
+        P.Note(MidA, NormA, 50.0f);
+        bWaits = bWaits && !P.Choose(EyeA) && P.Centre.Y == MidB.Y - ProbeAhead;
+        // The camera off, and no pane drawn: after a while it follows the camera again.
+        bool bFollows = true;
+        for (int f = 0; f < ProbeMoveFrames - 1; f++)
+            bFollows = bFollows && !P.Choose(EyeA) && P.bAtPane;
+        bFollows = bFollows && P.Choose(EyeA) && !P.bAtPane && P.Centre.X == EyeA.X && P.Centre.Y == EyeA.Y;
+        P.Forget();
+        Check(bNone && bFirst && bStays && bToB && bWaits && bFollows && !P.bPlaced,
+              "probe: with no pane it follows the camera; the first pane takes it, and it stays while the camera is "
+              "near; gone off, a clearly larger pane takes it after a while, or with none it follows the camera "
+              "again; nowhere after a new level");
+    }
+    // A box-shaped room round the probe, every texel the point where its middle's line from the centre leaves the room.
+    // Rays from places all over the room, every way: where the march says each leaves, against where it does.
+    {
+        const int   Cube   = 64;
+        const FVec3 Centre = { 0.0f, 0.0f, 0.0f };
+        const FVec3 Lo = { -200.0f, -150.0f, -100.0f }, Hi = { 300.0f, 250.0f, 120.0f };
+        auto Leaves = [&](const FVec3& S, const FVec3& R)
+        {
+            float T = 1e30f;
+            const float Sv[3] = { S.X, S.Y, S.Z }, Rv[3] = { R.X, R.Y, R.Z };
+            const float Lv[3] = { Lo.X, Lo.Y, Lo.Z }, Hv[3] = { Hi.X, Hi.Y, Hi.Z };
+            for (int a = 0; a < 3; a++)
+                if (Rv[a] != 0.0f)
+                {
+                    const float Ta = ((Rv[a] > 0.0f ? Hv[a] : Lv[a]) - Sv[a]) / Rv[a];
+                    T = (Ta < T) ? Ta : T;
+                }
+            return T;
+        };
+        static FProbeTexel Probe[6][64][64];
+        for (int f = 0; f < 6; f++)
+            for (int y = 0; y < Cube; y++)
+                for (int x = 0; x < Cube; x++)
+                {
+                    float U, V;
+                    ProbeTexelMiddle(x, y, Cube, U, V);
+                    FVec3 D = ProbeDirOf(f, U, V);
+                    const float L = sqrtf(Dot(D, D));
+                    D = FVec3{ D.X / L, D.Y / L, D.Z / L };
+                    Probe[f][y][x] = { Leaves(Centre, D), { (float)f, 0.0f, 0.0f }, 1.0f, 1 };
+                }
+        auto Lookup = [&](int f, int x, int y) { return &Probe[f][y][x]; };
+        unsigned int Seed = 12345u;
+        auto Rand = [&]() { Seed = Seed * 1664525u + 1013904223u; return (float)(Seed >> 8) / 16777216.0f; };
+        const int Rays = 4000;
+        int       Within[3] = { 0, 0, 0 };
+        const int StepsOf[3] = { 8, 12, 16 };
+        for (int r = 0; r < Rays; r++)
+        {
+            // A place in the room, a fifth of its size in from every wall; a way of any kind.
+            const FVec3 S = { Lo.X + (Hi.X - Lo.X) * (0.2f + 0.6f * Rand()), Lo.Y + (Hi.Y - Lo.Y) * (0.2f + 0.6f * Rand()),
+                              Lo.Z + (Hi.Z - Lo.Z) * (0.2f + 0.6f * Rand()) };
+            FVec3 R = { Rand() * 2.0f - 1.0f, Rand() * 2.0f - 1.0f, Rand() * 2.0f - 1.0f };
+            const float L = sqrtf(Dot(R, R));
+            if (L < 0.1f)
+                continue;
+            R = FVec3{ R.X / L, R.Y / L, R.Z / L };
+            const float Truth = Leaves(S, R);
+            const FVec3 At    = { S.X + R.X * Truth, S.Y + R.Y * Truth, S.Z + R.Z * Truth };
+            for (int k = 0; k < 3; k++)
+            {
+                float T = 0.0f;
+                if (!ProbeMarch(Centre, Cube, S, R, 900.0f, StepsOf[k], 8, Lookup, T))
+                    continue;
+                const FVec3 Got = { S.X + R.X * T, S.Y + R.Y * T, S.Z + R.Z * T };
+                const FVec3 D   = { Got.X - At.X, Got.Y - At.Y, Got.Z - At.Z };
+                // The texel spans this much at the point's distance from the centre: an error within two of them is the
+                // probe's own grain.
+                const float Grain = 2.0f * (2.0f / (float)Cube) * sqrtf(Dot(At, At));
+                Within[k] += (sqrtf(Dot(D, D)) <= 2.0f * Grain + 1.0f) ? 1 : 0;
+            }
+        }
+        Check(Within[2] >= Rays * 9 / 10 && Within[2] >= Within[0],
+              "probe: a ray marched through a box room's probe leaves where it really does, nine in ten within the "
+              "probe's grain");
+
+        // A pillar in the room, off the centre: the centre does not see behind it, and rays that meet its back or
+        // what stands behind it as the centre sees it are not to be had - most others are. And the same probe with
+        // three texels in ten unknown, scattered: a ray goes through those, and may find what lies further.
+        const FVec3 PLo = { 80.0f, 40.0f, -100.0f }, PHi = { 140.0f, 100.0f, 120.0f };
+        auto Meets = [&](const FVec3& S, const FVec3& R)
+        {
+            // The room's walls from inside, the pillar from outside: the nearest.
+            float T = Leaves(S, R);
+            float T0 = 0.0f, T1 = 1e30f;
+            const float Sv[3] = { S.X, S.Y, S.Z }, Rv[3] = { R.X, R.Y, R.Z };
+            const float Lv[3] = { PLo.X, PLo.Y, PLo.Z }, Hv[3] = { PHi.X, PHi.Y, PHi.Z };
+            bool bHit = true;
+            for (int a = 0; a < 3 && bHit; a++)
+            {
+                if (Rv[a] == 0.0f)
+                {
+                    bHit = Sv[a] >= Lv[a] && Sv[a] <= Hv[a];
+                    continue;
+                }
+                float Ta = (Lv[a] - Sv[a]) / Rv[a], Tb = (Hv[a] - Sv[a]) / Rv[a];
+                if (Ta > Tb) { const float K = Ta; Ta = Tb; Tb = K; }
+                T0 = (Ta > T0) ? Ta : T0;
+                T1 = (Tb < T1) ? Tb : T1;
+                bHit = T0 <= T1;
+            }
+            if (bHit && T0 > 0.0f && T0 < T)
+                T = T0;
+            return T;
+        };
+        auto Inside = [&](const FVec3& Q)
+        {
+            return Q.X >= PLo.X && Q.X <= PHi.X && Q.Y >= PLo.Y && Q.Y <= PHi.Y && Q.Z >= PLo.Z && Q.Z <= PHi.Z;
+        };
+        // Three probes: whole; three texels in ten unknown, scattered; and one wide patch unknown, a part of the room
+        // never seen. Three ways to read them: a texel that knows nothing stops no ray; the coarser level stands in for
+        // it; or up to three levels up, the first that knows something.
+        static FProbeTexel Coarse[3][6][32][32];
+        auto LevelOf = [&](int k, int f, int x, int y) -> const FProbeTexel*
+        {
+            return k ? &Coarse[k - 1][f][y][x] : &Probe[f][y][x];
+        };
+        // The wide patch: once where a wall faces the centre, once round a corner of the room.
+        const FVec3 PatchWays[2] = { { -0.97f, -0.2f, 0.1f }, { -0.71f, -0.53f, 0.43f } };
+        FVec3       HoleWay      = PatchWays[0];
+        const float HoleCos = cosf(15.0f * 3.14159265f / 180.0f);
+        const int   UpOf[3] = { 0, 1, 3 };
+        const int   StepsOf2[2] = { 8, 16 };
+        for (int Holes = 0; Holes <= 3; Holes++)
+        {
+            {
+                const FVec3 W = PatchWays[(Holes == 3) ? 1 : 0];
+                const float L = sqrtf(Dot(W, W));
+                HoleWay = FVec3{ W.X / L, W.Y / L, W.Z / L };
+            }
+            for (int f = 0; f < 6; f++)
+                for (int y = 0; y < Cube; y++)
+                    for (int x = 0; x < Cube; x++)
+                    {
+                        float U, V;
+                        ProbeTexelMiddle(x, y, Cube, U, V);
+                        FVec3 D = ProbeDirOf(f, U, V);
+                        const float L = sqrtf(Dot(D, D));
+                        D = FVec3{ D.X / L, D.Y / L, D.Z / L };
+                        Probe[f][y][x] = { Meets(Centre, D), { (float)f, 0.0f, 0.0f }, 1.0f, 1 };
+                        if ((Holes == 1 && Rand() < 0.3f) || (Holes >= 2 && Dot(D, HoleWay) > HoleCos))
+                            Probe[f][y][x].Trust = 0.0f;
+                    }
+            for (int k = 1; k <= 3; k++)
+                for (int f = 0; f < 6; f++)
+                    for (int y = 0; y < (Cube >> k); y++)
+                        for (int x = 0; x < (Cube >> k); x++)
+                        {
+                            const FProbeTexel Four[4] = { *LevelOf(k - 1, f, 2 * x, 2 * y), *LevelOf(k - 1, f, 2 * x + 1, 2 * y),
+                                                          *LevelOf(k - 1, f, 2 * x, 2 * y + 1),
+                                                          *LevelOf(k - 1, f, 2 * x + 1, 2 * y + 1) };
+                            Coarse[k - 1][f][y][x] = ProbeMipOf(Four);
+                        }
+            int Tried = 0, TriedIn = 0;
+            int Found[3][2] = {}, Fine[3][2] = {}, Near[3][2] = {}, FineIn[3][2] = {}, NearIn[3][2] = {}, FoundIn[3][2] = {};
+            for (int r = 0; r < Rays; r++)
+            {
+                const FVec3 S = { Lo.X + (Hi.X - Lo.X) * (0.2f + 0.6f * Rand()), Lo.Y + (Hi.Y - Lo.Y) * (0.2f + 0.6f * Rand()),
+                                  Lo.Z + (Hi.Z - Lo.Z) * (0.2f + 0.6f * Rand()) };
+                if (Inside(S))
+                    continue;
+                FVec3 R = { Rand() * 2.0f - 1.0f, Rand() * 2.0f - 1.0f, Rand() * 2.0f - 1.0f };
+                if (Holes >= 2)
+                {
+                    // Aimed at what the centre sees inside the patch.
+                    FVec3 D;
+                    do
+                    {
+                        D = FVec3{ HoleWay.X + (Rand() - 0.5f) * 0.6f, HoleWay.Y + (Rand() - 0.5f) * 0.6f,
+                                   HoleWay.Z + (Rand() - 0.5f) * 0.6f };
+                        const float LD = sqrtf(Dot(D, D));
+                        D = FVec3{ D.X / LD, D.Y / LD, D.Z / LD };
+                    } while (Dot(D, HoleWay) <= HoleCos);
+                    const float TW = Meets(Centre, D);
+                    R = FVec3{ D.X * TW - S.X, D.Y * TW - S.Y, D.Z * TW - S.Z };
+                }
+                const float L = sqrtf(Dot(R, R));
+                if (L < 0.1f)
+                    continue;
+                R = FVec3{ R.X / L, R.Y / L, R.Z / L };
+                Tried++;
+                const float Truth = Meets(S, R);
+                const FVec3 At    = { S.X + R.X * Truth, S.Y + R.Y * Truth, S.Z + R.Z * Truth };
+                const float AtLen = sqrtf(Dot(At, At));
+                const bool  bIn   = Dot(At, HoleWay) > HoleCos * AtLen;
+                TriedIn += bIn ? 1 : 0;
+                const float Grain = 2.0f * (2.0f / (float)Cube) * AtLen;
+                for (int m = 0; m < 3; m++)
+                {
+                    const int Up = UpOf[m];
+                    auto Read = [&](int f, int x, int y) -> const FProbeTexel*
+                    {
+                        for (int k = 0; k <= Up; k++)
+                        {
+                            const FProbeTexel* T = LevelOf(k, f, x >> k, y >> k);
+                            if (T->Trust > 0.0f)
+                                return T;
+                        }
+                        return &Probe[f][y][x];
+                    };
+                    for (int k = 0; k < 2; k++)
+                    {
+                        float T = 0.0f;
+                        if (!ProbeMarch(Centre, Cube, S, R, 900.0f, StepsOf2[k], 8, Read, T))
+                            continue;
+                        const FVec3 Got = { S.X + R.X * T, S.Y + R.Y * T, S.Z + R.Z * T };
+                        const FVec3 D   = { Got.X - At.X, Got.Y - At.Y, Got.Z - At.Z };
+                        const float E   = sqrtf(Dot(D, D));
+                        Found[m][k]++;
+                        Fine[m][k] += (E <= 2.0f * Grain + 1.0f) ? 1 : 0;
+                        Near[m][k] += (E <= 8.0f * Grain + 1.0f) ? 1 : 0;
+                        if (bIn)
+                        {
+                            FoundIn[m][k]++;
+                            FineIn[m][k] += (E <= 2.0f * Grain + 1.0f) ? 1 : 0;
+                            NearIn[m][k] += (E <= 8.0f * Grain + 1.0f) ? 1 : 0;
+                        }
+                    }
+                }
+            }
+            if (Holes == 0)
+                Check(Found[0][0] == Tried && Fine[0][0] >= Tried * 8 / 10 && Fine[1][0] == Fine[0][0] &&
+                          Fine[2][0] == Fine[0][0] && Fine[2][1] == Fine[0][1],
+                      "probe: with a pillar the centre cannot see behind, four rays in five still leave where they do; "
+                      "where every texel is known, the coarser levels change nothing");
+            else if (Holes == 1)
+                Check(Fine[0][0] >= Tried * 45 / 100 && Fine[0][1] >= Fine[0][0] && Fine[1][0] >= Tried * 78 / 100 &&
+                          Fine[1][1] >= Tried * 78 / 100 && Fine[2][0] >= Fine[1][0] * 99 / 100,
+                      "probe: with scattered unknown texels nearly half the rays still leave where they do; with the "
+                      "coarser level standing in, as many as with none unknown");
+            else
+                Check(NearIn[2][0] >= TriedIn * ((Holes == 2) ? 75 : 65) / 100 && NearIn[2][0] > NearIn[1][0] &&
+                          NearIn[1][0] >= NearIn[0][0] && FineIn[2][0] >= TriedIn * ((Holes == 2) ? 60 : 40) / 100,
+                      "probe: into a wide unknown patch, three levels up stand in well enough - most rays end near "
+                      "where they do, against a fifth with none");
+        }
+    }
+}
+
 static void TestTrees()
 {
     using namespace RdxTree;
@@ -6269,13 +8658,63 @@ static void TestTrees()
         Check(bGrown, "trees: every kind grows and builds");
         if (!bGrown)
             continue;
-        Check(Plant.Nodes.Num > 100 && Plant.Leaves.Num > 1000 && Mesh.BarkIndex.Num > 0 &&
-                  Mesh.Leaf.Num == Plant.Leaves.Num,
+        // A plant grown stem by stem (StemPlant) has a few stems and some tens of leaves, a crown's hundreds of
+        // branches and thousands.
+        const bool bStem = IsStemPlant((EKind)k);
+        Check((bStem ? Plant.Nodes.Num > 10 && Plant.Leaves.Num > 15 : Plant.Nodes.Num > 100 && Plant.Leaves.Num > 1000) &&
+                  Mesh.BarkIndex.Num > 0 && Mesh.Leaf.Num == Plant.Leaves.Num,
               "trees: a plant has branches and leaves, every leaf an instance of the blade");
         bool bIndices = (Mesh.BarkIndex.Num % 3) == 0;
         for (int i = 0; i < Mesh.BarkIndex.Num; i++)
             bIndices = bIndices && (int)Mesh.BarkIndex[i] < Mesh.Bark.Num;
         Check(bIndices, "trees: whole triangles, every index a vertex of its own list");
+        {
+            // Its bark far off (Build's bPlain and Least, a far plant's at the trees' lower levels): whole triangles of
+            // its own vertices and no leaves, nowhere out of the whole bark's room; only the wood from two twigs'
+            // radius on a tree's a fifth of the whole's faces at the most - the thinner wood is most of the bark - and
+            // from four no more than from two. EZ-Tree's way the same from the same seed: the same plant, its far bark
+            // no more than its whole.
+            float Lo[3] = { 1e9f, 1e9f, 1e9f }, Hi[3] = { -1e9f, -1e9f, -1e9f };
+            for (int i = 0; i < Mesh.Bark.Num; i++)
+            {
+                const float P[3] = { Mesh.Bark[i].X, Mesh.Bark[i].Y, Mesh.Bark[i].Z };
+                for (int c = 0; c < 3; c++)
+                {
+                    Lo[c] = (P[c] < Lo[c]) ? P[c] : Lo[c];
+                    Hi[c] = (P[c] > Hi[c]) ? P[c] : Hi[c];
+                }
+            }
+            FMesh Far[2];
+            bool  bFar = true;
+            for (int f = 0; f < 2; f++)
+            {
+                bFar = bFar && Build(Plant, Far[f], 64.0f, true, S.Twig * (f ? 4.0f : 2.0f)) &&
+                       (Far[f].BarkIndex.Num % 3) == 0 && Far[f].Leaf.Num == 0;
+                for (int i = 0; bFar && i < Far[f].BarkIndex.Num; i++)
+                    bFar = (int)Far[f].BarkIndex[i] < Far[f].Bark.Num;
+                for (int i = 0; bFar && i < Far[f].Bark.Num; i++)
+                {
+                    const float P[3] = { Far[f].Bark[i].X, Far[f].Bark[i].Y, Far[f].Bark[i].Z };
+                    for (int c = 0; c < 3; c++)
+                        bFar = bFar && P[c] >= Lo[c] - 1.0f && P[c] <= Hi[c] + 1.0f;
+                }
+            }
+            Check(bFar && Far[1].BarkIndex.Num <= Far[0].BarkIndex.Num &&
+                      (bBush ? Far[0].BarkIndex.Num <= Mesh.BarkIndex.Num
+                             : Far[0].BarkIndex.Num > 0 && 5 * Far[0].BarkIndex.Num <= Mesh.BarkIndex.Num),
+                  "trees: the far bark - whole triangles, no leaves, within the whole bark's room; from two twigs' "
+                  "radius on a tree's a fifth of the whole at the most, from four no more");
+            if (EzGrows((EKind)k))
+            {
+                FPlant EzPlant, EzAgain;
+                FMesh  EzMesh, EzFar;
+                const bool bEz = GrowEz(S, 1234u, EzPlant, EzMesh, 64.0f) &&
+                                 GrowEz(S, 1234u, EzAgain, EzFar, 64.0f, S.Twig * 2.0f);
+                Check(bEz && EzAgain.Nodes.Num == EzPlant.Nodes.Num && EzFar.Leaf.Num == 0 && EzFar.BarkIndex.Num > 0 &&
+                          EzFar.BarkIndex.Num <= EzMesh.BarkIndex.Num,
+                      "trees: EZ-Tree's far bark - the same plant, no leaves, no more than its whole bark");
+            }
+        }
         float Low = 1e9f, High = -1e9f, Wide = 0.0f;
         for (int i = 0; i < Mesh.Leaf.Num; i++)
         {
@@ -6285,7 +8724,9 @@ static void TestTrees()
             const float D = sqrtf(V.X * V.X + V.Y * V.Y);
             Wide = (D > Wide) ? D : Wide;
         }
-        Check(High < Height * 1.15f && High > Height * 0.7f && Wide < Radius * 1.6f && Wide > Radius * 0.5f,
+        // A pink's or a lily's stems stand narrower than the room: it is no crown.
+        Check(High < Height * 1.15f && High > Height * (bStem ? 0.5f : 0.7f) && Wide < Radius * 1.6f &&
+                  (bStem || Wide > Radius * 0.5f),
               "trees: the leaves fill about the room the plant was given, no further");
         // A card's corner reaches half its size below its middle, which stands within a step of its twig.
         Check(Low > S.CrownBase * Height * 0.85f - S.LeafSize - S.Step, "trees: no leaves below the crown");
@@ -6293,7 +8734,22 @@ static void TestTrees()
         for (int i = 0; i < Plant.Nodes.Num; i++)
             if (Plant.Nodes[i].Parent < 0 && Plant.Nodes[i].Radius > Foot)
                 Foot = Plant.Nodes[i].Radius;
-        Check(Foot > S.Twig * 3.0f, "trees: the foot of the stems thicker than a twig");
+        // A stem plant's stems as thin as a flower's, but every node of theirs drawn - a stem with no child as thick as
+        // Build draws one - so a stem reaches its flower.
+        bool bDrawn = true;
+        for (int i = 0; bStem && i < Plant.Nodes.Num; i++)
+            bDrawn = bDrawn && Plant.Nodes[i].Radius >= S.Twig * 1.25f;
+        Check(bStem ? (Foot >= S.Twig * 1.25f && bDrawn) : Foot > S.Twig * 3.0f,
+              "trees: the foot of the stems thicker than a twig");
+        // A lily's and a pink's flowers: their petals first among the leaves (PetalsOf), a lily's six, a pink's five, a
+        // stem's each.
+        if (k == Kind_Lily || k == Kind_Pink)
+        {
+            int Stems = 0;
+            for (int i = 0; i < Plant.Nodes.Num; i++)
+                Stems += (Plant.Nodes[i].Parent < 0) ? 1 : 0;
+            Check(PetalsOf(Mesh) == Stems * ((k == Kind_Lily) ? 6 : 5), "trees: a lily's and a pink's flowers, one a stem");
+        }
         Check(Grow(S, 1234u, Again, Grid) && Again.Nodes.Num == Plant.Nodes.Num && Again.Leaves.Num == Plant.Leaves.Num &&
               Again.Nodes[Again.Nodes.Num - 1].At.X == Plant.Nodes[Plant.Nodes.Num - 1].At.X,
               "trees: the same seed, the same plant");
@@ -6912,6 +9368,12 @@ int main(int argc, char** argv)
     TestSplashView();
     TestGrass();
     TestTrees();
+    TestMeshRound();
+    TestLevelRound();
+    TestLevelHold();
+    TestEdgeBevel();
+    TestBevelCut();
+    TestProbe();
 
     printf("\n%d checks, %d failed\n", GChecks, GFailed);
     if (argc > 1 && strcmp(argv[1], "measure") == 0)

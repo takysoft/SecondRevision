@@ -87,6 +87,21 @@ struct FSpot
     DWORD64 Start;      // the function's first byte, or the module's base where no symbol is known
     LONG    Count;
     char    Name[160];
+    UBOOL   bOwn;       // a function of ours, by our symbols: its lines can be told too
+};
+// One address the samples fell on, how often, and the first byte of its function (FSpot::Start).
+struct FPlaceRun
+{
+    DWORD   Place;
+    LONG    Count;
+    DWORD64 Start;
+};
+// A line of one of our functions, and the samples that fell on it.
+struct FLineCount
+{
+    DWORD Line;
+    LONG  Count;
+    char  File[48];
 };
 }
 
@@ -98,7 +113,7 @@ void RdxCpuSamplerFrame(double Seconds, int Top, const char* Label)
     const LONG Count = GCount;
     if (!GSymbols)
     {
-        ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         GSymbols = ::SymInitialize(::GetCurrentProcess(), nullptr, TRUE) ? 1 : 0;
     }
     // The places by address, and each run of one address once to its function.
@@ -106,6 +121,10 @@ void RdxCpuSamplerFrame(double Seconds, int Top, const char* Label)
     static FSpot* Spots     = nullptr;
     static INT    SpotRoom  = 0;
     INT           SpotCount = 0;
+    // Each address once, for our functions' lines below.
+    static FPlaceRun* Runs    = nullptr;
+    static INT        RunRoom = 0;
+    INT               RunCount = 0;
     char          SymBuf[sizeof(SYMBOL_INFO) + 256];
     SYMBOL_INFO*  Sym = (SYMBOL_INFO*)SymBuf;
     for (LONG i = 0; i < Count;)
@@ -143,11 +162,13 @@ void RdxCpuSamplerFrame(double Seconds, int Top, const char* Label)
         UBOOL bEngine = 0;
         for (INT e = 0; e < (INT)ARRAY_COUNT(Engine) && !bEngine; e++)
             bEngine = lstrcmpiA(ModName, Engine[e]) == 0;
+        UBOOL bOwn = 0;
         if (!bEngine && GSymbols && ::SymFromAddr(::GetCurrentProcess(), (DWORD64)GPlaces[i], &Off, Sym) &&
             Off < 0x10000)
         {
             Start = Sym->Address;
             wsprintfA(Name, "%.40s!%.110s", ModName[0] ? ModName : "?", Sym->Name);
+            bOwn = lstrcmpiA(ModName, "SecondRevision.dll") == 0;
         }
         else
         {
@@ -172,10 +193,31 @@ void RdxCpuSamplerFrame(double Seconds, int Top, const char* Label)
             }
             Spots[s].Start = Start;
             Spots[s].Count = 0;
+            Spots[s].bOwn  = bOwn;
             lstrcpynA(Spots[s].Name, Name, 160);
             SpotCount++;
         }
         Spots[s].Count += j - i;
+        if (bOwn)
+        {
+            if (RunCount >= RunRoom)
+            {
+                const INT        Room = Max(RunRoom * 2, 4096);
+                FPlaceRun* const More = (FPlaceRun*)appRealloc(Runs, Room * sizeof(FPlaceRun), TEXT("RdxCpuRuns"));
+                if (More)
+                {
+                    Runs    = More;
+                    RunRoom = Room;
+                }
+            }
+            if (RunCount < RunRoom)
+            {
+                Runs[RunCount].Place = GPlaces[i];
+                Runs[RunCount].Count = j - i;
+                Runs[RunCount].Start = Start;
+                RunCount++;
+            }
+        }
         i = j;
     }
     std::sort(Spots, Spots + SpotCount, [](const FSpot& A, const FSpot& B) { return A.Count > B.Count; });
@@ -230,6 +272,59 @@ void RdxCpuSamplerFrame(double Seconds, int Top, const char* Label)
     }
     lstrcatA(Line, "\n");
     RdxLogLineFromAnyThread(Line);
+    // Our busiest functions line by line: the lines of each that the most samples fell on.
+    if (GSymbols)
+    {
+        for (INT s = 0, Shown = 0; s < SpotCount && Shown < 10; s++)
+        {
+            if (!Spots[s].bOwn)
+                continue;
+            Shown++;
+            FLineCount Lines[96];
+            INT        LineCount = 0;
+            for (INT r = 0; r < RunCount; r++)
+            {
+                if (Runs[r].Start != Spots[s].Start)
+                    continue;
+                IMAGEHLP_LINE64 L;
+                appMemzero(&L, sizeof(L));
+                L.SizeOfStruct = sizeof(L);
+                DWORD Disp     = 0;
+                DWORD Number   = 0;
+                const char* File = "?";
+                if (::SymGetLineFromAddr64(::GetCurrentProcess(), (DWORD64)Runs[r].Place, &Disp, &L))
+                {
+                    Number = L.LineNumber;
+                    File   = L.FileName ? L.FileName : "?";
+                    for (const char* p = File; *p; p++)
+                        if (*p == '\\' || *p == '/')
+                            File = p + 1;
+                }
+                INT k = 0;
+                while (k < LineCount && !(Lines[k].Line == Number && lstrcmpA(Lines[k].File, File) == 0))
+                    k++;
+                if (k == LineCount)
+                {
+                    if (LineCount >= 96)
+                        continue;
+                    Lines[k].Line  = Number;
+                    Lines[k].Count = 0;
+                    lstrcpynA(Lines[k].File, File, 48);
+                    LineCount++;
+                }
+                Lines[k].Count += Runs[r].Count;
+            }
+            std::sort(Lines, Lines + LineCount,
+                      [](const FLineCount& A, const FLineCount& B) { return A.Count > B.Count; });
+            for (INT k = 0; k < LineCount && k < 8; k++)
+            {
+                const LONG Tenths = (LONG)((LONGLONG)Lines[k].Count * 1000 / Max((LONG)1, Count));
+                wsprintfA(Line, "cpu samples, by line:   %3ld.%ld%%  %.70s  %s:%lu\n", Tenths / 10, Tenths % 10,
+                          Spots[s].Name, Lines[k].File, Lines[k].Line);
+                RdxLogLineFromAnyThread(Line);
+            }
+        }
+    }
     GCount     = 0;
     GFirstTick = ::GetTickCount();
     ::InterlockedExchange(&GPaused, 0);

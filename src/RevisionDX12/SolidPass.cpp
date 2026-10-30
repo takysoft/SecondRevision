@@ -27,6 +27,9 @@
 #include "SolidPassRtAskGlassMirrorPS.h"
 #include "SolidPassRtHostGlassMirrorPS.h"
 #include "SolidPassRtHostGlassMirrorPSLit.h"
+#include "SolidPassRtAskWetMirrorPS.h"
+#include "SolidPassRtHostWetMirrorPS.h"
+#include "SolidPassRtHostWetMirrorPSLit.h"
 #include "SolidPassRtHostPS.h"
 #include "SolidPassRtHostPSLit.h"
 #include "SolidPassRtAskPS.h"
@@ -97,8 +100,9 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     // The water's views (BLEND_Water): the picture, the depth, the ripples and the texture's own wave field, side by side
     // in the texture heap's reserved views.
     // The caustics' net after them (t13): a second range of the same table, which costs a root signature nothing - the
-    // RT water's has no room for another parameter.
-    D3D12_DESCRIPTOR_RANGE WaterRange[2];
+    // RT water's has no room for another parameter. And the mirror probe's pyramid and the own body's picture after
+    // that (t21, t22), for the glass's layer where no rays run, the same way.
+    D3D12_DESCRIPTOR_RANGE WaterRange[3];
     appMemzero(WaterRange, sizeof(WaterRange));
     WaterRange[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     WaterRange[0].NumDescriptors     = 4;
@@ -106,7 +110,11 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     WaterRange[1].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     WaterRange[1].NumDescriptors     = 1;
     WaterRange[1].BaseShaderRegister = 13;
-    WaterRange[1].OffsetInDescriptorsFromTableStart = 4;
+    WaterRange[1].OffsetInDescriptorsFromTableStart = WATER_VIEW_NET;
+    WaterRange[2].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    WaterRange[2].NumDescriptors     = 2;
+    WaterRange[2].BaseShaderRegister = 21;
+    WaterRange[2].OffsetInDescriptorsFromTableStart = WATER_VIEW_PROBE;
 
     // The water's own depth, which the see-through water writes (u3 - shader model 5.0 numbers a pixel shader's UAVs
     // after its outputs, FTargetSwitch::WaterSurfaceView): a table, as its view sits in the texture heap. Last in both
@@ -115,8 +123,9 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     // 64-bit host (SetRayListViews): the pixels' heads and the requests (u4, u5), as far after the depth's view in
     // the texture heap as the backend put them. The signature has no room for a parameter more.
     // In both, a range for what the shadows' apply pass needs of the water's pixels (u6, WaterShade), as far after the
-    // depth's view as SetWaterShadeView says.
-    D3D12_DESCRIPTOR_RANGE SurfaceRange[3];
+    // depth's view as SetWaterShadeView says. And in the rays' signature the list Reflections=RTLow's pixels write
+    // into instead (u7, FRaySparse), the same way.
+    D3D12_DESCRIPTOR_RANGE SurfaceRange[4];
     appMemzero(SurfaceRange, sizeof(SurfaceRange));
     SurfaceRange[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     SurfaceRange[0].NumDescriptors     = 1;
@@ -129,7 +138,27 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     SurfaceRange[2].NumDescriptors     = 2;
     SurfaceRange[2].BaseShaderRegister = 4;
     SurfaceRange[2].OffsetInDescriptorsFromTableStart = (UINT)RayHeadsAfterSurface;
-    const UBOOL bRayList = (bRt && RayHeadsAfterSurface > 0 && RayAnswersAfterMasks > 1) ? 1 : 0;
+    SurfaceRange[3].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    SurfaceRange[3].NumDescriptors     = 1;
+    SurfaceRange[3].BaseShaderRegister = 7;
+    SurfaceRange[3].OffsetInDescriptorsFromTableStart = (UINT)RayLowAfterSurface;
+    const UBOOL bRayList = (bRt && RayHeadsAfterSurface > 0 && RayAnswersAfterMasks > 1 && RayLowAfterSurface > 0 &&
+                            RayCornersAfterMasks > 1) ? 1 : 0;
+    // In the pass's own signature, where the rays' ranges are not, the wet floors' mark (u4, FBackend's WetMark) as far
+    // after the depth's view as SetWetMarkView says - written by the wet floors' runs (PSMainWet) -, and the rain's cover
+    // over them (t27, FBackend::SetWetCover) the same way, which those runs read.
+    D3D12_DESCRIPTOR_RANGE OwnSurfaceRange[4];
+    OwnSurfaceRange[0] = SurfaceRange[0];
+    OwnSurfaceRange[1] = SurfaceRange[1];
+    OwnSurfaceRange[2] = SurfaceRange[0];
+    OwnSurfaceRange[2].BaseShaderRegister                = 4;
+    OwnSurfaceRange[2].OffsetInDescriptorsFromTableStart = (UINT)WetMarkAfterSurface;
+    OwnSurfaceRange[3] = SurfaceRange[0];
+    OwnSurfaceRange[3].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    OwnSurfaceRange[3].BaseShaderRegister                = 27;
+    OwnSurfaceRange[3].OffsetInDescriptorsFromTableStart = (UINT)WetCoverAfterSurface;
+    const UBOOL bWetRange   = (!bRt && WetMarkAfterSurface > 0) ? 1 : 0;
+    const UBOOL bCoverRange = (bWetRange && WetCoverAfterSurface > 0) ? 1 : 0;
 
     D3D12_ROOT_PARAMETER Params[14];
     appMemzero(Params, sizeof(Params));
@@ -158,7 +187,7 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     Params[3].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;      // the water's domain shader reads them too
 
     Params[4].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    Params[4].DescriptorTable.NumDescriptorRanges = 2;
+    Params[4].DescriptorTable.NumDescriptorRanges = 3;
     Params[4].DescriptorTable.pDescriptorRanges   = WaterRange;
     Params[4].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;      // the domain shader lifts by the fields
 
@@ -179,8 +208,10 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     // and what the rays passed (t16, t17), as far after the masks' view as the backend put them - the pixels' heads
     // are in the masks' own place there.
     // And the own lamps' table and maps (t18, t19, SetOwnLampViews), as far after the masks' view as the backend put
-    // them: a range of that table, which costs the full signature nothing.
-    D3D12_DESCRIPTOR_RANGE MaskRange[4];
+    // them: a range of that table, which costs the full signature nothing. And for the builds that read the answers
+    // the corners the rays are traced against (t23..t25, SetRayListViews), the same way.
+    // And the wet floors' mark (t26, SetWetMarkView), for their layer on rays (WetMirror), the same way.
+    D3D12_DESCRIPTOR_RANGE MaskRange[6];
     appMemzero(MaskRange, sizeof(MaskRange));
     MaskRange[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     MaskRange[0].NumDescriptors     = 1;
@@ -197,6 +228,19 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     MaskRange[3].NumDescriptors     = 2;
     MaskRange[3].BaseShaderRegister = 16;
     MaskRange[3].OffsetInDescriptorsFromTableStart = (UINT)RayAnswersAfterMasks;
+    MaskRange[4].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    MaskRange[4].NumDescriptors     = 3;
+    MaskRange[4].BaseShaderRegister = 23;
+    MaskRange[4].OffsetInDescriptorsFromTableStart = (UINT)RayCornersAfterMasks;
+    UINT MaskRanges = bRayList ? 5u : 3u;
+    if (bRt && WetMarkSrvAfterMasks > 1)
+    {
+        MaskRange[MaskRanges].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        MaskRange[MaskRanges].NumDescriptors                    = 1;
+        MaskRange[MaskRanges].BaseShaderRegister                = 26;
+        MaskRange[MaskRanges].OffsetInDescriptorsFromTableStart = (UINT)WetMarkSrvAfterMasks;
+        MaskRanges++;
+    }
     D3D12_DESCRIPTOR_RANGE HeapRange;
     appMemzero(&HeapRange, sizeof(HeapRange));
     HeapRange.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -214,7 +258,7 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     Params[9].ParameterType              = D3D12_ROOT_PARAMETER_TYPE_SRV;
     Params[9].Descriptor.ShaderRegister  = 8;
     Params[10].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    Params[10].DescriptorTable.NumDescriptorRanges = bRayList ? 4 : 3;
+    Params[10].DescriptorTable.NumDescriptorRanges = MaskRanges;
     Params[10].DescriptorTable.pDescriptorRanges   = MaskRange;
     Params[11].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     Params[11].Descriptor.ShaderRegister = 10;
@@ -241,8 +285,8 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
     D3D12_ROOT_PARAMETER& Surface = Params[bRt ? ROOT_WATER_UAV_RT : ROOT_WATER_UAV];
     appMemzero(&Surface, sizeof(Surface));
     Surface.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    Surface.DescriptorTable.NumDescriptorRanges = bRayList ? 3 : 2;
-    Surface.DescriptorTable.pDescriptorRanges   = SurfaceRange;
+    Surface.DescriptorTable.NumDescriptorRanges = bRayList ? 4 : (bCoverRange ? 4 : (bWetRange ? 3 : 2));
+    Surface.DescriptorTable.pDescriptorRanges   = bRt ? SurfaceRange : OwnSurfaceRange;
     Surface.ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
     // The flashlight's block (b4, SetBeam), in the pass's own root signature after everything else it has; and the
     // mirrors' map after it (t15, SetBounceView), with the own lamps' table and maps a range of the same table (t18,
@@ -267,6 +311,16 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
         Params[ROOT_BOUNCE].DescriptorTable.NumDescriptorRanges = 2;
         Params[ROOT_BOUNCE].DescriptorTable.pDescriptorRanges   = BounceRange;
         Params[ROOT_BOUNCE].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+        // The spherifier's field (t20, SetSphereField), for the relief's domain shader: two DWORDs more, 58 of the 64.
+        appMemzero(&Params[ROOT_SPHERE], sizeof(Params[ROOT_SPHERE]));
+        Params[ROOT_SPHERE].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        Params[ROOT_SPHERE].Descriptor.ShaderRegister = 20;
+        Params[ROOT_SPHERE].ShaderVisibility          = D3D12_SHADER_VISIBILITY_DOMAIN;
+        // The wet floors' block (b5, SetWetBlocks): two more, 60 of the 64.
+        appMemzero(&Params[ROOT_WET], sizeof(Params[ROOT_WET]));
+        Params[ROOT_WET].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        Params[ROOT_WET].Descriptor.ShaderRegister = 5;
+        Params[ROOT_WET].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
     }
 
     // Anisotropic, 16x - the stock renderer's own setting (Anisotropy=16) - with wrap,
@@ -296,7 +350,7 @@ UBOOL FSolidPass::MakeRoot(ID3D12Device* Device, UBOOL bRt, TComRef<ID3D12RootSi
 
     D3D12_ROOT_SIGNATURE_DESC Desc;
     appMemzero(&Desc, sizeof(Desc));
-    Desc.NumParameters     = bRt ? (ROOT_WATER_UAV_RT + 1) : (ROOT_BOUNCE + 1);
+    Desc.NumParameters     = bRt ? (ROOT_WATER_UAV_RT + 1) : (ROOT_WET + 1);
     Desc.pParameters       = Params;
     Desc.NumStaticSamplers = 2;
     Desc.pStaticSamplers   = Samplers;
@@ -403,6 +457,36 @@ void FSolidPass::MakeTree(ID3D12Device* Device, const D3D12_GRAPHICS_PIPELINE_ST
         RdxLog(TEXT("the trees' pipeline could not be made (0x%08X) - the game's own plants"), (UINT)Made);
         TreePipelines[0].Release();
         TreePipelines[1].Release();
+    }
+    // The bark's relief made real: the same with the patch stages, its triangles as patches of three.
+    TreePatchPipelines[0].Release();
+    TreePatchPipelines[1].Release();
+    if (SUCCEEDED(Made) && TreePatchVs && TreeHs && TreeDs)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC Patch = Desc;
+        Patch.VS.pShaderBytecode    = TreePatchVs->GetBufferPointer();
+        Patch.VS.BytecodeLength     = TreePatchVs->GetBufferSize();
+        Patch.HS.pShaderBytecode    = TreeHs->GetBufferPointer();
+        Patch.HS.BytecodeLength     = TreeHs->GetBufferSize();
+        Patch.DS.pShaderBytecode    = TreeDs->GetBufferPointer();
+        Patch.DS.BytecodeLength     = TreeDs->GetBufferSize();
+        Patch.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        Patch.SampleDesc.Count      = 1;
+        HRESULT PatchMade = Device->CreateGraphicsPipelineState(&Patch, __uuidof(ID3D12PipelineState),
+                                                                TreePatchPipelines[0].VoidSlot());
+        if (SUCCEEDED(PatchMade) && MsaaSamples > 1)
+        {
+            Patch.SampleDesc.Count = (UINT)MsaaSamples;
+            PatchMade = Device->CreateGraphicsPipelineState(&Patch, __uuidof(ID3D12PipelineState),
+                                                            TreePatchPipelines[1].VoidSlot());
+        }
+        if (FAILED(PatchMade))
+        {
+            RdxLog(TEXT("the bark's relief pipeline could not be made (0x%08X) - its relief is its shading alone"),
+                   (UINT)PatchMade);
+            TreePatchPipelines[0].Release();
+            TreePatchPipelines[1].Release();
+        }
     }
     // The leaves': each instance a leaf (TreeGen.h's FLeafInstance, 56 bytes), the corner its vertex's number.
     LeafPipelines[0].Release();
@@ -560,6 +644,16 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
                Error ? appFromAnsi((const ANSICHAR*)Error->GetBufferPointer()) : TEXT("(no message)"));
         return 0;
     }
+    // The wet floors' (PSMainWet; PSMainLitSurfaceWet with the shadows' targets): without it they are drawn dry.
+    TComRef<ID3DBlob> PsWet;
+    if (FAILED(RdxCompile(GSolidPassText, Len, "GeometryPass", Macros, nullptr,
+                          bStencilKinds ? "PSMainLitSurfaceWet" : "PSMainWet", "ps_5_0", Flags, 0, PsWet.Slot(),
+                          Error.Slot())))
+    {
+        RdxLog(TEXT("wet floors: their pixel shader failed - they are drawn dry: %s"),
+               Error ? appFromAnsi((const ANSICHAR*)Error->GetBufferPointer()) : TEXT("(no message)"));
+        PsWet.Release();
+    }
     // Grass3D: the blades' vertex shader (GrassShader.h), taken by the opaque pipeline's copy below (MakeGrass). Without
     // it there is no grass, and nothing else changes.
     GrassVs.Release();
@@ -578,6 +672,23 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
         RdxLog(TEXT("the trees' vertex shader failed - the game's own plants: %s"),
                Error ? appFromAnsi((const ANSICHAR*)Error->GetBufferPointer()) : TEXT("(no message)"));
         TreeVs.Release();
+    }
+    // The bark's relief made real (TreeShader.h's patch stages): without them the bark's relief is its shading alone.
+    TreePatchVs.Release();
+    TreeHs.Release();
+    TreeDs.Release();
+    if (FAILED(RdxCompile(GTreeShader, strlen(GTreeShader), "TreePatch", nullptr, nullptr, "VSTreePatch", "vs_5_0",
+                          Flags, 0, TreePatchVs.Slot(), Error.Slot())) ||
+        FAILED(RdxCompile(GTreeShader, strlen(GTreeShader), "TreeHull", nullptr, nullptr, "HSTree", "hs_5_0", Flags, 0,
+                          TreeHs.Slot(), Error.Slot())) ||
+        FAILED(RdxCompile(GTreeShader, strlen(GTreeShader), "TreeDomain", nullptr, nullptr, "DSTree", "ds_5_0", Flags, 0,
+                          TreeDs.Slot(), Error.Slot())))
+    {
+        RdxLog(TEXT("the bark's relief stages failed - its relief is its shading alone: %s"),
+               Error ? appFromAnsi((const ANSICHAR*)Error->GetBufferPointer()) : TEXT("(no message)"));
+        TreePatchVs.Release();
+        TreeHs.Release();
+        TreeDs.Release();
     }
     LeafVs.Release();
     if (FAILED(RdxCompile(GTreeShader, strlen(GTreeShader), "Leaf", nullptr, nullptr, "VSLeaf", "vs_5_0", Flags, 0,
@@ -753,12 +864,37 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
         HsRelief.Release();
         DsRelief.Release();
     }
+    // The models rounded: the mesh patches' stages (VSMesh, HSMesh, DSMesh). A failure costs only the rounding of the
+    // models - logged, and they are drawn flat as they always were.
+    TComRef<ID3DBlob> VsMesh, HsMesh, DsMesh;
+    if (FAILED(RdxCompile(GSolidPassText, Len, "GeometryPass", Macros, nullptr, "VSMesh", "vs_5_0", Flags, 0, VsMesh.Slot(), Error.Slot())) ||
+        FAILED(RdxCompile(GSolidPassText, Len, "GeometryPass", Macros, nullptr, "HSMesh", "hs_5_0", Flags, 0, HsMesh.Slot(), Error.Slot())) ||
+        FAILED(RdxCompile(GSolidPassText, Len, "GeometryPass", Macros, nullptr, "DSMesh", "ds_5_0", Flags, 0, DsMesh.Slot(), Error.Slot())))
+    {
+        RdxLog(TEXT("mesh tessellation shaders failed - the models are drawn flat: %s"),
+               Error ? appFromAnsi((const ANSICHAR*)Error->GetBufferPointer()) : TEXT("(no message)"));
+        VsMesh.Release();
+        HsMesh.Release();
+        DsMesh.Release();
+    }
+    for (INT Set = 0; Set < PIPE_SETS; Set++)
+    {
+        WetPipelines[Set].Release();
+        TessWetPipelines[Set].Release();
+        RtWetMirrorPipelines[Set].Release();
+        RtWetAskPipelines[Set].Release();
+    }
     TessPipelines[0].Release();
     TessPipelines[1].Release();
     TessModPipelines[0].Release();
     TessModPipelines[1].Release();
     TessFogPipelines[0].Release();
     TessFogPipelines[1].Release();
+    for (INT m = 0; m < MESH_MODES; m++)
+    {
+        MeshPipelines[m][0].Release();
+        MeshPipelines[m][1].Release();
+    }
     GrassPipelines[0].Release();
     GrassPipelines[1].Release();
     TreePipelines[0].Release();
@@ -1103,6 +1239,7 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
         {
             MakeGrass(Device, Desc);
             MakeTree(Device, Desc);
+            MakeWet(Device, Desc, PsWet.Get(), VsRelief.Get(), HsRelief.Get(), DsRelief.Get());
         }
         if (Mode == BLEND_Translucent && SUCCEEDED(Made) && SUCCEEDED(MadeMs))
             MakeDust(Device, Desc);
@@ -1115,7 +1252,10 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
         if (Mode == BLEND_SludgeMirror && SUCCEEDED(Made) && SUCCEEDED(MadeMs))
             MakeRtSludgeMirror(Device, Desc);
         if (Mode == BLEND_GlassMirror && SUCCEEDED(Made) && SUCCEEDED(MadeMs))
+        {
             MakeRtGlassMirror(Device, Desc);
+            MakeRtWetMirror(Device, Desc);
+        }
         // Geometry=Tessellation: the opaque pipeline once more, with the relief's stages in front of the same pixel
         // shader - so it writes depth, stencil kind and the light target exactly as the flat surface does - and the
         // modulated one, for the detail texture laid over the same patches.
@@ -1148,6 +1288,36 @@ UBOOL FSolidPass::CreatePipelineState(ID3D12Device* Device)
                                               : TEXT("the relief goes without its detail texture"));
                 Set[0].Release();
                 Set[1].Release();
+            }
+        }
+        // The models rounded: the solid, the glass's and the modulated pipeline once more, with the mesh patches' stages
+        // in front of the same pixel shader - depth, stencil kind, blend and the light target as a flat mesh has them.
+        const INT MeshMode = MeshModeOf(Mode);
+        if (MeshMode >= 0 && SUCCEEDED(Made) && SUCCEEDED(MadeMs) && VsMesh && HsMesh && DsMesh)
+        {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC T = Desc;
+            T.VS.pShaderBytecode  = VsMesh->GetBufferPointer();
+            T.VS.BytecodeLength   = VsMesh->GetBufferSize();
+            T.HS.pShaderBytecode  = HsMesh->GetBufferPointer();
+            T.HS.BytecodeLength   = HsMesh->GetBufferSize();
+            T.DS.pShaderBytecode  = DsMesh->GetBufferPointer();
+            T.DS.BytecodeLength   = DsMesh->GetBufferSize();
+            T.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+            T.SampleDesc.Count    = 1;
+            HRESULT MeshMade = Device->CreateGraphicsPipelineState(&T, __uuidof(ID3D12PipelineState),
+                                                                   MeshPipelines[MeshMode][0].VoidSlot());
+            if (SUCCEEDED(MeshMade) && MsaaSamples > 1)
+            {
+                T.SampleDesc.Count = (UINT)MsaaSamples;
+                MeshMade = Device->CreateGraphicsPipelineState(&T, __uuidof(ID3D12PipelineState),
+                                                               MeshPipelines[MeshMode][1].VoidSlot());
+            }
+            if (FAILED(MeshMade))
+            {
+                RdxLog(TEXT("mesh tessellation pipeline %i refused (0x%08X) - such models are drawn flat"), Mode,
+                       (DWORD)MeshMade);
+                MeshPipelines[MeshMode][0].Release();
+                MeshPipelines[MeshMode][1].Release();
             }
         }
         // The water's stages belong to the water alone.
@@ -1423,6 +1593,51 @@ void FSolidPass::MakeRtWater(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE
 // water, with the stages its drawing has - the two goes have to put every point in the very same place, and the
 // run-time compiled stages and the DXIL ones need not agree to the last bit. An effect: refused, the water is drawn
 // as it comes.
+void FSolidPass::MakeWet(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE_DESC Desc, ID3DBlob* Ps, ID3DBlob* Vs,
+                         ID3DBlob* Hs, ID3DBlob* Ds)
+{
+    for (INT Set = 0; Set < PIPE_SETS; Set++)
+    {
+        WetPipelines[Set].Release();
+        TessWetPipelines[Set].Release();
+    }
+    if (!Ps)
+        return;
+    Desc.PS.pShaderBytecode = Ps->GetBufferPointer();
+    Desc.PS.BytecodeLength  = Ps->GetBufferSize();
+    for (INT Tess = 0; Tess < 2; Tess++)
+    {
+        if (Tess && (!Vs || !Hs || !Ds))
+            break;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC T = Desc;
+        if (Tess)
+        {
+            T.VS.pShaderBytecode    = Vs->GetBufferPointer();
+            T.VS.BytecodeLength     = Vs->GetBufferSize();
+            T.HS.pShaderBytecode    = Hs->GetBufferPointer();
+            T.HS.BytecodeLength     = Hs->GetBufferSize();
+            T.DS.pShaderBytecode    = Ds->GetBufferPointer();
+            T.DS.BytecodeLength     = Ds->GetBufferSize();
+            T.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        }
+        TComRef<ID3D12PipelineState>* const Out = Tess ? TessWetPipelines : WetPipelines;
+        T.SampleDesc.Count = 1;
+        HRESULT Made = Device->CreateGraphicsPipelineState(&T, __uuidof(ID3D12PipelineState), Out[0].VoidSlot());
+        if (SUCCEEDED(Made) && MsaaSamples > 1)
+        {
+            T.SampleDesc.Count = (UINT)MsaaSamples;
+            Made = Device->CreateGraphicsPipelineState(&T, __uuidof(ID3D12PipelineState), Out[1].VoidSlot());
+        }
+        if (FAILED(Made))
+        {
+            RdxLog(TEXT("wet floors: the %s pipeline was refused (0x%08X) - such floors are drawn dry"),
+                   Tess ? TEXT("relief's") : TEXT("flat surfaces'"), (UINT)Made);
+            Out[0].Release();
+            Out[1].Release();
+        }
+    }
+}
+
 void FSolidPass::MakeWaterMark(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE_DESC Desc, ID3DBlob* Ps)
 {
     for (INT Set = 0; Set < PIPE_SETS; Set++)
@@ -1655,6 +1870,59 @@ void FSolidPass::MakeRtGlassMirror(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE
            TEXT("layer that reads their answers"));
 }
 
+void FSolidPass::MakeRtWetMirror(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE_DESC Desc)
+{
+    for (INT Set = 0; Set < PIPE_SETS; Set++)
+    {
+        RtWetMirrorPipelines[Set].Release();
+        RtWetAskPipelines[Set].Release();
+    }
+    if (!bRtHosted || !RtWaterRoot || WetMarkSrvAfterMasks <= 1)
+        return;
+    // The glass's layer as MakeRtGlassMirror makes it - on the rays' root signature, the main vertex shader, the layer's
+    // blend and depth test - with the wet floors' pixel shaders: the build that reads the host's answers, and the build
+    // that writes the rays down with no target at all.
+    Desc.pRootSignature     = RtWaterRoot.Get();
+    Desc.VS.pShaderBytecode = GSolidPassRtMainVS;
+    Desc.VS.BytecodeLength  = sizeof(GSolidPassRtMainVS);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC Ask = Desc;
+    Desc.PS.pShaderBytecode = bStencilKinds ? GSolidPassRtHostWetMirrorPSLit : GSolidPassRtHostWetMirrorPS;
+    Desc.PS.BytecodeLength  = bStencilKinds ? sizeof(GSolidPassRtHostWetMirrorPSLit) : sizeof(GSolidPassRtHostWetMirrorPS);
+    Ask.PS.pShaderBytecode  = GSolidPassRtAskWetMirrorPS;
+    Ask.PS.BytecodeLength   = sizeof(GSolidPassRtAskWetMirrorPS);
+    Ask.NumRenderTargets    = 0;
+    for (INT k = 0; k < 8; k++)
+        Ask.RTVFormats[k] = DXGI_FORMAT_UNKNOWN;
+    appMemzero(&Ask.BlendState, sizeof(Ask.BlendState));
+    Ask.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    Ask.DepthStencilState.StencilEnable  = FALSE;
+    HRESULT Made = S_OK;
+    for (INT Set = 0; Set < PIPE_SETS && SUCCEEDED(Made); Set++)
+    {
+        if (Set && MsaaSamples <= 1)
+            break;
+        Desc.SampleDesc.Count = Ask.SampleDesc.Count = Set ? (UINT)MsaaSamples : 1u;
+        Made = Device->CreateGraphicsPipelineState(&Desc, __uuidof(ID3D12PipelineState),
+                                                   RtWetMirrorPipelines[Set].VoidSlot());
+        if (SUCCEEDED(Made))
+            Made = Device->CreateGraphicsPipelineState(&Ask, __uuidof(ID3D12PipelineState),
+                                                       RtWetAskPipelines[Set].VoidSlot());
+    }
+    if (FAILED(Made))
+    {
+        for (INT Set = 0; Set < PIPE_SETS; Set++)
+        {
+            RtWetMirrorPipelines[Set].Release();
+            RtWetAskPipelines[Set].Release();
+        }
+        RdxLog(TEXT("wet floors: the water's layer on the 64-bit host's rays was refused (0x%08X) - their water is given ")
+               TEXT("back from the picture"), (UINT)Made);
+        return;
+    }
+    RdxLog(TEXT("wet floors: the water's layer on the 64-bit host's rays made - the rays written down, and the layer that ")
+           TEXT("reads their answers"));
+}
+
 UBOOL FSolidPass::RebuildPipelines(ID3D12Device* Device)
 {
     for (INT Set = 0; Set < PIPE_SETS; Set++)
@@ -1699,31 +1967,21 @@ UBOOL FSolidPass::CreateVertexBuffers(ID3D12Device* Device)
     D3D12_RESOURCE_DESC Desc;
     appMemzero(&Desc, sizeof(Desc));
     Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    Desc.Width            = (UINT64)MAX_VERTICES * sizeof(FSolidVertex);
     Desc.Height           = 1;
     Desc.DepthOrArraySize = 1;
     Desc.MipLevels        = 1;
     Desc.SampleDesc.Count = 1;
     Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
+    VertexDevice = Device;
     for (INT i = 0; i < BACKEND_FRAME_COUNT; i++)
     {
-        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
-                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                   __uuidof(ID3D12Resource), (void**)&VertexBuffers[i])))
+        if (!MakeVertexBuffer(RdxMath::VertexRoomFirst, VertexBuffers[i], Mapped[i]))
         {
             RdxLog(TEXT("vertex buffer %i allocation failed"), i);
             return 0;
         }
-
-        D3D12_RANGE NoRead;
-        NoRead.Begin = 0;
-        NoRead.End   = 0;
-        if (FAILED(VertexBuffers[i]->Map(0, &NoRead, (void**)&Mapped[i])))
-        {
-            RdxLog(TEXT("vertex buffer %i map failed"), i);
-            return 0;
-        }
+        VertexRoom[i] = RdxMath::VertexRoomFirst;
     }
 
     // The flashlight's blocks (SetBeam): a frame slot's four each, and one of zeros after them - every run binds one
@@ -1742,6 +2000,28 @@ UBOOL FSolidPass::CreateVertexBuffers(ID3D12Device* Device)
             return 0;
         }
         appMemzero(BeamMapped, BEAM_BLOCK_BYTES * (BEAM_KINDS * BACKEND_FRAME_COUNT + 1));
+    }
+
+    // The wet floors' blocks (SetWetBlocks): a frame slot's two, and one of zeros after them. Without the buffer no run
+    // is drawn wet.
+    {
+        D3D12_RANGE NoRead;
+        NoRead.Begin = 0;
+        NoRead.End   = 0;
+        Desc.Width = (UINT64)WET_BLOCK_BYTES * (WET_KINDS * BACKEND_FRAME_COUNT + 1);
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   __uuidof(ID3D12Resource), (void**)&WetBuffer)) ||
+            FAILED(WetBuffer->Map(0, &NoRead, (void**)&WetMapped)) || !WetMapped)
+        {
+            RdxLog(TEXT("wet floors: their constant buffer could not be made - no floor is drawn wet"));
+            if (WetBuffer)
+                WetBuffer->Release();
+            WetBuffer = nullptr;
+            WetMapped = nullptr;
+        }
+        else
+            appMemzero(WetMapped, WET_BLOCK_BYTES * (WET_KINDS * BACKEND_FRAME_COUNT + 1));
     }
 
     // The relief's held edges' blocks (SetReliefHeld), a buffer a frame slot. Without them the patches' corners carry the
@@ -1766,6 +2046,27 @@ UBOOL FSolidPass::CreateVertexBuffers(ID3D12Device* Device)
                 HeldBuffers[i] = nullptr;
             }
             HeldMapped[i] = nullptr;
+        }
+    }
+
+    // The rounded models' edges (MeshEdgeRoom), a buffer a frame slot. Without one the frame slot draws its models flat.
+    Desc.Width = MESH_EDGE_BYTES;
+    for (INT i = 0; i < BACKEND_FRAME_COUNT; i++)
+    {
+        D3D12_RANGE NoRead;
+        NoRead.Begin = 0;
+        NoRead.End   = 0;
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, __uuidof(ID3D12Resource), (void**)&MeshEdgeBuffers[i])) ||
+            FAILED(MeshEdgeBuffers[i]->Map(0, &NoRead, (void**)&MeshEdgeMapped[i])))
+        {
+            RdxLog(TEXT("rounded models' edge buffer %i could not be made - the models are drawn flat"), i);
+            if (MeshEdgeBuffers[i])
+            {
+                MeshEdgeBuffers[i]->Release();
+                MeshEdgeBuffers[i] = nullptr;
+            }
+            MeshEdgeMapped[i] = nullptr;
         }
     }
 
@@ -1804,12 +2105,32 @@ UBOOL FSolidPass::Init(ID3D12Device* Device, UBOOL bStencilKinds_)
     if (!CreateRootSignature(Device)) return 0;
     if (!CreatePipelineState(Device)) return 0;
     if (!CreateVertexBuffers(Device)) return 0;
-    RdxLog(TEXT("geometry pass ready (%i vertices, %i draws max)"), (INT)MAX_VERTICES, (INT)MAX_RUNS);
+    RdxLog(TEXT("geometry pass ready (%i vertices a frame, growing to %i where a frame asks for more; %i draws max)"),
+           (INT)RdxMath::VertexRoomFirst, (INT)RdxMath::VertexRoomMost, (INT)MAX_RUNS);
     return 1;
 }
 
 void FSolidPass::Shutdown()
 {
+    // The spherifier's field: given again by the next one handed it (SphereGen).
+    free(SphereWords);
+    SphereWords   = nullptr;
+    SphereCount   = 0;
+    SphereGen     = -1;
+    bSphereDirty  = 0;
+    SphereAddress = 0;
+    SphereBuffer.Release();
+    for (INT k = 0; k < SPHERE_RETIRED_MOST; k++)
+        if (SphereRetired[k])
+        {
+            SphereRetired[k]->Release();
+            SphereRetired[k] = nullptr;
+        }
+    for (INT i = 0; i < BACKEND_FRAME_COUNT; i++)
+    {
+        SphereUpload[i].Release();
+        SphereUploadBytes[i] = 0;
+    }
     for (INT Set = 0; Set < PIPE_SETS; Set++)
     {
         WaterMarkPipelines[Set].Release();
@@ -1831,12 +2152,24 @@ void FSolidPass::Shutdown()
     }
     RtHostPaneKeepPipeline.Release();
     RtPaneKeepAskPipeline.Release();
+    for (INT Set = 0; Set < PIPE_SETS; Set++)
+    {
+        WetPipelines[Set].Release();
+        TessWetPipelines[Set].Release();
+        RtWetMirrorPipelines[Set].Release();
+        RtWetAskPipelines[Set].Release();
+    }
     TessPipelines[0].Release();
     TessPipelines[1].Release();
     TessModPipelines[0].Release();
     TessModPipelines[1].Release();
     TessFogPipelines[0].Release();
     TessFogPipelines[1].Release();
+    for (INT m = 0; m < MESH_MODES; m++)
+    {
+        MeshPipelines[m][0].Release();
+        MeshPipelines[m][1].Release();
+    }
     GrassPipelines[0].Release();
     GrassPipelines[1].Release();
     TreePipelines[0].Release();
@@ -1860,6 +2193,27 @@ void FSolidPass::Shutdown()
             }
             VertexBuffers[i]->Release();
             VertexBuffers[i] = nullptr;
+            VertexRoom[i]    = 0;
+        }
+        if (i == 0)
+        {
+            // The given-up buffers, a grown frame's old buffer and the join: no frame is in flight any more.
+            for (INT k = 0; k < VERTEX_RETIRED_MOST; k++)
+                if (VertexRetired[k])
+                {
+                    VertexRetired[k]->Release();
+                    VertexRetired[k] = nullptr;
+                }
+            if (VertexOld)
+            {
+                VertexOld->Unmap(0, nullptr);
+                VertexOld->Release();
+                VertexOld = nullptr;
+            }
+            VertexSwitchAt = -1;
+            VertexJoined.Release();
+            VertexJoinedRoom = 0;
+            VertexPeak       = 0;
         }
         if (HeldBuffers[i])
         {
@@ -1869,6 +2223,14 @@ void FSolidPass::Shutdown()
             HeldBuffers[i] = nullptr;
         }
         HeldMapped[i] = nullptr;
+        if (MeshEdgeBuffers[i])
+        {
+            if (MeshEdgeMapped[i])
+                MeshEdgeBuffers[i]->Unmap(0, nullptr);
+            MeshEdgeBuffers[i]->Release();
+            MeshEdgeBuffers[i] = nullptr;
+        }
+        MeshEdgeMapped[i] = nullptr;
         if (GrassBuffers[i])
         {
             if (GrassMapped[i])
@@ -1888,6 +2250,16 @@ void FSolidPass::Shutdown()
     BeamMapped = nullptr;
     for (INT i = 0; i < BEAM_KINDS; i++)
         BeamOn[i] = 0;
+    if (WetBuffer)
+    {
+        if (WetMapped)
+            WetBuffer->Unmap(0, nullptr);
+        WetBuffer->Release();
+        WetBuffer = nullptr;
+    }
+    WetMapped = nullptr;
+    for (INT i = 0; i < WET_KINDS; i++)
+        WetOn[i] = 0;
 
     Dest = nullptr;
 
@@ -1942,6 +2314,46 @@ void FSolidPass::SetBeam(INT FrameIndex, const FLOAT* Block, const FLOAT* Thin, 
             appMemzero(O, BEAM_VIEW_FLOATS * sizeof(FLOAT));
         BeamOn[i] = BeamBuffer->GetGPUVirtualAddress() + (UINT64)At;
     }
+}
+
+void FSolidPass::SetWetBlocks(INT FrameIndex, const FLOAT* Blocks)
+{
+    for (INT i = 0; i < WET_KINDS; i++)
+        WetOn[i] = 0;
+    if (!Blocks || !WetBuffer || !WetMapped || FrameIndex < 0 || FrameIndex >= BACKEND_FRAME_COUNT)
+        return;
+    for (INT i = 0; i < WET_KINDS; i++)
+    {
+        const INT At = (WET_KINDS * FrameIndex + i) * WET_BLOCK_BYTES;
+        appMemcpy(WetMapped + At, Blocks + i * RdxMath::WetBlockFloats, RdxMath::WetBlockFloats * sizeof(FLOAT));
+        WetOn[i] = WetBuffer->GetGPUVirtualAddress() + (UINT64)At;
+    }
+}
+
+void FSolidPass::AddWetLayer(const FLOAT* Consts, INT White)
+{
+    if (!Consts || White < 0)
+        return;
+    // The whole screen in one triangle, at the nearest depth: every pixel passes the depth test, and the shader finds
+    // the wet floors by their mark.
+    FSolidVertex V[3];
+    appMemzero(V, sizeof(V));
+    V[1].X = 2.0f * (FLOAT)Width;
+    V[2].Y = 2.0f * (FLOAT)Height;
+    for (INT k = 0; k < 3; k++)
+    {
+        V[k].Depth = 1.0f;
+        V[k].R = V[k].G = V[k].B = V[k].A = 1.0f;
+    }
+    // The layer's numbers for its run alone: the surface it is added beside goes on with its own.
+    FLOAT Kept[WATER_CONSTANTS];
+    appMemcpy(Kept, WaterNow, sizeof(Kept));
+    SetWaterConstants(Consts);
+    const INT Was = CurrentWet;
+    CurrentWet = WET_LAYER;
+    AddFan(V, 3, White, -1, BLEND_GlassMirror, 0);
+    CurrentWet = Was;
+    appMemcpy(WaterNow, Kept, sizeof(Kept));
 }
 
 FLOAT* FSolidPass::GrassBlock(INT Rows, D3D12_GPU_VIRTUAL_ADDRESS& Address)
@@ -2004,12 +2416,14 @@ void FSolidPass::AddGrassDraw(D3D12_GPU_VIRTUAL_ADDRESS Block, INT Instances, IN
     R.Kind             = bStencilKinds ? 2 : 0;
     R.bSprite          = 0;
     R.Beam             = CurrentBeamLit;
+    R.Wet              = 0;
     R.bPom             = 0;
     R.PomTable         = -1;
     appMemzero(R.Pom, sizeof(R.Pom));
     appMemzero(R.Water, sizeof(R.Water));
     R.bRelief          = 0;
     R.bTess            = 0;
+    R.bMesh            = 0;
     R.bRepeat          = 0;
     R.bInMirror        = bInMirrorNow;
     R.ReliefBlock      = 0;
@@ -2052,12 +2466,14 @@ void FSolidPass::AddDustDraw(D3D12_GPU_VIRTUAL_ADDRESS Block, INT Instances, INT
     R.Kind             = 0;
     R.bSprite          = 0;
     R.Beam             = CurrentBeamLit;
+    R.Wet              = 0;
     R.bPom             = 0;
     R.PomTable         = -1;
     appMemzero(R.Pom, sizeof(R.Pom));
     appMemzero(R.Water, sizeof(R.Water));
     R.bRelief          = 0;
     R.bTess            = 0;
+    R.bMesh            = 0;
     R.bRepeat          = 0;
     R.bInMirror        = bInMirrorNow;
     R.ReliefBlock      = 0;
@@ -2085,6 +2501,8 @@ void FSolidPass::AddTreeDraw(const D3D12_VERTEX_BUFFER_VIEW& Vb, const D3D12_IND
     D.InstanceStart = 0;
     D.InstanceCount = 1;
     D.bLeaves       = 0;
+    // The bark's relief made real where its run says so (SetPomRun with RdxMath::PomFlag_Tess).
+    D.bPatches      = (PomTableNow >= 0 && ((INT)PomNow[1] & RdxMath::PomFlag_Tess)) ? 1 : 0;
     D.Block         = Block;
     // A solid run as far as the flush's order goes, with no vertices of the pass's own: never extended (EnsureRun).
     FRun& R = Runs[RunCount++];
@@ -2106,12 +2524,16 @@ void FSolidPass::AddTreeDraw(const D3D12_VERTEX_BUFFER_VIEW& Vb, const D3D12_IND
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = 0;
     R.Beam             = CurrentBeamLit;
-    R.bPom             = 0;
-    R.PomTable         = -1;
-    appMemzero(R.Pom, sizeof(R.Pom));
+    R.Wet              = 0;
+    // The bark's relief, where one is set for it (SetPomRun): its height map and its four numbers.
+    R.bPom             = (PomTableNow >= 0) ? 1 : 0;
+    R.PomTable         = PomTableNow;
+    for (INT k = 0; k < 4; k++)
+        R.Pom[k] = (PomTableNow >= 0) ? PomNow[k] : 0.0f;
     appMemzero(R.Water, sizeof(R.Water));
     R.bRelief          = 0;
     R.bTess            = 0;
+    R.bMesh            = 0;
     R.bRepeat          = 0;
     R.bInMirror        = bInMirrorNow;
     R.ReliefBlock      = 0;
@@ -2356,11 +2778,46 @@ void FSolidPass::DrawPlantMotion(ID3D12Device* Device, ID3D12GraphicsCommandList
 void FSolidPass::Begin(INT InWidth, INT InHeight, INT FrameIndex)
 {
     PlantMotionUsed = 0;
+    // The buffers given up a frame older; one no frame in flight can read any more goes.
+    for (INT k = 0; k < VERTEX_RETIRED_MOST; k++)
+        if (VertexRetired[k] && ++VertexRetiredAge[k] >= BACKEND_FRAME_COUNT + 1)
+        {
+            VertexRetired[k]->Release();
+            VertexRetired[k] = nullptr;
+        }
+    VertexSwitchAt  = -1;
+    VertexDropFrame = 0;
+    // This slot's buffer made larger before anything is written into it, where the frames have come near its room: no
+    // frame in flight reads it - the slot's last frame is done - and there is nothing in it to keep.
+    if (FrameIndex >= 0 && FrameIndex < BACKEND_FRAME_COUNT && VertexBuffers[FrameIndex])
+    {
+        const INT Want = RdxMath::VertexRoomFor(VertexPeak, VertexRoom[FrameIndex]);
+        ID3D12Resource* Grown       = nullptr;
+        FSolidVertex*   GrownMapped = nullptr;
+        if (Want > VertexRoom[FrameIndex] && MakeVertexBuffer(Want, Grown, GrownMapped))
+        {
+            RdxLog(TEXT("vertices: frame slot %i's buffer grown from %i to %i (%.0f MB) at its frame's start - the frames ")
+                   TEXT("asked for up to %i"), FrameIndex, VertexRoom[FrameIndex], Want,
+                   (DOUBLE)Want * sizeof(FSolidVertex) / (1024.0 * 1024.0), VertexPeak);
+            RetireVertexBuffer(VertexBuffers[FrameIndex], 1);
+            VertexBuffers[FrameIndex] = Grown;
+            Mapped[FrameIndex]        = GrownMapped;
+            VertexRoom[FrameIndex]    = Want;
+        }
+    }
     Dest = (FrameIndex >= 0 && FrameIndex < BACKEND_FRAME_COUNT) ? Mapped[FrameIndex] : nullptr;
     VertexCount = 0;
     RunCount    = 0;
     HeldFrame      = (FrameIndex >= 0 && FrameIndex < BACKEND_FRAME_COUNT) ? FrameIndex : -1;
     HeldUsed       = HELD_ZERO;
+    // The retired spherifier fields a frame older; one no frame in flight can read any more goes.
+    for (INT k = 0; k < SPHERE_RETIRED_MOST; k++)
+        if (SphereRetired[k] && ++SphereRetiredAge[k] >= BACKEND_FRAME_COUNT + 1)
+        {
+            SphereRetired[k]->Release();
+            SphereRetired[k] = nullptr;
+        }
+    MeshEdgeUsed   = 0;
     ReliefBlockNow = 0;
     GrassUsed      = 0;
     GrassRuns      = 0;
@@ -2378,10 +2835,16 @@ UBOOL FSolidPass::EnsureRun(INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL b
     // but for the see-through and the modulated draws, where the relief's covers tell the level's sheets from the
     // actors' sprites, decals and shadows by it (DrawReliefCovers). Those are few.
     const INT Kind = (bStencilKinds || Mode == BLEND_Translucent || Mode == BLEND_Modulated) ? CurrentKind : 0;
+    // A wet floor's kind only where it is drawn opaque: its detail texture, its fog map and its decals stay as they are.
+    // And the wet floors' layer on rays (AddWetLayer), a pane's mirror layer of its own.
+    const INT Wet = (Mode == BLEND_Opaque || (Mode == BLEND_GlassMirror && CurrentWet == WET_LAYER)) ? CurrentWet : 0;
+    // The constants compared with the C library's memcmp, not the engine's appMemcmp: that one goes a byte at a time,
+    // and this runs for every fan drawn.
     if (RunCount > 0 &&
         Runs[RunCount - 1].Kind == Kind &&
         Runs[RunCount - 1].bSprite == CurrentSprite &&
         Runs[RunCount - 1].Beam == CurrentBeamLit &&
+        Runs[RunCount - 1].Wet == Wet &&
         !Runs[RunCount - 1].bClearDepthFirst &&
         !Runs[RunCount - 1].bFlash &&
         !Runs[RunCount - 1].bTargetSwitch &&
@@ -2396,14 +2859,16 @@ UBOOL FSolidPass::EnsureRun(INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL b
         Runs[RunCount - 1].Mode      == Mode &&
         Runs[RunCount - 1].bNoSmooth == bNoSmooth &&
         Runs[RunCount - 1].PomTable  == PomTableNow &&
-        appMemcmp(Runs[RunCount - 1].Pom, PomNow, sizeof(PomNow)) == 0 &&
+        memcmp(Runs[RunCount - 1].Pom, PomNow, sizeof(PomNow)) == 0 &&
         Runs[RunCount - 1].bRelief == bReliefNow &&
         Runs[RunCount - 1].bTess == bTessNow &&
+        Runs[RunCount - 1].bMesh == bMeshNow &&
+        (!bMeshNow || memcmp(Runs[RunCount - 1].Water, MeshNow, sizeof(MeshNow)) == 0) &&
         Runs[RunCount - 1].ReliefBlock == ReliefBlockNow &&
         ((Mode != BLEND_Water && Mode != BLEND_Fall && Mode != BLEND_Sludge && Mode != BLEND_SludgeFog &&
           Mode != BLEND_SludgeMirror && Mode != BLEND_GlassMirror && Mode != BLEND_Body) ||
-         appMemcmp(Runs[RunCount - 1].Water, WaterNow, sizeof(WaterNow)) == 0) &&
-        (!bReliefNow || appMemcmp(Runs[RunCount - 1].Water, ReliefNow, sizeof(ReliefNow)) == 0))
+         memcmp(Runs[RunCount - 1].Water, WaterNow, sizeof(WaterNow)) == 0) &&
+        (!bReliefNow || memcmp(Runs[RunCount - 1].Water, ReliefNow, sizeof(ReliefNow)) == 0))
         return 1;
 
     if (RunCount >= MAX_RUNS)
@@ -2436,25 +2901,41 @@ UBOOL FSolidPass::EnsureRun(INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL b
     Runs[RunCount].Kind      = Kind;
     Runs[RunCount].bSprite   = CurrentSprite;
     Runs[RunCount].Beam      = CurrentBeamLit;
+    Runs[RunCount].Wet       = Wet;
     Runs[RunCount].bRelief   = bReliefNow;
     Runs[RunCount].bTess     = bTessNow;
+    Runs[RunCount].bMesh     = bMeshNow;
     Runs[RunCount].bRepeat   = 0;
     Runs[RunCount].bInMirror = bInMirrorNow;
     Runs[RunCount].ReliefBlock = ReliefBlockNow;
-    appMemcpy(Runs[RunCount].Water, bReliefNow ? ReliefNow : WaterNow, sizeof(WaterNow));
+    appMemcpy(Runs[RunCount].Water, bMeshNow ? MeshNow : (bReliefNow ? ReliefNow : WaterNow), sizeof(WaterNow));
     RunCount++;
     return 1;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS FSolidPass::SetReliefHeld(const FLOAT* Lamps, INT LampFloats, const FLOAT* Ends, INT Count)
+FLOAT* FSolidPass::MeshEdgeRoom(INT Count, INT& First)
+{
+    const INT Bytes = Count * MESH_EDGE_FLOATS * (INT)sizeof(FLOAT);
+    if (Count <= 0 || HeldFrame < 0 || !MeshEdgeMapped[HeldFrame] || MeshEdgeUsed + Bytes > MESH_EDGE_BYTES)
+        return nullptr;
+    First = MeshEdgeUsed / (MESH_EDGE_FLOATS * (INT)sizeof(FLOAT));
+    FLOAT* const Out = (FLOAT*)(MeshEdgeMapped[HeldFrame] + MeshEdgeUsed);
+    MeshEdgeUsed += Bytes;
+    return Out;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS FSolidPass::SetReliefHeld(const FLOAT* Lamps, INT LampFloats, const FLOAT* Sphere,
+                                                    const FLOAT* Ends, INT Count)
 {
     ReliefBlockNow = 0;
-    if (Count <= 0 || Count > RELIEF_HELD_MAX || HeldFrame < 0 || !HeldMapped[HeldFrame] || !Ends)
+    if (!Ends || Count < 0)
+        Count = 0;
+    if ((Count <= 0 && !Sphere) || Count > RELIEF_HELD_MAX || HeldFrame < 0 || !HeldMapped[HeldFrame])
         return 0;
-    // The shader's layout (WaterLampConsts): the lamps' count and two rows a lamp, then how many held edges, then three
-    // rows an edge. A constant buffer's address is a multiple of 256.
+    // The shader's layout (WaterLampConsts): the lamps' count and two rows a lamp, then how many held edges, the
+    // spherifier's rows, then three rows an edge. A constant buffer's address is a multiple of 256.
     enum { LampRows = 1 + 2 * RdxMath::ReliefLampMax };
-    const INT Bytes = ((LampRows + 1 + 3 * Count) * 16 + 255) & ~255;
+    const INT Bytes = ((LampRows + 1 + SPHERE_ROWS + 3 * Count) * 16 + 255) & ~255;
     if (HeldUsed + Bytes > HELD_BYTES)
     {
         if (!bHeldFullSaid)
@@ -2473,11 +2954,182 @@ D3D12_GPU_VIRTUAL_ADDRESS FSolidPass::SetReliefHeld(const FLOAT* Lamps, INT Lamp
     At[0] = (FLOAT)Count;
     At[1] = At[2] = At[3] = 0.0f;
     At += 4;
+    for (INT k = 0; k < SPHERE_FLOATS; k++)
+        At[k] = Sphere ? Sphere[k] : 0.0f;
+    At += SPHERE_FLOATS;
     for (INT e = 0; e < Count * 12; e++)
         At[e] = Ends[e];
     ReliefBlockNow = HeldBuffers[HeldFrame]->GetGPUVirtualAddress() + (UINT64)HeldUsed;
     HeldUsed += Bytes;
     return ReliefBlockNow;
+}
+
+void FSolidPass::SetSphereField(const DWORD* Words, INT Count, INT Gen)
+{
+    SphereGen = Gen;
+    if (Count <= 0 || !Words)
+    {
+        // No field for the rounding drawn - none at all, or none that could be packed: the one on the card is of
+        // another rounding, and goes.
+        free(SphereWords);
+        SphereWords  = nullptr;
+        SphereCount  = 0;
+        bSphereDirty = 0;
+        RetireSphereField();
+        return;
+    }
+    DWORD* const Copy = (DWORD*)malloc(sizeof(DWORD) * (SIZE_T)Count);
+    if (!Copy)
+    {
+        RdxLog(TEXT("spherifier: no memory for the relief's copy of the rounding - the relief's patches stay unrounded"));
+        free(SphereWords);
+        SphereWords  = nullptr;
+        SphereCount  = 0;
+        bSphereDirty = 0;
+        RetireSphereField();
+        return;
+    }
+    appMemcpy(Copy, Words, sizeof(DWORD) * (SIZE_T)Count);
+    free(SphereWords);
+    SphereWords  = Copy;
+    SphereCount  = Count;
+    bSphereDirty = 1;
+}
+
+void FSolidPass::TakeSphereField(DWORD* Words, INT Count, INT Gen)
+{
+    if (Count <= 0 || !Words)
+    {
+        free(Words);
+        SetSphereField(nullptr, 0, Gen);
+        return;
+    }
+    SphereGen = Gen;
+    free(SphereWords);
+    SphereWords  = Words;
+    SphereCount  = Count;
+    bSphereDirty = 1;
+}
+
+// The field handed over since the last frame onto the card: a buffer of its own each time - the one before kept, a frame
+// in flight may still read it - written through the card writer (Card), on a list of its own done with before this
+// frame's draws, and read from the common state it is left in; where there is none, filled from this frame slot's
+// upload buffer on the frame's list. What was handed over goes once it is on the card.
+void FSolidPass::UploadSphereField(ID3D12GraphicsCommandList* Cmd, INT FrameIndex)
+{
+    if (!bSphereDirty || !SphereWords || SphereCount <= 0 || !Cmd || FrameIndex < 0 || FrameIndex >= BACKEND_FRAME_COUNT)
+        return;
+    const UINT64            Bytes  = (UINT64)SphereCount * sizeof(DWORD);
+    TComRef<ID3D12Resource> Made;
+    ID3D12Resource* const   OnCard = Card ? Card->MakeCardBuffer(Bytes, TEXT("spherifier's field")) : nullptr;
+    if (OnCard && Card->WriteCardBuffer(OnCard, 0, SphereWords, Bytes))
+        *Made.Slot() = OnCard;
+    else if (OnCard)
+        OnCard->Release();
+    if (!Made && !UploadSphereFieldThere(Cmd, FrameIndex, Bytes, Made))
+    {
+        RdxLog(TEXT("spherifier: the relief's field could not be put on the card - the relief's patches stay "
+                    "unrounded"));
+        bSphereDirty = 0;
+        free(SphereWords);
+        SphereWords = nullptr;
+        RetireSphereField();
+        return;
+    }
+    RetireSphereField();
+    ID3D12Resource* const New = Made.Get();
+    New->AddRef();
+    *SphereBuffer.Slot() = New;
+    SphereAddress = SphereBuffer->GetGPUVirtualAddress();
+    bSphereDirty  = 0;
+    free(SphereWords);
+    SphereWords = nullptr;
+    RdxLog(TEXT("spherifier: the field on the card for the relief's patches (%i words, %.1f KB)"), SphereCount,
+           (DOUBLE)Bytes / 1024.0);
+}
+
+void FSolidPass::RetireSphereField()
+{
+    if (SphereBuffer)
+    {
+        ID3D12Resource* const Old = SphereBuffer.Get();
+        Old->AddRef();
+        SphereBuffer.Release();
+        INT k = 0;
+        while (k < SPHERE_RETIRED_MOST && SphereRetired[k])
+            k++;
+        if (k < SPHERE_RETIRED_MOST)
+        {
+            SphereRetired[k]    = Old;
+            SphereRetiredAge[k] = 0;
+        }
+        else
+        {
+            // Every place taken within a few frames: this one is kept for good rather than freed while a frame in
+            // flight may read it.
+            static UBOOL bSaid = 0;
+            if (!bSaid)
+                RdxLog(TEXT("spherifier: more fields retired at once than there is room to age - one kept for good"));
+            bSaid = 1;
+        }
+    }
+    SphereAddress = 0;
+}
+
+// UploadSphereField's way without a card writer: the card's buffer made in Made and filled on the frame's list from
+// this frame slot's upload buffer. False, logged, where either could not be made.
+UBOOL FSolidPass::UploadSphereFieldThere(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, UINT64 Bytes,
+                                         TComRef<ID3D12Resource>& Made)
+{
+    TComRef<ID3D12Device> Device;
+    if (FAILED(Cmd->GetDevice(__uuidof(ID3D12Device), Device.VoidSlot())) || !Device)
+        return 0;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    D3D12_RESOURCE_DESC Desc;
+    appMemzero(&Desc, sizeof(Desc));
+    Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    Desc.Width            = Bytes;
+    Desc.Height           = 1;
+    Desc.DepthOrArraySize = 1;
+    Desc.MipLevels        = 1;
+    Desc.SampleDesc.Count = 1;
+    Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SphereUploadBytes[FrameIndex] < Bytes)
+    {
+        SphereUpload[FrameIndex].Release();
+        SphereUploadBytes[FrameIndex] = 0;
+        Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, __uuidof(ID3D12Resource), SphereUpload[FrameIndex].VoidSlot())))
+        {
+            RdxLog(TEXT("spherifier: the field's upload buffer could not be made (%.1f MB)"), (DOUBLE)Bytes / 1048576.0);
+            return 0;
+        }
+        SphereUploadBytes[FrameIndex] = Bytes;
+    }
+    BYTE* Mapped = nullptr;
+    if (FAILED(SphereUpload[FrameIndex]->Map(0, nullptr, (void**)&Mapped)) || !Mapped)
+        return 0;
+    appMemcpy(Mapped, SphereWords, (SIZE_T)Bytes);
+    SphereUpload[FrameIndex]->Unmap(0, nullptr);
+    Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               __uuidof(ID3D12Resource), Made.VoidSlot())))
+    {
+        RdxLog(TEXT("spherifier: the field could not be put on the card (%.1f MB)"), (DOUBLE)Bytes / 1048576.0);
+        return 0;
+    }
+    Cmd->CopyBufferRegion(Made.Get(), 0, SphereUpload[FrameIndex].Get(), 0, Bytes);
+    D3D12_RESOURCE_BARRIER B;
+    appMemzero(&B, sizeof(B));
+    B.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    B.Transition.pResource   = Made.Get();
+    B.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    B.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    B.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    Cmd->ResourceBarrier(1, &B);
+    return 1;
 }
 
 UBOOL FSolidPass::AddRepeatRun(INT Start, INT Count, INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL bNoSmooth)
@@ -2511,11 +3163,13 @@ UBOOL FSolidPass::AddRepeatRun(INT Start, INT Count, INT SrvIndex, INT LightSrv,
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = CurrentSprite;
     R.Beam             = CurrentBeamLit;
+    R.Wet              = 0;
     R.bPom             = (PomTableNow >= 0) ? 1 : 0;
     R.PomTable         = PomTableNow;
     appMemcpy(R.Pom, PomNow, sizeof(PomNow));
     R.bRelief          = bReliefNow;
     R.bTess            = bTessNow;
+    R.bMesh            = 0;
     R.bRepeat          = 1;
     R.ReliefBlock      = ReliefBlockNow;
     appMemcpy(R.Water, bReliefNow ? ReliefNow : WaterNow, sizeof(WaterNow));
@@ -2531,15 +3185,8 @@ FSolidVertex* FSolidPass::BeginTriangles(INT Count, INT SrvIndex, INT LightSrv, 
 {
     if (!Dest || Count <= 0)
         return nullptr;
-    if (VertexCount + 3 * Count > MAX_VERTICES)
-    {
-        if (!bOverflowReported)
-        {
-            RdxLog(TEXT("vertex buffer full at %i - geometry dropped"), VertexCount);
-            bOverflowReported = 1;
-        }
+    if (!VertexRoomForMore(3 * Count))
         return nullptr;
-    }
     if (!EnsureRun(SrvIndex, LightSrv, Mode, bNoSmooth))
         return nullptr;
 
@@ -2549,6 +3196,106 @@ FSolidVertex* FSolidPass::BeginTriangles(INT Count, INT SrvIndex, INT LightSrv, 
     return V;
 }
 
+UBOOL FSolidPass::MakeVertexBuffer(INT Room, ID3D12Resource*& Out, FSolidVertex*& OutMapped)
+{
+    Out       = nullptr;
+    OutMapped = nullptr;
+    if (!VertexDevice || Room <= 0)
+        return 0;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC Desc;
+    appMemzero(&Desc, sizeof(Desc));
+    Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    Desc.Width            = (UINT64)Room * sizeof(FSolidVertex);
+    Desc.Height           = 1;
+    Desc.DepthOrArraySize = 1;
+    Desc.MipLevels        = 1;
+    Desc.SampleDesc.Count = 1;
+    Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(VertexDevice->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                     nullptr, __uuidof(ID3D12Resource), (void**)&Out)))
+    {
+        Out = nullptr;
+        return 0;
+    }
+    D3D12_RANGE NoRead;
+    NoRead.Begin = 0;
+    NoRead.End   = 0;
+    if (FAILED(Out->Map(0, &NoRead, (void**)&OutMapped)) || !OutMapped)
+    {
+        Out->Release();
+        Out       = nullptr;
+        OutMapped = nullptr;
+        return 0;
+    }
+    return 1;
+}
+
+void FSolidPass::RetireVertexBuffer(ID3D12Resource* Buffer, UBOOL bMapped)
+{
+    if (!Buffer)
+        return;
+    if (bMapped)
+        Buffer->Unmap(0, nullptr);
+    for (INT k = 0; k < VERTEX_RETIRED_MOST; k++)
+        if (!VertexRetired[k])
+        {
+            VertexRetired[k]    = Buffer;
+            VertexRetiredAge[k] = 0;
+            return;
+        }
+    // No place left to wait in: the oldest - already a few frames old - goes now, and this takes its place.
+    INT Oldest = 0;
+    for (INT k = 1; k < VERTEX_RETIRED_MOST; k++)
+        if (VertexRetiredAge[k] > VertexRetiredAge[Oldest])
+            Oldest = k;
+    VertexRetired[Oldest]->Release();
+    VertexRetired[Oldest]    = Buffer;
+    VertexRetiredAge[Oldest] = 0;
+}
+
+UBOOL FSolidPass::VertexRoomForMore(INT Needed)
+{
+    const INT Slot  = HeldFrame;
+    const INT Asked = VertexCount + Needed;
+    if (Slot < 0 || Slot >= BACKEND_FRAME_COUNT)
+        return 0;
+    if (Asked <= VertexRoom[Slot])
+        return 1;
+    // Once a frame: the frame goes on in a larger buffer from here (see VertexRoom). Its first part stays where it
+    // was written - read back from the upload heap it would be slow - and Flush joins the two on the card.
+    const INT Want = RdxMath::VertexRoomFor(Asked, VertexRoom[Slot]);
+    ID3D12Resource* Grown       = nullptr;
+    FSolidVertex*   GrownMapped = nullptr;
+    if (VertexSwitchAt < 0 && Want >= Asked && MakeVertexBuffer(Want, Grown, GrownMapped))
+    {
+        RdxLog(TEXT("vertices: frame slot %i's buffer grown from %i to %i (%.0f MB) in the middle of a frame that asked ")
+               TEXT("for %i - its two parts joined on the card"), Slot, VertexRoom[Slot], Want,
+               (DOUBLE)Want * sizeof(FSolidVertex) / (1024.0 * 1024.0), Asked);
+        VertexOld          = VertexBuffers[Slot];
+        VertexSwitchAt     = VertexCount;
+        VertexBuffers[Slot] = Grown;
+        Mapped[Slot]        = GrownMapped;
+        Dest                = GrownMapped;
+        VertexRoom[Slot]    = Want;
+        VertexPeak          = Max(VertexPeak, Asked);
+        return 1;
+    }
+    // No more room to be had: dropped, and said - the first frames it happens in, then one in 600.
+    VertexPeak      = Max(VertexPeak, Min(Asked, (INT)RdxMath::VertexRoomMost));
+    VertexAskedMost = Max(VertexAskedMost, Asked);
+    if (!VertexDropFrame)
+    {
+        VertexDropFrame = 1;
+        if (VertexDropFrames++ < 10 || (VertexDropFrames % 600) == 0)
+            RdxLog(TEXT("vertex buffer full at %i of %i - geometry dropped (%i frames so far; the most a frame asked ")
+                   TEXT("for: %i)"), VertexCount, VertexRoom[Slot], VertexDropFrames, VertexAskedMost);
+    }
+    return 0;
+}
+
 void FSolidPass::AddFan(const FSolidVertex* Verts, INT Count, INT SrvIndex, INT LightSrv, EBlendMode Mode,
                         UBOOL bNoSmooth)
 {
@@ -2556,15 +3303,8 @@ void FSolidPass::AddFan(const FSolidVertex* Verts, INT Count, INT SrvIndex, INT 
         return;
 
     const INT Needed = (Count - 2) * 3;
-    if (VertexCount + Needed > MAX_VERTICES)
-    {
-        if (!bOverflowReported)
-        {
-            RdxLog(TEXT("vertex buffer full at %i - geometry dropped"), VertexCount);
-            bOverflowReported = 1;
-        }
+    if (!VertexRoomForMore(Needed))
         return;
-    }
 
     if (!EnsureRun(SrvIndex, LightSrv, Mode, bNoSmooth))
         return;
@@ -2604,6 +3344,7 @@ void FSolidPass::AddDepthClear()
     Runs[RunCount].Kind      = bStencilKinds ? CurrentKind : 0;
     Runs[RunCount].bSprite   = 0;
     Runs[RunCount].Beam      = 0;
+    Runs[RunCount].Wet       = 0;
     RunCount++;
 }
 
@@ -2643,6 +3384,7 @@ void FSolidPass::AddFlash(FLOAT ScaleR, FLOAT ScaleG, FLOAT ScaleB, FLOAT FogR, 
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = 0;
     R.Beam             = 0;
+    R.Wet              = 0;
     R.Flash[0] = ScaleR; R.Flash[1] = ScaleG; R.Flash[2] = ScaleB;
     R.Flash[3] = FogR;   R.Flash[4] = FogG;   R.Flash[5] = FogB;
 }
@@ -2672,6 +3414,7 @@ UBOOL FSolidPass::AddTargetSwitch()
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = 0;
     R.Beam             = 0;
+    R.Wet              = 0;
     return 1;
 }
 
@@ -2698,6 +3441,7 @@ UBOOL FSolidPass::AddWorldStart()
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = 0;
     R.Beam             = 0;
+    R.Wet              = 0;
     return 1;
 }
 
@@ -2724,6 +3468,7 @@ UBOOL FSolidPass::AddWorldEnd()
     R.Kind             = bStencilKinds ? CurrentKind : 0;
     R.bSprite          = 0;
     R.Beam             = 0;
+    R.Wet              = 0;
     return 1;
 }
 
@@ -2755,7 +3500,8 @@ INT FSolidPass::DrawReliefCovers(ID3D12GraphicsCommandList* Cmd, FTextureCache& 
         const FRun& R = Runs[RunOrder[At]];
         if (R.bWorldEnd || R.bClearDepthFirst || R.bTargetSwitch)
             break;
-        if (R.bFlash || R.bWorldStart || R.Count <= 0 || R.SrvIndex < 0 || R.bTess || R.bRepeat)
+        // A mesh run's corners are in view space (SetMeshRun): not for the covers' flat pipeline.
+        if (R.bFlash || R.bWorldStart || R.Count <= 0 || R.SrvIndex < 0 || R.bTess || R.bMesh || R.bRepeat)
             continue;
         const UBOOL bLevelModulated = (R.Mode == BLEND_Modulated && R.Kind == 0 && bCoverModulated) ? 1 : 0;
         if (!(R.Mode == BLEND_Opaque || R.Mode == BLEND_TranslucentOccluding ||
@@ -2803,6 +3549,80 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
     View.BufferLocation = VertexBuffers[FrameIndex]->GetGPUVirtualAddress();
     View.SizeInBytes    = VertexCount * sizeof(FSolidVertex);
     View.StrideInBytes  = sizeof(FSolidVertex);
+    VertexPeak          = Max(VertexPeak, VertexCount);
+    // A frame that grew in its middle (VertexRoomForMore): its vertices up to the switch in the slot's old buffer, the
+    // rest in the new one, at their own places - joined in the card's own buffer, which the frame's draws then read.
+    // Where that cannot be made, the frame's draws read the new buffer, whose first part holds nothing.
+    UBOOL bJoined = 0;
+    if (VertexSwitchAt >= 0 && VertexOld)
+    {
+        if (VertexJoinedRoom < VertexRoom[FrameIndex] && VertexDevice)
+        {
+            D3D12_HEAP_PROPERTIES Heap;
+            appMemzero(&Heap, sizeof(Heap));
+            Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC Desc;
+            appMemzero(&Desc, sizeof(Desc));
+            Desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            Desc.Width            = (UINT64)VertexRoom[FrameIndex] * sizeof(FSolidVertex);
+            Desc.Height           = 1;
+            Desc.DepthOrArraySize = 1;
+            Desc.MipLevels        = 1;
+            Desc.SampleDesc.Count = 1;
+            Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (VertexJoined)
+            {
+                // The older join may still be read by a frame in flight: it waits with the given-up buffers.
+                ID3D12Resource* const Old = VertexJoined.Get();
+                Old->AddRef();
+                VertexJoined.Release();
+                RetireVertexBuffer(Old, 0);
+            }
+            VertexJoinedRoom = 0;
+            if (SUCCEEDED(VertexDevice->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                __uuidof(ID3D12Resource), VertexJoined.VoidSlot())))
+            {
+                VertexJoinedRoom  = VertexRoom[FrameIndex];
+                VertexJoinedState = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
+            else
+                VertexJoined.Release();
+        }
+        if (VertexJoined && VertexJoinedRoom >= VertexCount)
+        {
+            D3D12_RESOURCE_BARRIER B;
+            appMemzero(&B, sizeof(B));
+            B.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            B.Transition.pResource   = VertexJoined.Get();
+            B.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            if (VertexJoinedState != D3D12_RESOURCE_STATE_COPY_DEST)
+            {
+                B.Transition.StateBefore = VertexJoinedState;
+                B.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                Cmd->ResourceBarrier(1, &B);
+            }
+            const UINT64 Stride = sizeof(FSolidVertex);
+            if (VertexSwitchAt > 0)
+                Cmd->CopyBufferRegion(VertexJoined.Get(), 0, VertexOld, 0, (UINT64)VertexSwitchAt * Stride);
+            if (VertexCount > VertexSwitchAt)
+                Cmd->CopyBufferRegion(VertexJoined.Get(), (UINT64)VertexSwitchAt * Stride, VertexBuffers[FrameIndex],
+                                      (UINT64)VertexSwitchAt * Stride, (UINT64)(VertexCount - VertexSwitchAt) * Stride);
+            B.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            B.Transition.StateAfter  = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            Cmd->ResourceBarrier(1, &B);
+            VertexJoinedState   = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            View.BufferLocation = VertexJoined->GetGPUVirtualAddress();
+            bJoined             = 1;
+        }
+        else
+            RdxLog(TEXT("vertices: the grown frame's two parts could not be joined on the card - its first %i vertices ")
+                   TEXT("are not drawn"), VertexSwitchAt);
+        // The old buffer is read by the copy above: it waits with the given-up buffers.
+        RetireVertexBuffer(VertexOld, 1);
+        VertexOld      = nullptr;
+        VertexSwitchAt = -1;
+    }
 
     // The jitter belongs to the WORLD and to nothing else: it starts with the world's first geometry (bWorldStart),
     // stops at the switch to the output target where the HUD begins, and never runs in a frame without a world, like
@@ -2810,6 +3630,9 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
     // the menu too - and a temporal upscaler resolves the world's offsets from the motion vectors, which the HUD has
     // none of. There its shake would simply be a shake.
     FLOAT Constants[6] = { 2.0f / (FLOAT)Width, 2.0f / (FLOAT)Height, 0.0f, 0.0f, LightBoost, 0.0f };
+
+    // The spherifier's field, if a new one was handed over, onto the card before anything is drawn with it.
+    UploadSphereField(Cmd, FrameIndex);
 
     ID3D12DescriptorHeap* Heaps[1] = { Textures.GetHeap() };
     Cmd->SetDescriptorHeaps(1, Heaps);
@@ -2836,6 +3659,9 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
     // The water's copies: made at the frame's first water run, once (FTargetSwitch::CopyForWater).
     UBOOL bWaterTried  = 0;
     UBOOL bWaterCopied = 0;
+    // A wet floor's run marked this frame (WetMarkView): the wet floors' layer on rays reads the mark, and only this
+    // frame's.
+    UBOOL bWetMarked = 0;
     // What the copy of the depth misses: where in the frame it was made, and how many runs that write the depth - the
     // level's and the actors' - still came after it before the world ended. The smoke, the waterfalls and the soft
     // particles stop at that copy, so a thing drawn after it is not there for them (reported below, sparsely).
@@ -2953,6 +3779,22 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         Cmd->SetGraphicsRootShaderResourceView(11, RtBind.LevelMaterial);
         Cmd->SetGraphicsRootDescriptorTable(12, Textures.GetGpuHandle(0));
         bRtRootSet      = 1;
+        CurrentMode     = -1;
+        CurrentNoSmooth = -1;
+        CurrentPom      = 1;
+        CurrentSrv      = -1;
+        CurrentLightSrv = -1;
+    };
+    // And back: a run of the rays' kinds that does not draw on rays after all - a water surface without its lamps'
+    // constants is a plain see-through one - binds the pass's own parameters, on the pass's own root signature,
+    // whatever the run before it left set.
+    auto UseOwnRoot = [&]()
+    {
+        if (!bRtRootSet)
+            return;
+        Cmd->SetGraphicsRootSignature(RootSignature.Get());
+        Cmd->SetGraphicsRoot32BitConstants(0, 6, Constants, 0);
+        bRtRootSet      = 0;
         CurrentMode     = -1;
         CurrentNoSmooth = -1;
         CurrentPom      = 1;
@@ -3153,8 +3995,17 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
             bPatches = 0;
             if (R.Count <= 0 || R.SrvIndex < 0)
                 return Ask;
-            if (R.Mode == BLEND_GlassMirror && Pipelines[PipeSet][BLEND_GlassMirror] && RtGlassMirrorPipe(PipeSet) &&
-                Zeros)
+            // The wet floors' layer (AddWetLayer): its own pipelines, or not on rays at all.
+            if (R.Mode == BLEND_GlassMirror && R.Wet == WET_LAYER)
+            {
+                if (bWetMarked && Pipelines[PipeSet][BLEND_GlassMirror] && RtWetMirrorPipelines[PipeSet] && Zeros)
+                {
+                    Ask   = RtWetAskPipelines[PipeSet].Get();
+                    Lamps = Zeros;
+                }
+            }
+            else if (R.Mode == BLEND_GlassMirror && Pipelines[PipeSet][BLEND_GlassMirror] &&
+                     RtGlassMirrorPipe(PipeSet) && Zeros)
             {
                 Ask   = RtGlassAskPipelines[PipeSet].Get();
                 Lamps = Zeros;
@@ -3197,8 +4048,9 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         Cmd->SetGraphicsRootDescriptorTable(ROOT_WATER_UAV_RT, RtBind.Asked);
         Cmd->IASetVertexBuffers(0, 1, &View);
         INT Topology = -1;
-        // What the stretch asked, for the log: the runs and their vertices by kind - water, glass, sludge.
-        INT AskedRuns[3] = { 0, 0, 0 }, AskedVertices[3] = { 0, 0, 0 }, Marked = 0;
+        // What the stretch asked, for the log: the runs and their vertices by kind - water, glass, sludge, the wet floors'
+        // layer.
+        INT AskedRuns[4] = { 0, 0, 0, 0 }, AskedVertices[4] = { 0, 0, 0, 0 }, Marked = 0;
         for (INT At = From; At < To; At++)
         {
             const FRun& R = Runs[RunOrder[At]];
@@ -3207,7 +4059,8 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
             ID3D12PipelineState* const Ask = AskWith(R, Lamps, bPatches);
             if (!Ask)
                 continue;
-            const INT Kind = (R.Mode == BLEND_Water) ? 0 : (R.Mode == BLEND_GlassMirror) ? 1 : 2;
+            const INT Kind = (R.Mode == BLEND_Water) ? 0 : (R.Wet == WET_LAYER) ? 3
+                           : (R.Mode == BLEND_GlassMirror) ? 1 : 2;
             AskedRuns[Kind]++;
             AskedVertices[Kind] += R.Count;
             FLOAT Run[WATER_CONSTANTS];
@@ -3251,9 +4104,9 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         static INT Told = 0;
         if ((Told++ % 601) == 0)
             RdxLog(TEXT("rays' list: a stretch of the flush asked, runs %i to %i of %i - water %i (%i vertices, %i ")
-                   TEXT("marked first), glass %i (%i vertices), sludge %i (%i vertices)"), From, To, NumOrder,
-                   AskedRuns[0], AskedVertices[0], Marked, AskedRuns[1], AskedVertices[1], AskedRuns[2],
-                   AskedVertices[2]);
+                   TEXT("marked first), glass %i (%i vertices), sludge %i (%i vertices), the wet floors' layer %i"),
+                   From, To, NumOrder, AskedRuns[0], AskedVertices[0], Marked, AskedRuns[1], AskedVertices[1],
+                   AskedRuns[2], AskedVertices[2], AskedRuns[3]);
         return Switch->EndMirrorAsk(Cmd, Dsv, RtBind);
     };
     for (INT OrderAt = 0; OrderAt < NumOrder; OrderAt++)
@@ -3303,10 +4156,16 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
 
         // The RT water's root signature is for the runs on rays alone - the water's, and the sludge mirror layer's where it
         // has its pipeline: anything else - a marker, the tint, another blend - gets the pass's own back first, everything
-        // bound again.
-        const UBOOL bRtKind = ((Runs[i].Mode == BLEND_Water && RtWaterPipe(PipeSet)) ||
-                               (Runs[i].Mode == BLEND_SludgeMirror && RtSludgeMirrorPipe(PipeSet)) ||
-                               (Runs[i].Mode == BLEND_GlassMirror && RtGlassMirrorPipe(PipeSet))) ? 1 : 0;
+        // bound again. And only while this stretch's rays are answered (bRtWater): without them - no copy of the picture
+        // to ask them from, the host not answering - such a run draws with the pass's own pipeline, and with the rays'
+        // root signature still set it would bind the pass's parameters where that one has others (D3D12 ERROR #710, #708,
+        // #201). The stretch's first such run asks the rays further down, with the pass's own set again.
+        const UBOOL bRtKind = (bRtWater &&
+                               ((Runs[i].Mode == BLEND_Water && RtWaterPipe(PipeSet)) ||
+                                (Runs[i].Mode == BLEND_SludgeMirror && RtSludgeMirrorPipe(PipeSet)) ||
+                                (Runs[i].Mode == BLEND_GlassMirror &&
+                                 ((Runs[i].Wet == WET_LAYER) ? RtWetMirrorPipelines[PipeSet].Get() != nullptr
+                                                             : RtGlassMirrorPipe(PipeSet) != nullptr)))) ? 1 : 0;
         if (bRtRootSet && (!bRtKind || Runs[i].bFlash || Runs[i].bTargetSwitch || Runs[i].bWorldStart ||
                            Runs[i].bWorldEnd))
         {
@@ -3444,21 +4303,35 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         if (Runs[i].Tree > 0 && Runs[i].Tree <= TreeDrawCount)
         {
             const FTreeDraw& D = TreeDrawList[Runs[i].Tree - 1];
-            ID3D12PipelineState* const Pso = D.bLeaves ? LeafPipelines[PipeSet].Get() : TreePipelines[PipeSet].Get();
+            // The bark's relief made real: its patches' pipeline, where there is one.
+            const UBOOL bPatchDraw = (D.bPatches && !D.bLeaves && TreePatchPipelines[PipeSet].Get()) ? 1 : 0;
+            ID3D12PipelineState* const Pso = D.bLeaves ? LeafPipelines[PipeSet].Get()
+                                           : bPatchDraw ? TreePatchPipelines[PipeSet].Get() : TreePipelines[PipeSet].Get();
             if (!Pso)
                 continue;
             Cmd->SetPipelineState(Pso);
             CurrentMode = -1;
-            if (bTopologyPatches)
+            if (bPatchDraw && !bTopologyPatches)
+            {
+                Cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+                bTopologyPatches = 1;
+            }
+            else if (!bPatchDraw && bTopologyPatches)
             {
                 Cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 bTopologyPatches = 0;
             }
             UINT RunConsts[4 + WATER_CONSTANTS];
             appMemzero(RunConsts, sizeof(RunConsts));
+            // The bark's relief (AddTreeDraw): its four numbers in the spare place, its height map in the water's table.
+            if (Runs[i].bPom)
+            {
+                appMemcpy(RunConsts + 4 + WATER_CONSTANTS - 4, Runs[i].Pom, sizeof(Runs[i].Pom));
+                Cmd->SetGraphicsRootDescriptorTable(4, Textures.GetGpuHandle(Runs[i].PomTable));
+            }
             Cmd->SetGraphicsRoot32BitConstants(3, 4 + WATER_CONSTANTS, RunConsts, 0);
             CurrentNoSmooth = 0;
-            CurrentPom      = 0;
+            CurrentPom      = Runs[i].bPom ? 1 : 0;
             if (Runs[i].SrvIndex != CurrentSrv)
             {
                 Cmd->SetGraphicsRootDescriptorTable(1, Textures.GetGpuHandle(Runs[i].SrvIndex));
@@ -3655,7 +4528,10 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         {
             // Without the copies, or the lamps' constants, the water is what it always was: a translucent surface.
             if (!bWaterCopied || !WaterLamps)
+            {
                 Mode = BLEND_Translucent;
+                UseOwnRoot();
+            }
             else
             {
                 WaterMissed = Max(WaterMissed, OthersAfterCopy);
@@ -3664,6 +4540,8 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
                     bRtRun = 1;
                     UseRtRoot();
                 }
+                else
+                    UseOwnRoot();
                 // The water's own depth, for the run's pixel shader to write where its surface is seen
                 // (FTargetSwitch::WaterSurfaceView) - the constant says whether it may.
                 UBOOL     bSurface    = 0;
@@ -3725,6 +4603,8 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
                 bRtRun = 1;
                 UseRtRoot();
             }
+            else
+                UseOwnRoot();
             FLOAT WaterRun[WATER_CONSTANTS];
             for (INT k = 0; k < WATER_CONSTANTS; k++)
                 WaterRun[k] = Runs[i].Water[k];
@@ -3743,15 +4623,27 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
                 continue;
             const D3D12_GPU_VIRTUAL_ADDRESS Zeros = (HeldFrame >= 0 && HeldBuffers[HeldFrame])
                                                     ? HeldBuffers[HeldFrame]->GetGPUVirtualAddress() : 0;
-            if (bRtWater && RtGlassMirrorPipe(PipeSet) && Zeros)
+            // The wet floors' layer (AddWetLayer) is drawn on rays alone: where none run this frame, the late
+            // reflection pass has given their water back.
+            const UBOOL bWetLayer = (Runs[i].Wet == WET_LAYER) ? 1 : 0;
+            if (bWetLayer)
+            {
+                if (!bWetMarked || !bRtWater || !RtWetMirrorPipelines[PipeSet] || !Zeros)
+                    continue;
+                bRtRun = 1;
+                UseRtRoot();
+                Cmd->SetGraphicsRootConstantBufferView(5, Zeros);
+            }
+            else if (bRtWater && RtGlassMirrorPipe(PipeSet) && Zeros)
             {
                 bRtRun = 1;
                 UseRtRoot();
                 Cmd->SetGraphicsRootConstantBufferView(5, Zeros);
             }
-            // A pane's layer is drawn on rays alone: without them the pane stands as the level drew it. A mirror's
-            // whole image (its constant 31) keeps the picture's copy to fall back on.
-            else if (Runs[i].Water[31] <= 0.5f)
+            // A pane's layer is drawn on rays, or where no rays run from the mirror probe (its constant 27, the
+            // probe's reach - SolidPass.hlsl's GlassProbe): with neither the pane stands as the level drew it. A
+            // mirror's whole image (its constant 31) keeps the picture's copy to fall back on.
+            else if (Runs[i].Water[31] <= 0.5f && !(Runs[i].Water[27] > 0.0f))
                 continue;
             else if (bRtRootSet)
             {
@@ -3793,6 +4685,20 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
                                                   (Mode == BLEND_Fog && TessFogPipelines[PipeSet]))) ? 1 : 0;
         if (Runs[i].bTess && !bTessRun)
             continue;
+        // The models rounded: without the pipeline a mesh run cannot be drawn - its corners are in view space, not on
+        // the screen (the renderer makes none then, CanRoundMeshes).
+        const INT   MeshMode = Runs[i].bMesh ? MeshModeOf(Mode) : -1;
+        const UBOOL bMeshRun = (MeshMode >= 0 && MeshPipelines[MeshMode][PipeSet]) ? 1 : 0;
+        if (Runs[i].bMesh && !bMeshRun)
+            continue;
+        if (bMeshRun)
+        {
+            Cmd->SetGraphicsRoot32BitConstants(3, WATER_CONSTANTS, Runs[i].Water, 4);
+            CurrentPom = 0;
+            // The frame's edges, in the spherifier field's place (DSMesh's MeshEdges).
+            if (HeldFrame >= 0 && MeshEdgeBuffers[HeldFrame])
+                Cmd->SetGraphicsRootShaderResourceView(ROOT_SPHERE, MeshEdgeBuffers[HeldFrame]->GetGPUVirtualAddress());
+        }
         // The patches read what stands above them (DSRelief, ReliefClear): the covers are made before a view's first
         // patches, once a view - the depth drawn so far, and the rest of that view's covers drawn into it - and every
         // patch run
@@ -3842,6 +4748,17 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
                 Block = HeldBuffers[HeldFrame]->GetGPUVirtualAddress();      // the zeros at its start
             if (Block)
                 Cmd->SetGraphicsRootConstantBufferView(5, Block);
+            // The spherifier's field for its patches (the block's rows say whether this run is rounded by it). Where
+            // the card holds none for the rounding drawn, the held buffer's zeros: a field of no cells, which rounds
+            // nothing - never what the register held before, a model run's edges.
+            if (Runs[i].bTess)
+            {
+                const D3D12_GPU_VIRTUAL_ADDRESS Zeros =
+                    (HeldFrame >= 0 && HeldBuffers[HeldFrame]) ? HeldBuffers[HeldFrame]->GetGPUVirtualAddress() : 0;
+                const D3D12_GPU_VIRTUAL_ADDRESS Field = SphereAddress ? SphereAddress : Zeros;
+                if (Field)
+                    Cmd->SetGraphicsRootShaderResourceView(ROOT_SPHERE, Field);
+            }
         }
 
         // The four spare numbers carry the relief on an opaque run and the soft fade on a translucent one. A run is
@@ -3876,8 +4793,14 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
 
         // The water's triangles go in as patches, to be cut and lifted (DSWater) - the sludge's and its fog map's too - and
         // so do the relief's (DSRelief); everything else as triangles.
+        // A wet floor's run (SetWet): its own pipeline, flat or with the relief made real, reading the frame's block of
+        // its kind and marking the wet floors' mark - drawn as it always was where any of that is missing.
+        const INT   Wet     = (!bRtRun && !bMeshRun && Mode == BLEND_Opaque && Runs[i].Wet >= 1 &&
+                               Runs[i].Wet <= WET_KINDS) ? Runs[i].Wet : 0;
+        const UBOOL bWetRun = (Wet > 0 && WetOn[Wet - 1] && Switch &&
+                               (bTessRun ? TessWetPipelines[PipeSet] : WetPipelines[PipeSet])) ? 1 : 0;
         const UBOOL bPatches = (Mode == BLEND_Water || Mode == BLEND_Sludge || Mode == BLEND_SludgeFog ||
-                                Mode == BLEND_SludgeMirror || bTessRun) ? 1 : 0;
+                                Mode == BLEND_SludgeMirror || bTessRun || bMeshRun) ? 1 : 0;
         if (bPatches != bTopologyPatches)
         {
             Cmd->IASetPrimitiveTopology(bPatches ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
@@ -3886,19 +4809,26 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         }
 
         // The RT water's pipeline goes by a mode of its own, past the blend modes, the relief's three by the next, and the
-        // sludge mirror layer's on rays by the one after them.
-        const INT PipeMode = bRtRun ? ((Mode == BLEND_SludgeMirror) ? (INT)BLEND_MAX + 4
+        // sludge mirror layer's on rays by the one after them; the meshes' after those, then the wet floors' two, and their
+        // layer on rays last.
+        const UBOOL bWetLayerRun = (bRtRun && Mode == BLEND_GlassMirror && Runs[i].Wet == WET_LAYER) ? 1 : 0;
+        const INT PipeMode = bWetRun ? (INT)BLEND_MAX + 6 + MESH_MODES + (bTessRun ? 1 : 0) :
+                             bWetLayerRun ? (INT)BLEND_MAX + 8 + MESH_MODES :
+                             bRtRun ? ((Mode == BLEND_SludgeMirror) ? (INT)BLEND_MAX + 4
                                        : (Mode == BLEND_GlassMirror) ? (INT)BLEND_MAX + 5 : (INT)BLEND_MAX)
                                     : (bTessRun ? (INT)BLEND_MAX + ((Mode == BLEND_Opaque)    ? 1
                                                                     : (Mode == BLEND_Modulated) ? 2 : 3)
-                                                : Mode);
+                                                : (bMeshRun ? (INT)BLEND_MAX + 6 + MeshMode : Mode));
         ID3D12PipelineState* const Pso =
+            bWetRun  ? (bTessRun ? TessWetPipelines[PipeSet].Get() : WetPipelines[PipeSet].Get()) :
+            bWetLayerRun ? RtWetMirrorPipelines[PipeSet].Get() :
             bRtRun   ? ((Mode == BLEND_SludgeMirror) ? RtSludgeMirrorPipe(PipeSet)
                         : (Mode == BLEND_GlassMirror) ? RtGlassMirrorPipe(PipeSet)
                                                       : RtWaterPipe(PipeSet)) :
             bTessRun ? ((Mode == BLEND_Opaque)    ? TessPipelines[PipeSet].Get()
                         : (Mode == BLEND_Modulated) ? TessModPipelines[PipeSet].Get()
                                                     : TessFogPipelines[PipeSet].Get()) :
+            bMeshRun ? MeshPipelines[MeshMode][PipeSet].Get() :
                        Pipelines[PipeSet][Mode].Get();
         if (PipeMode != CurrentMode)
         {
@@ -3940,6 +4870,14 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
             if (BounceView >= 0)
                 Cmd->SetGraphicsRootDescriptorTable(ROOT_BOUNCE, Textures.GetGpuHandle(BounceView));
         }
+        // A wet floor's run: the block of its kind, and the table its mark is written through (u4) - the mark ready,
+        // cleared on the frame's first.
+        if (bWetRun)
+        {
+            Cmd->SetGraphicsRootConstantBufferView(ROOT_WET, WetOn[Wet - 1]);
+            Cmd->SetGraphicsRootDescriptorTable(ROOT_WATER_UAV, Textures.GetGpuHandle(Switch->WetMarkView(Cmd)));
+            bWetMarked = 1;
+        }
         if (bDredMarkers)
         {
             WCHAR Label[96];
@@ -3970,7 +4908,7 @@ void FSolidPass::Flush(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, FTextureC
         else if (bCopyCounting && Mode != BLEND_Fall)
             OthersAfterCopy++;
         // Not the relief's patches: their vertices are in view space, not on the screen, so there is no area to add.
-        if (bModeStats && !bTessRun && (INT)Runs[i].Mode >= 0 && (INT)Runs[i].Mode < BLEND_MAX)
+        if (bModeStats && !bJoined && !bTessRun && (INT)Runs[i].Mode >= 0 && (INT)Runs[i].Mode < BLEND_MAX)
         {
             const INT M = (INT)Runs[i].Mode;
             const INT K = (Runs[i].Kind == 1) ? 1 : 0;

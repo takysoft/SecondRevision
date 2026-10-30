@@ -65,6 +65,13 @@ public:
     INT   FindCached(QWORD CacheId, const TCHAR* PathName, INT USize, INT VSize);
 
     INT   GetHeightSrv(INT Entry) const;
+    // A map of the renderer's own, not of a texture package's - a grown plant's bark: its entry under Key, made the first
+    // time with the map Blob (MakeOwnBlob's, which the caller keeps for as long as the renderer runs) and the depth, and
+    // found again after. -1: no room. A new set of maps (SetMethod) lets it go with the rest; it is then made again.
+    INT   AddOwn(const char* Key, const BYTE* Blob, INT Bytes, INT W, INT H, FLOAT Depth);
+    // A map of heights - W x H, a byte each, 255 the top - laid out for AddOwn with its shrunken copies, in memory the
+    // caller frees (appFree); Bytes its size. Null: no memory.
+    static BYTE* MakeOwnBlob(const BYTE* Heights, INT W, INT H, INT& Bytes);
     // One over the MAP's own size, which the shader needs to step through it a texel at a time. A smaller set's map is
     // smaller than the texture it belongs to.
     void  GetSize(INT Entry, FLOAT& OutU, FLOAT& OutV) const;
@@ -76,7 +83,7 @@ public:
 
 private:
     // MAX_ENTRIES: one set can hold a map for every texture picked for the relief. FTextureCache's POM_VIEWS has room
-    // for two descriptors to each, and the two the last one's table reads past its own.
+    // for two descriptors to each, and the five the last one's table reaches past its own.
     enum { MAX_ENTRIES = 2048, MAX_KEY = 96, MAX_MIPS = 14, MAX_PACKS = 512, MAX_PACK_NAME = 64, MAX_FILE = 128 };
 
     struct FEntry
@@ -97,6 +104,8 @@ private:
         ID3D12Resource* Height;
         INT             HeightSrv;
         INT             Mips;             // how many shrunken copies the map has
+        const BYTE*     Own;              // an own map (AddOwn): the map itself, in the caller's memory
+        INT             OwnBytes;
     };
 
     UBOOL Upload(FEntry& E, INT Index, const BYTE* Data, INT Bytes, ID3D12GraphicsCommandList* Cmd,
@@ -121,6 +130,7 @@ private:
     FEntry          Entries[MAX_ENTRIES];
     INT             Count;
     INT             Uploaded;
+    INT             OwnLast = -1;      // the own map last found (AddOwn)
     // Frames still to pass after a set change before anything is uploaded: the new maps go into the same descriptor
     // slots, and a frame recorded before the change may still be reading them on the card.
     INT             Hold;

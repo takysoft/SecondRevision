@@ -167,6 +167,13 @@ public:
     // not a detail: a shadow belongs to the wall behind the smoke, and a wall's shadow drawn ONTO the smoke in front
     // of it is the oldest tell there is. Drawn as one triangle over the whole target, blended src + dst*(1-cover).
     UBOOL InitComposite(ID3D12Device* Device, DXGI_FORMAT SceneFormat);
+    // The heat haze's pass made now rather than at its first use (FBackend::WarmShaders), by its own flag.
+    UBOOL WarmHaze(ID3D12Device* Device, DXGI_FORMAT SceneFormat)
+    {
+        if (HazeReady == 0)
+            HazeReady = InitHaze(Device, SceneFormat) ? 1 : -1;
+        return HazeReady > 0;
+    }
     void  RecordComposite(ID3D12GraphicsCommandList* Cmd);
     UBOOL HasComposite() const { return Lay.Get() != nullptr; }
 

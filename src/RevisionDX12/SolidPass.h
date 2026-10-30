@@ -12,6 +12,7 @@
 #include "FinalPass.h"
 
 class FTextureCache;
+class FCardWriter;
 
 // Screen-space shadows' second render target (FSolidPass::Init with stencil kinds): the light each surface receives - the
 // light map times the vertex colour, as luminance - for the shadow pass to weigh a light's share against. One float.
@@ -163,6 +164,11 @@ public:
     // Between a water run's two goes: everything the first wrote into the water's own depth is in it before the second
     // reads it.
     virtual void WaterSurfaceSettle(ID3D12GraphicsCommandList* Cmd) = 0;
+    // A wet floor's run is next (SetWet): the wet floors' mark (FBackend's WetMark) made writable for its pixel shader
+    // (u4, PSMainWet), cleared on the frame's first wet run. Returns the texture heap index of the table to bind at
+    // ROOT_WATER_UAV - the water's own depth's view, the mark's being SetWetMarkView's offset after it - with a view of
+    // nothing in the mark's place where there is no mark.
+    virtual INT WetMarkView(ID3D12GraphicsCommandList* Cmd) = 0;
     // Geometry=Tessellation: the relief's first patches are next. The depth drawn so far is copied into the covers - the
     // depth the relief's domain shader finds what stands above a surface in (ReliefClear) - and the covers are left bound
     // as the only target, for this pass to draw the rest of the world's covers into (DrawReliefCovers). False, with
@@ -257,11 +263,14 @@ public:
     // Where the rays' list's views lie in the texture heap, before Init - the rays' root signature names them by how
     // far each lies from a view it has a table at already: the answers (and after them what the rays passed) from
     // the masks' view, the pixels' heads (and after them the requests, as a pixel shader writes them) from the
-    // water's own depth's view.
-    void  SetRayListViews(INT AnswersAfterMasks, INT HeadsAfterSurface)
+    // water's own depth's view - and from there too the list Reflections=RTLow's pixels write into instead (u7,
+    // FRaySparse); and the corners the rays are traced against (t23..t25) from the masks' view too.
+    void  SetRayListViews(INT AnswersAfterMasks, INT HeadsAfterSurface, INT LowAfterSurface, INT CornersAfterMasks)
     {
         RayAnswersAfterMasks = AnswersAfterMasks;
         RayHeadsAfterSurface = HeadsAfterSurface;
+        RayLowAfterSurface   = LowAfterSurface;
+        RayCornersAfterMasks = CornersAfterMasks;
     }
     // Where the view of what the shadows' apply pass needs of the water's pixels lies (u6), as far after the water's own
     // depth's view - before Init.
@@ -344,6 +353,29 @@ public:
     // cone alone, by the view's own numbers - the light off the mirrors is the world's view's. Runs that differ in
     // it are not merged.
     void SetBeamLit(INT How) { CurrentBeamLit = (How >= 1 && How <= BEAM_KINDS) ? How : 0; }
+    // Whether the next geometry is a wet floor (docs/terv-nedves-feluletek.md 8.5), and of what kind - 0 not, 1 stone,
+    // 2 metal, 3 wood (RdxMath::EWetKind): its opaque runs are drawn with WetPipelines, reading the block of their kind
+    // (SetWetBlocks) and leaving their mark for the late reflection pass. Runs that differ in it are not merged.
+    enum { WET_KINDS = 3 };
+    void SetWet(INT Kind) { CurrentWet = (Kind >= 1 && Kind <= WET_KINDS) ? Kind : 0; }
+    // The frame slot's wet blocks, RdxMath::WetBlockFloats numbers each - the world's view's place in the level, its
+    // screen, the look's numbers (SolidPass.hlsl's WetConsts) - one for each kind, WET_KINDS of them in a row; null for a
+    // frame whose view has no place, whose wet runs then read the block of zeros and stay as they are.
+    void SetWetBlocks(INT FrameIndex, const FLOAT* Blocks);
+    // Where the wet floors' mark's views lie, before Init: as written (u4), as far after the water's own depth's view; and
+    // as read by the wet floors' layer on rays (t26, a range of the masks' table in the rays' root signature), as far
+    // after the masks' view.
+    void SetWetMarkView(INT AfterSurface, INT SrvAfterMasks, INT CoverAfterSurface)
+    {
+        WetMarkAfterSurface  = AfterSurface;
+        WetMarkSrvAfterMasks = SrvAfterMasks;
+        WetCoverAfterSurface = CoverAfterSurface;
+    }
+    // The wet floors' water on rays (Reflections=RTLow and up; SolidPass.hlsl's WetMirror): one run over the whole screen,
+    // laid over the world's solid runs as a pane's mirror layer is (BLEND_GlassMirror) - its numbers a pane's (Consts, as
+    // RenderDevice's GlassRunConstants fills them), its texture White. Drawn only where the frame traces its rays
+    // (RtWetMirrorPipelines); anywhere else the late reflection pass gives the water back (FWetReflect).
+    void AddWetLayer(const FLOAT* Consts, INT White);
     // The frame slot's blocks: the flashlight's cone (RdxMath::BeamBlock's sixteen numbers) - Block for the runs that
     // take all of it, Thin for the see-through ones - or null for a frame without it. Mirrors: the level's mirrors
     // that give the cone back to the world's view's runs (FBeamBounce), eight numbers each - the mirror's plane in
@@ -391,6 +423,9 @@ public:
     // The last of them is this pass's own, never RenderDevice's: 1 where the water's own depth is bound for the water to
     // write (FTargetSwitch::WaterSurfaceView), set as each water run is drawn.
     enum { WATER_SURFACE_CONSTANT = 35 };
+    // Where the water's table holds the caustics' net (t13), and the mirror probe's pyramid and the own body's picture
+    // (t21, t22) after it, counted from its first view - FBackend's water sets put them there.
+    enum { WATER_VIEW_NET = 4, WATER_VIEW_PROBE = 5 };
     // The root signatures' parameter for that view (u3): after the pass's own seven, after the RT water's thirteen.
     enum { ROOT_WATER_UAV = 7, ROOT_WATER_UAV_RT = 13 };
     // And the pass's own root signature's parameter for the flashlight's block (b4). The RT water's has none, and no
@@ -398,6 +433,11 @@ public:
     enum { ROOT_BEAM = 8 };
     // And for the mirrors' map (t15), a table as its view sits in the texture heap: the pass's own root signature's.
     enum { ROOT_BOUNCE = 9 };
+    // And for the spherifier's field (t20, SetSphereField), which DSRelief rounds the relief's patches by: the pass's own
+    // root signature's - no RT water run draws relief.
+    enum { ROOT_SPHERE = 10 };
+    // And for the wet floors' block (b5, SetWetBlocks): the pass's own root signature's - no floor is drawn on rays.
+    enum { ROOT_WET = 11 };
     void SetWaterConstants(const FLOAT* C) { for (INT i = 0; i < WATER_CONSTANTS; i++) WaterNow[i] = C[i]; }
     // What follows is seen through a mirror whose image is traced: the engine's own drawing of the see-through things
     // in the mirror - a flame, a sprite, a pane - which the rays' scene does not hold. It comes before the world and
@@ -457,6 +497,21 @@ public:
         ReliefNow[6]  = Plane[3];                                                        // WaterView.z
     }
     void ClearReliefRun() { bReliefNow = 0; bTessNow = 0; ReliefBlockNow = 0; }
+    // The models rounded (Spherifier): the runs that follow are mesh triangles as patches of three, their
+    // corners in VIEW space, each with the bow of the edge from it to the next corner (the vertex's PX, PY, PN; MeshRound.h),
+    // cut and bowed out on the GPU (VSMesh, HSMesh, DSMesh). Sag: how far a cut piece of an edge may stand off its curve,
+    // in the engine's pixels; Focal, CentreX, CentreY: the engine's projection of the triangle; Most: the most a point
+    // moves, level units; Shape: how much of the curve, 0 to 1.
+    void SetMeshRun(FLOAT Sag, FLOAT Focal, FLOAT CentreX, FLOAT CentreY, FLOAT Most, FLOAT Shape)
+    {
+        for (INT i = 0; i < WATER_CONSTANTS; i++)
+            MeshNow[i] = 0.0f;
+        MeshNow[4]  = Sag;      MeshNow[5]  = Focal;                                // WaterView.xy
+        MeshNow[6]  = Most;     MeshNow[7]  = Shape;                                // WaterView.zw
+        MeshNow[16] = CentreX;  MeshNow[17] = CentreY;                              // WaterScreen.xy
+        bMeshNow = 1;
+    }
+    void ClearMeshRun() { bMeshNow = 0; }
     // Whether the world's tessellated runs are drawn together (Flush); on unless a measurement turns it off.
     void SetTessTogether(UBOOL bOn) { bTessTogether = bOn ? 1 : 0; }
     // Whether the world's blended runs go after the runs that write depth (Flush); on unless a measurement turns it off.
@@ -475,8 +530,31 @@ public:
     // register and the root signature has no room for another. Returns the block, for a run drawing the same patches
     // again (SetReliefBlock); zero when there are none, too many, or no room left this frame - the patches' corners then
     // carry the band.
-    enum { RELIEF_HELD_MAX = 64 };
-    D3D12_GPU_VIRTUAL_ADDRESS SetReliefHeld(const FLOAT* Lamps, INT LampFloats, const FLOAT* Ends, INT Count);
+    // Sphere: the spherifier's rows for patches it rounds (DSRelief, SphereMoveAt) - SPHERE_FLOATS of them: on (1), the
+    // light map's coordinates against the texture's along U and V, how many of the level's polygons the patches lie on
+    // (none: any); the view's space to the level's, three rows of an axis and an offset each; the level's to the view's,
+    // the same; and those polygons' numbers, eight words - or none. With them a block is made even with no held edges.
+    enum { RELIEF_HELD_MAX = 64, SPHERE_ROWS = 9, SPHERE_FLOATS = 4 * SPHERE_ROWS, SPHERE_NODES = 8 };
+    D3D12_GPU_VIRTUAL_ADDRESS SetReliefHeld(const FLOAT* Lamps, INT LampFloats, const FLOAT* Sphere, const FLOAT* Ends,
+                                            INT Count);
+    // The models rounded: this frame's room for Count edges' terms (MESH_EDGE_FLOATS floats each, MeshRound.h's
+    // FEdgeTerms from the edge's end A to its end B: a bend and its room in each four), which the mesh runs' domain shader
+    // reads by the number a patch's corner carries (DSMesh). Returns where to write them - write-combined, never read -
+    // and in First the first one's number this frame; null when the frame has no room left.
+    enum { MESH_EDGE_FLOATS = 16, MESH_EDGE_BYTES = 4 * 1024 * 1024 };
+    FLOAT* MeshEdgeRoom(INT Count, INT& First);
+    // The level's rounding for DSRelief (LevelRound.h's PackRound), Count words: kept here and put on the card at the next
+    // Flush; none (Count 0) when the level has no rounding. Gen is the caller's number for it, which SphereFieldGen says
+    // back - and -1 before any, and after the pass is taken down.
+    void SetSphereField(const DWORD* Words, INT Count, INT Gen);
+    // The same, taking the caller's block (malloc's, freed here once it is on the card) rather than a copy of it: a
+    // large rounded level's field is tens of megabytes, twice over in the 32-bit address space as a copy.
+    void TakeSphereField(DWORD* Words, INT Count, INT Gen);
+    INT  SphereFieldGen() const { return SphereGen; }
+    // What puts the field on the card's own memory (FBackend's, CardWriter.h): with it no upload buffer of the field's
+    // size is kept - one a frame slot, each as large as the largest field so far, took more of the 32-bit address space
+    // than a large rounded level can spare. Null: those upload buffers.
+    void SetCardWriter(FCardWriter* Writer) { Card = Writer; }
     void SetReliefBlock(D3D12_GPU_VIRTUAL_ADDRESS Block) { ReliefBlockNow = Block; }
     // The vertices written so far this frame, and a run that draws a stretch of them AGAIN with the state in force now -
     // the detail texture over a surface's relief patches, which must land on exactly the same lifted surface. Such a
@@ -533,6 +611,19 @@ public:
     // And the fog map's pass over them (BLEND_Fog).
     UBOOL CanTessellateFog() const
     { return TessFogPipelines[0].Get() && (MsaaSamples <= 1 || TessFogPipelines[1].Get()); }
+    // The blend modes a mesh's triangle comes in, each with its own set of patch pipelines: the solid, the glass, the
+    // modulated - -1 for any other.
+    enum { MESH_MODES = 3 };
+    static INT MeshModeOf(INT Mode)
+    {
+        return (Mode == BLEND_Opaque) ? 0 : (Mode == BLEND_Translucent) ? 1 : (Mode == BLEND_Modulated) ? 2 : -1;
+    }
+    // Whether mesh patches of blend mode Mode can be drawn (SetMeshRun): its pipelines were made for both sample counts.
+    UBOOL CanRoundMeshes(INT Mode) const
+    {
+        const INT m = MeshModeOf(Mode);
+        return m >= 0 && MeshPipelines[m][0].Get() && (MsaaSamples <= 1 || MeshPipelines[m][1].Get());
+    }
     // Where the water runs' four views start in the texture heap (the picture, the depth, the ripples, the texture's own
     // wave field): the backend keeps two such sets and moves between them as the ripples' field flips (StepRipples).
     void SetWaterTable(INT FirstView) { WaterTable = FirstView; }
@@ -641,7 +732,7 @@ private:
                        TComRef<ID3D12PipelineState>* Ask, const TCHAR* What);
     UBOOL CreateVertexBuffers(ID3D12Device* Device);
 
-    enum { MAX_VERTICES = 400000, MAX_RUNS = 8192 };
+    enum { MAX_RUNS = 8192 };
 
     // One draw call: a stretch of vertices sharing a texture.
     struct FRun
@@ -664,6 +755,7 @@ private:
         INT        Kind;            // SetKind's surface kind, for the stencil (geometry runs only)
         UBOOL      bSprite;         // SetSprite's: a sprite's picture, not a mesh's polygons (geometry runs only)
         INT        Beam;            // SetBeamLit's: which of the flashlight's blocks, 0 none (geometry runs only)
+        INT        Wet;             // SetWet's: a wet floor's kind, 0 none (opaque geometry runs only)
         FLOAT      Flash[6];        // its scale (RGB) and fog (RGB)
         FLOAT      Water[WATER_CONSTANTS];   // a water run's constants (SetWaterConstants)
         // The relief (POM). A run either has height maps or it has not; the four numbers ride in the constants the
@@ -676,6 +768,7 @@ private:
         // TessPipelines (TessModPipelines when modulated).
         UBOOL      bRelief;
         UBOOL      bTess;
+        UBOOL      bMesh;                    // mesh patches, rounded on the GPU (SetMeshRun); its numbers in Water
         UBOOL      bRepeat;                  // draws vertices another run drew (AddRepeatRun): never extended
         UBOOL      bInMirror;                // SetInMirror's: seen through a traced mirror, drawn over its image
         D3D12_GPU_VIRTUAL_ADDRESS ReliefBlock;   // its held edges and lamps (SetReliefHeld); zero: the frame's lamps
@@ -712,7 +805,19 @@ private:
     // the modulated one for the detail texture over the same patches, and the fog map's.
     TComRef<ID3D12PipelineState> TessPipelines[PIPE_SETS];
     TComRef<ID3D12PipelineState> TessModPipelines[PIPE_SETS];
+    // The wet floors' opaque runs (SetWet): the opaque pipeline and the relief's, with the wet floors' pixel shader
+    // (PSMainWet, PSMainLitSurfaceWet), a set each. Without them a wet floor is drawn as it always was.
+    TComRef<ID3D12PipelineState> WetPipelines[PIPE_SETS];
+    TComRef<ID3D12PipelineState> TessWetPipelines[PIPE_SETS];
+    // The wet floors' layer on rays (AddWetLayer, MakeRtWetMirror): the build that reads the host's answers, and the build
+    // that writes its rays down, a set each - the glass's layer's description with the wet floors' pixel shaders.
+    TComRef<ID3D12PipelineState> RtWetMirrorPipelines[PIPE_SETS];
+    TComRef<ID3D12PipelineState> RtWetAskPipelines[PIPE_SETS];
+    void MakeRtWetMirror(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE_DESC Desc);
     TComRef<ID3D12PipelineState> TessFogPipelines[PIPE_SETS];
+    // The models rounded: the solid, the glass's and the modulated pipeline with the mesh patches' stages (VSMesh,
+    // HSMesh, DSMesh) - by MeshModeOf - a set each.
+    TComRef<ID3D12PipelineState> MeshPipelines[MESH_MODES][PIPE_SETS];
     // Grass3D: the opaque pipeline with the blades' vertex shader (MakeGrass) - the same pixel shader, targets, depth,
     // stencil and blend, so a blade is drawn exactly as the ground under it - a set each.
     TComRef<ID3D12PipelineState> GrassPipelines[PIPE_SETS];
@@ -724,11 +829,19 @@ private:
     // And the leaves': the same with their own vertex shader and a leaf's instance as the input (MakeTree).
     TComRef<ID3D12PipelineState> LeafPipelines[PIPE_SETS];
     TComRef<ID3DBlob>            LeafVs;
+    // And the bark's relief made real (Geometry=DisplacementMapping): its triangles as patches, cut and pushed in by the
+    // height map (TreeShader.h's VSTreePatch, HSTree, DSTree; MakeTree). None: the bark's relief is its shading alone.
+    TComRef<ID3D12PipelineState> TreePatchPipelines[PIPE_SETS];
+    TComRef<ID3DBlob>            TreePatchVs, TreeHs, TreeDs;
     void MakeTree(ID3D12Device* Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& Desc);
     // Wind: the see-through pipeline with the dust's vertex shader (MakeDust).
     TComRef<ID3D12PipelineState> DustPipelines[PIPE_SETS];
     TComRef<ID3DBlob>            DustVs;
     void MakeDust(ID3D12Device* Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& Desc);
+    // The wet floors' two (WetPipelines, TessWetPipelines) from the opaque pipeline's description: its pixel shader the
+    // wet one (Ps), and for the second the relief's stages in front of it (none: no relief made real).
+    void MakeWet(ID3D12Device* Device, D3D12_GRAPHICS_PIPELINE_STATE_DESC Desc, ID3DBlob* Ps, ID3DBlob* Vs,
+                 ID3DBlob* Hs, ID3DBlob* Ds);
     // And their covers (DrawReliefCovers): depth alone, single-sample - under MSAA there are none (FBackend refuses them).
     TComRef<ID3D12PipelineState> CoverPipeline;
     INT                          CoverView = -1;       // see SetCoverViews
@@ -754,6 +867,32 @@ private:
 
     ID3D12Resource* VertexBuffers[BACKEND_FRAME_COUNT];
     FSolidVertex*   Mapped[BACKEND_FRAME_COUNT];
+    // How many vertices each slot's buffer holds (RdxMath::VertexRoomFor): it grows at the start of the slot's frame,
+    // when the frames have come within a quarter of it (VertexPeak, the most a frame has asked for). A frame that
+    // outgrows it all the same goes on in a new, larger buffer from where it was (VertexSwitchAt; VertexOld the buffer
+    // before, holding what was written up to there), and Flush joins the two parts in the card's own buffer
+    // (VertexJoined) for that frame's draws - nothing is dropped. Only past RdxMath::VertexRoomMost, or where the card
+    // refuses a buffer, is geometry dropped, and every such frame is counted.
+    INT                     VertexRoom[BACKEND_FRAME_COUNT] = {};
+    INT                     VertexPeak     = 0;
+    INT                     VertexSwitchAt = -1;
+    ID3D12Resource*         VertexOld      = nullptr;
+    TComRef<ID3D12Resource> VertexJoined;
+    INT                     VertexJoinedRoom  = 0;
+    D3D12_RESOURCE_STATES   VertexJoinedState = D3D12_RESOURCE_STATE_COPY_DEST;
+    ID3D12Device*           VertexDevice      = nullptr;
+    // The buffers given up, kept until no frame in flight can read them (their age in frames).
+    enum { VERTEX_RETIRED_MOST = 8 };
+    ID3D12Resource*         VertexRetired[VERTEX_RETIRED_MOST]    = {};
+    INT                     VertexRetiredAge[VERTEX_RETIRED_MOST] = {};
+    INT                     VertexDropFrames = 0;     // frames that dropped geometry, all the same
+    INT                     VertexDropFrame  = 0;     // the frame's own: whether it dropped any yet
+    INT                     VertexAskedMost  = 0;     // the most a frame asked for that dropped
+    // A buffer of Room vertices in the upload heap, mapped; false where the card refuses it.
+    UBOOL MakeVertexBuffer(INT Room, ID3D12Resource*& Out, FSolidVertex*& OutMapped);
+    void  RetireVertexBuffer(ID3D12Resource* Buffer, UBOOL bMapped);
+    // Room for Needed vertices more in this frame: true where there is, made where there was not (see VertexRoom).
+    UBOOL VertexRoomForMore(INT Needed);
 
     // Where AddFan writes: this frame slot's vertex buffer itself, from Begin to Flush. Straight into the upload
     // heap rather than into ordinary memory copied across at Flush - that copy measured 0.19 ms a frame at 35000-odd
@@ -784,12 +923,32 @@ private:
     BYTE*           BeamMapped = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS BeamOn[BEAM_KINDS] = {};      // this frame's blocks, or zero for the block of zeros
     INT             BounceView = -1;
+    // The wet floors' blocks (SetWetBlocks): one upload buffer, WET_KINDS blocks a frame slot and one more that stays
+    // zeros; the frame's, or zero where it has none.
+    enum { WET_BLOCK_BYTES = 256 };
+    // The run's Wet for the wet floors' layer on rays (AddWetLayer), past the kinds.
+    enum { WET_LAYER = WET_KINDS + 1 };
+    static_assert(RdxMath::WetBlockFloats * sizeof(FLOAT) <= WET_BLOCK_BYTES, "the wet floors' numbers fit their block");
+    INT             CurrentWet = 0;
+    ID3D12Resource* WetBuffer  = nullptr;
+    BYTE*           WetMapped  = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS WetOn[WET_KINDS] = {};
+    INT             WetMarkAfterSurface  = 0;   // SetWetMarkView
+    INT             WetCoverAfterSurface = 0;   // SetWetMarkView: the rain's cover's view (t27) from the depth's
+    INT             WetMarkSrvAfterMasks = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS WetOff() const
+    {
+        return WetBuffer ? WetBuffer->GetGPUVirtualAddress() + (UINT64)(WET_KINDS * BACKEND_FRAME_COUNT) * WET_BLOCK_BYTES
+                         : 0;
+    }
     UBOOL                        bRtHosted = 0;         // SetRtHosted: the mirror rays are the 64-bit host's to trace
     // PSGlassMirrorAsk: the layer's rays written down for the host, a set each as the layer's own - the pixels are
     // tested against the depth the world is drawn with.
     TComRef<ID3D12PipelineState> RtGlassAskPipelines[PIPE_SETS];
     INT                          RayAnswersAfterMasks = 0;      // SetRayListViews
     INT                          RayHeadsAfterSurface = 0;
+    INT                          RayLowAfterSurface   = 0;
+    INT                          RayCornersAfterMasks = 0;
     INT                          WaterShadeAfterSurface = 0;    // SetWaterShadeView
     INT                          OwnAfterMasks  = 0;            // SetOwnLampViews
     INT                          OwnAfterBounce = 0;
@@ -835,19 +994,52 @@ private:
     UBOOL bReliefNow = 0;                       // see SetReliefRun
     UBOOL bTessNow   = 0;
     FLOAT ReliefNow[WATER_CONSTANTS];
+    UBOOL bMeshNow   = 0;                       // see SetMeshRun
+    FLOAT MeshNow[WATER_CONSTANTS];
     D3D12_GPU_VIRTUAL_ADDRESS ReliefLamps = 0;  // see SetReliefLamps
     D3D12_GPU_VIRTUAL_ADDRESS ReliefBlockNow = 0;   // see SetReliefHeld
     // The blocks SetReliefHeld writes: one upload buffer a frame slot, filled from HELD_ZERO on each frame. The first
     // HELD_ZERO bytes stay zero: a relief run with neither its own block nor the frame's lamps binds them, and reads no
-    // lamps and no held edges rather than whatever the register held before - so they reach past the shader's lamp
-    // rows and the held edges' count: (2 + 2 * RDX_RELIEF_LAMP_MAX) rows of 16 bytes.
+    // lamps, no held edges and no spherifier rather than whatever the register held before - so they reach past the
+    // shader's lamp rows, the held edges' count and the spherifier's rows: (2 + SPHERE_ROWS + 2 * RDX_RELIEF_LAMP_MAX)
+    // rows of 16 bytes.
     enum { HELD_BYTES = 2 * 1024 * 1024, HELD_ZERO = 1024 };
-    static_assert((2 + 2 * RDX_RELIEF_LAMP_MAX) * 16 <= HELD_ZERO, "the zero block must cover the lamps and the count");
+    static_assert((2 + SPHERE_ROWS + 2 * RDX_RELIEF_LAMP_MAX) * 16 <= HELD_ZERO,
+                  "the zero block must cover the lamps, the count and the spherifier's rows");
     ID3D12Resource* HeldBuffers[BACKEND_FRAME_COUNT] = {};
     BYTE*           HeldMapped[BACKEND_FRAME_COUNT]  = {};
     INT             HeldFrame   = -1;
     INT             HeldUsed    = 0;
+    // The rounded models' edges (MeshEdgeRoom): one upload buffer a frame slot, filled from its start each frame and bound
+    // in the spherifier field's place for the mesh runs.
+    ID3D12Resource* MeshEdgeBuffers[BACKEND_FRAME_COUNT] = {};
+    BYTE*           MeshEdgeMapped[BACKEND_FRAME_COUNT]  = {};
+    INT             MeshEdgeUsed = 0;
     UBOOL           bHeldFullSaid = 0;
+    // The spherifier's field (SetSphereField): what was handed over, until it is on the card; the card's buffer made of
+    // it (and the one before, which a frame in flight may still read), and this frame slot's upload buffer for it where
+    // there is no card writer (Card).
+    FCardWriter*                 Card         = nullptr;
+    DWORD*                       SphereWords  = nullptr;
+    INT                          SphereCount  = 0;
+    INT                          SphereGen    = -1;
+    UBOOL                        bSphereDirty = 0;
+    TComRef<ID3D12Resource>      SphereBuffer;
+    // The fields retired, each with its age in frames begun since (Begin): BACKEND_FRAME_COUNT frames are in flight at
+    // most, so one frame after that a field is nobody's and goes. A second retirement before the first is free keeps
+    // both.
+    enum { SPHERE_RETIRED_MOST = 8 };
+    ID3D12Resource*              SphereRetired[SPHERE_RETIRED_MOST]    = {};
+    INT                          SphereRetiredAge[SPHERE_RETIRED_MOST] = {};
+    TComRef<ID3D12Resource>      SphereUpload[BACKEND_FRAME_COUNT];
+    UINT64                       SphereUploadBytes[BACKEND_FRAME_COUNT] = {};
+    D3D12_GPU_VIRTUAL_ADDRESS    SphereAddress = 0;
+    void UploadSphereField(ID3D12GraphicsCommandList* Cmd, INT FrameIndex);
+    // The card's field is no longer the rounding drawn: kept among the retired ones (a frame in flight may read it),
+    // and the runs read none (SphereAddress 0) until the next one is on the card.
+    void RetireSphereField();
+    UBOOL UploadSphereFieldThere(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, UINT64 Bytes,
+                                 TComRef<ID3D12Resource>& Made);
     // The grass's blocks (GrassBlock): an upload buffer a frame slot, with a constant buffer's reach of room past its
     // end - a root view reads a block's whole 64 KB, whatever of it was written.
     enum { GRASS_BYTES = 4 * 1024 * 1024, GRASS_TAIL = 64 * 1024 };
@@ -865,6 +1057,7 @@ private:
         UINT                      IndexStart, IndexCount;
         UINT                      InstanceStart, InstanceCount;   // the leaves': their instances; the bark: 0, 1
         UBOOL                     bLeaves;
+        UBOOL                     bPatches;       // the bark's relief made real (TreePatchPipelines)
         D3D12_GPU_VIRTUAL_ADDRESS Block;
     };
     FTreeDraw       TreeDrawList[TREE_DRAWS];

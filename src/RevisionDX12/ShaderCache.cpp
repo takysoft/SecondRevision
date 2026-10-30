@@ -2,6 +2,7 @@
 #include "ShaderCache.h"
 #include "Log.h"
 #include "RenderMath.h"
+#include <float.h>
 
 // The file, beside the DLL: a header, then the shaders one after another. Every number is little-endian, as the machine's.
 //   header: "RDXSHC02", the number of shaders (4 bytes)
@@ -13,14 +14,18 @@ static const INT  EntryChars  = 48;
 static const INT  TargetChars = 16;
 static const INT  HeaderBytes = 8 + 4;
 static const INT  ShaderHead  = 8 + 8 + EntryChars + TargetChars + 8 + 4 + 4;
-// A file larger than this is not ours to read: the renderer's shaders together are a few megabytes at most.
+// A file larger than this is not ours to read: the renderer's shaders together - every mode's builds, the rays' among
+// them - are well within it.
 static const LONGLONG MaxFileBytes = 64LL * 1024 * 1024;
 // What is written back (RdxMath::ShaderCacheWritten): a shader nobody asked for in KeepFor is one whose text a newer
-// build changed, or whose feature is not used any more; and the file stays within MaxKeptBytes. Both in the system
+// build changed, or whose feature is not used any more; and the file stays within MaxKeptBytes - room for every
+// shader the menu can ask for, all its modes' builds. A shader left out for want of room is compiled again the next
+// time its mode is chosen, in the middle of the game: the menu's change stops the picture for seconds while it is
+// (the shadows switched off, with the rays' builds of the layers to make again). KeepFor and OneDay in the system
 // time's 100 ns.
 static const UINT64 OneDay       = 24ULL * 3600ULL * 10000000ULL;
 static const UINT64 KeepFor      = 30ULL * OneDay;
-static const UINT64 MaxKeptBytes = 8ULL * 1024 * 1024;
+static const UINT64 MaxKeptBytes = 32ULL * 1024 * 1024;
 
 struct FShader
 {
@@ -44,6 +49,8 @@ static UBOOL    GDirty       = 0;      // compiled since the file was read or wr
 static UBOOL    GTouched     = 0;      // a kept shader's day moved on: written at the renderer's end, not before
 static UBOOL    GWriteFailed = 0;      // said once; not tried again every frame
 static INT      GNewSince    = 0;      // how many of them are new, for the save's line
+static UBOOL    GWarmDone    = 0;      // RdxShaderWarmDone
+static INT      GRead        = 0;      // RdxShaderCacheRead
 static DOUBLE   GLastCompile = 0.0;    // appSeconds of the last compile
 static UINT64   GNow         = 0;      // the system's time when the cache started
 static UINT32   GDllStamp    = 0;
@@ -58,9 +65,44 @@ static WCHAR    GAltPath[MAX_PATH + 64];
 static WCHAR    GAltTempPath[MAX_PATH + 64];
 static UBOOL    GUseAlt      = 0;      // the file lives in the user's folder
 static UBOOL    GSkipHome    = 0;      // RdxShaderCacheElsewhere: as if the DLL's folder could not be written
-// Who is told before a shader is compiled (RdxCompileWatch).
+// Who is told before a shader is compiled, and who waits while it is (RdxCompileWatch).
 static FRdxCompileWatch GWatch    = nullptr;
+static FRdxCompileWait  GWait     = nullptr;
 static void*            GWatchWho = nullptr;
+// The compiler's own thread reserves the stack the game's main thread has (Revision.exe's header: 8 MB) - the compiler
+// ran there until it had a thread of its own, and how deep it goes in a long shader is not ours to know.
+static const SIZE_T CompileStack = 8 * 1024 * 1024;
+
+// One compile on a thread of its own (RdxCompileWatch's Wait): D3DCompile's arguments and its answer. That thread does
+// nothing but the compile - no memory of the engine's, no log - and the asking thread waits for it to end. It takes the
+// asking thread's floating-point state first (Fpu: precision, rounding, denormals, exceptions), so what the compiler
+// makes is what it made on that thread, to the bit.
+struct FCompileJob
+{
+    unsigned int            Fpu;
+    LPCVOID                 Source;
+    SIZE_T                  Length;
+    LPCSTR                  SourceName;
+    const D3D_SHADER_MACRO* Macros;
+    ID3DInclude*            Include;
+    LPCSTR                  Entry;
+    LPCSTR                  Target;
+    UINT                    Flags1;
+    UINT                    Flags2;
+    ID3DBlob**              Code;
+    ID3DBlob**              Errors;
+    HRESULT                 Result;
+};
+
+static DWORD WINAPI CompileMain(void* Arg)
+{
+    FCompileJob& J = *(FCompileJob*)Arg;
+    unsigned int Was;
+    _controlfp_s(&Was, J.Fpu, _MCW_DN | _MCW_EM | _MCW_RC | _MCW_PC);
+    J.Result = D3DCompile(J.Source, J.Length, J.SourceName, J.Macros, J.Include, J.Entry, J.Target, J.Flags1, J.Flags2,
+                          J.Code, J.Errors);
+    return 0;
+}
 
 // Two chains over the same bytes, each 64 bits wide: FNV-1a, and the same shape with a multiplier of its own. Together
 // the key is 128 bits; two different questions sharing it is not a thing that happens by accident.
@@ -332,6 +374,7 @@ static INT ReadFrom(const WCHAR* Path, const TCHAR* Where)
             break;
         At += ShaderHead + Len;
     }
+    GRead = (INT)Taken;
     if (Taken < Count)
     {
         RdxLog(TEXT("shader cache: the file %s is damaged after %u of its %u shaders - the rest are compiled, and the file "
@@ -408,15 +451,32 @@ HRESULT RdxCompile(LPCVOID Source, SIZE_T Length, LPCSTR SourceName, const D3D_S
     // The watcher, told outside the lock: it draws, and may be long about it.
     ::AcquireSRWLockExclusive(&GLock);
     FRdxCompileWatch const Watch = GWatch;
+    FRdxCompileWait const  Wait  = GWait;
     void* const            Who   = GWatchWho;
     ::ReleaseSRWLockExclusive(&GLock);
     if (Watch)
         Watch(Who);
-    const DOUBLE  T0     = appSeconds();
-    const HRESULT Result = D3DCompile(Source, Length, SourceName, Macros, Include, Entry, Target, Flags1, Flags2, Code,
-                                      Errors);
-    const DOUBLE  T1     = appSeconds();
+    const DOUBLE T0     = appSeconds();
+    HRESULT      Result = E_FAIL;
+    FCompileJob  Job    = { 0, Source, Length, SourceName, Macros, Include, Entry, Target, Flags1, Flags2, Code, Errors,
+                            E_FAIL };
+    if (Wait)
+        _controlfp_s(&Job.Fpu, 0, 0);
+    HANDLE const Thread = Wait ? ::CreateThread(nullptr, CompileStack, &CompileMain, &Job,
+                                                STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr)
+                               : nullptr;
+    if (Thread)
+    {
+        Wait(Who, Thread);
+        ::WaitForSingleObject(Thread, INFINITE);
+        ::CloseHandle(Thread);
+        Result = Job.Result;
+    }
+    else
+        Result = D3DCompile(Source, Length, SourceName, Macros, Include, Entry, Target, Flags1, Flags2, Code, Errors);
+    const DOUBLE T1 = appSeconds();
     ::AcquireSRWLockExclusive(&GLock);
+    const UBOOL bLate = GWarmDone;
     RdxStartupNoteShader((T1 - T0) * 1000.0, 1);
     if (bKeepable && SUCCEEDED(Result) && *Code && !GDisabled)
     {
@@ -428,7 +488,22 @@ HRESULT RdxCompile(LPCVOID Source, SIZE_T Length, LPCSTR SourceName, const D3D_S
         GLastCompile = T1;
     }
     ::ReleaseSRWLockExclusive(&GLock);
+    if (bLate)
+        RdxLog(TEXT("shaders: %S (%S, %S) compiled after the start - the warm-up (FBackend::WarmShaders) does not make it"),
+               SourceName ? SourceName : "?", Entry ? Entry : "?", Target ? Target : "?");
     return Result;
+}
+
+INT RdxShaderCacheRead()
+{
+    return GRead;
+}
+
+void RdxShaderWarmDone()
+{
+    ::AcquireSRWLockExclusive(&GLock);
+    GWarmDone = 1;
+    ::ReleaseSRWLockExclusive(&GLock);
 }
 
 void RdxShaderCacheElsewhere(const WCHAR* Folder)
@@ -442,10 +517,11 @@ void RdxShaderCacheElsewhere(const WCHAR* Folder)
     ::ReleaseSRWLockExclusive(&GLock);
 }
 
-void RdxCompileWatch(FRdxCompileWatch Watch, void* Who)
+void RdxCompileWatch(FRdxCompileWatch Watch, void* Who, FRdxCompileWait Wait)
 {
     ::AcquireSRWLockExclusive(&GLock);
     GWatch    = Watch;
+    GWait     = Wait;
     GWatchWho = Who;
     ::ReleaseSRWLockExclusive(&GLock);
 }

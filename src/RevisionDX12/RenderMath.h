@@ -16,6 +16,7 @@
 
 // The numbers the shader files share with this side (RDX_...), as macros.
 #include "RenderLimits.h"
+#include <math.h>   // sqrtf: the lamps' bodies merged (MergeLampBodies)
 
 // SSE2: every processor that runs this game has it. Elsewhere the dilation reads texel by
 // texel, with the same result.
@@ -341,6 +342,101 @@ inline float LightDivisor(float Scale, int Size)
 inline float LightPan(float Pan, float Scale)
 {
     return Pan - 0.5f * Scale;
+}
+
+// ---------------------------------------------------------------------------
+// The light maps' blending over the spherifier's soft edges (RenderDevice's SphereLightBlend)
+// ---------------------------------------------------------------------------
+//
+// The engine bakes each of the level's surfaces a light map for it as it lies, flat. Rounded, the polygons either side of
+// a soft edge would each keep their own light up to the old edge, and the light would step there. So a texel within a
+// side's reach takes in the light of the polygon across, at the place as far from the edge there - SoftLightShare of
+// it: half on the edge, where the two polygons' copies meet, falling evenly to none at the reach, as the light of a
+// surface rounded from edge to edge turns; more than half just past the edge, where only the map's filtering reads it.
+inline float SoftLightShare(float D, float Reach)
+{
+    if (!(Reach > 0.0f) || !(D < Reach))
+        return 0.0f;
+    const float S = 0.5f * (1.0f - D / Reach);
+    return (S > 1.0f) ? 1.0f : S;
+}
+
+// A texel's light with the light across several sides taken in, each by its share (SoftLightShare): each share weighed
+// against the texel's own as S / (1 - S) - one side alone gives Own + (Across - Own) S, two sides meeting at a corner,
+// half each, the three polygons' mean. Own and Out: four channels; Across: Count times four.
+inline void SoftLightMix(const float* Own, const float* Shares, const float* Across, int Count, float* Out)
+{
+    float Sum[4] = { Own[0], Own[1], Own[2], Own[3] }, Weights = 1.0f;
+    for (int k = 0; k < Count; k++)
+    {
+        const float S = (Shares[k] < 0.95f) ? Shares[k] : 0.95f;
+        if (!(S > 0.0f))
+            continue;
+        const float W = S / (1.0f - S);
+        for (int c = 0; c < 4; c++)
+            Sum[c] += W * Across[k * 4 + c];
+        Weights += W;
+    }
+    for (int c = 0; c < 4; c++)
+        Out[c] = Sum[c] / Weights;
+}
+
+// What a texel takes in from across a side (SoftLightMix's Across): its own light, Own, with the step the light makes
+// at the side - from OwnEdge, this polygon's light just inside the side, to OtherEdge, the polygon's across just inside
+// it, at the same place along the side. Where each polygon's light is even over it - a round shape's faces - that is
+// the light across itself, as it always was; where a lamp near by makes the light run across both, only the step at the
+// side is smoothed away, and the lamp's own fall-off is kept - it is not mirrored over from the far polygon. Four
+// channels each.
+inline void SoftLightAcross(const float* Own, const float* OwnEdge, const float* OtherEdge, float* Out)
+{
+    for (int c = 0; c < 4; c++)
+        Out[c] = Own[c] + (OtherEdge[c] - OwnEdge[c]);
+}
+
+// A light map texel's middle on its surface's plane: the map's coordinate there as the renderer lays a light map on -
+// LU = ((P - Base) . AxisU - Pan) * Inv, and V the same - taken back through the surface's two texture axes. False
+// where the axes make no frame.
+inline bool LightTexelPlace(int I, int J, int W, int H, float PanU, float PanV, float InvU, float InvV,
+                            const FVec3& Base, const FVec3& AxisU, const FVec3& AxisV, FVec3& Out)
+{
+    if (W <= 0 || H <= 0 || InvU == 0.0f || InvV == 0.0f)
+        return false;
+    const double A   = ((double)I + 0.5) / (double)W / (double)InvU + (double)PanU;
+    const double B   = ((double)J + 0.5) / (double)H / (double)InvV + (double)PanV;
+    const double UU  = (double)Dot(AxisU, AxisU), UV = (double)Dot(AxisU, AxisV), VV = (double)Dot(AxisV, AxisV);
+    const double Det = UU * VV - UV * UV;
+    if (!(UU > 0.0) || !(VV > 0.0) || !(Det > 1e-9 * UU * VV))
+        return false;
+    const double Al = (A * VV - B * UV) / Det, Be = (B * UU - A * UV) / Det;
+    Out.X = Base.X + (float)((double)AxisU.X * Al + (double)AxisV.X * Be);
+    Out.Y = Base.Y + (float)((double)AxisU.Y * Al + (double)AxisV.Y * Be);
+    Out.Z = Base.Z + (float)((double)AxisU.Z * Al + (double)AxisV.Z * Be);
+    return true;
+}
+
+// A light map's texels - four bytes each, as the engine has them - read at the map's coordinate LU, LV between the four
+// texels round it, within the part the engine lit (LitU x LitV, from the map's corner).
+inline void SampleLightTexels(const unsigned char* Texels, int W, int H, int LitU, int LitV, float LU, float LV,
+                              float* Out)
+{
+    LitU = (LitU > 0 && LitU <= W) ? LitU : W;
+    LitV = (LitV > 0 && LitV <= H) ? LitV : H;
+    float X = LU * (float)W - 0.5f, Y = LV * (float)H - 0.5f;
+    X = (X < 0.0f) ? 0.0f : ((X > (float)(LitU - 1)) ? (float)(LitU - 1) : X);
+    Y = (Y < 0.0f) ? 0.0f : ((Y > (float)(LitV - 1)) ? (float)(LitV - 1) : Y);
+    const int   X0 = (int)X, Y0 = (int)Y;
+    const int   X1 = (X0 + 1 < LitU) ? X0 + 1 : X0, Y1 = (Y0 + 1 < LitV) ? Y0 + 1 : Y0;
+    const float Fx = X - (float)X0, Fy = Y - (float)Y0;
+    const unsigned char* const A = Texels + 4 * (Y0 * W + X0);
+    const unsigned char* const B = Texels + 4 * (Y0 * W + X1);
+    const unsigned char* const C = Texels + 4 * (Y1 * W + X0);
+    const unsigned char* const D = Texels + 4 * (Y1 * W + X1);
+    for (int c = 0; c < 4; c++)
+    {
+        const float Top = (float)A[c] + ((float)B[c] - (float)A[c]) * Fx;
+        const float Bot = (float)C[c] + ((float)D[c] - (float)C[c]) * Fx;
+        Out[c] = Top + (Bot - Top) * Fy;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,16 +1888,16 @@ inline bool ShadowMapsSame(const FShadowPreset& A, const FShadowPreset& B)
 }
 
 // The ini's text for ShadowQuality: Off, Low, Medium, High, RT Low, RT Medium or RT High in any case (or the number,
-// 0-6), spaces around it allowed; within it a space, '-' or '_' counts for nothing, so RT-Low, rt low and RTLOW are one,
-// and RT alone is RT High. Anything else gives High - the default - with bKnown false, so the caller can say so in the
+// 0-6), spaces around it allowed; within it a space, '-' or '_' counts for nothing, so RT-Low, rt low and RTLOW are one.
+// Anything else gives High - the default - with bKnown false, so the caller can say so in the
 // log. A template: the engine's TCHAR, the tests' char and wchar_t alike.
 template <typename TChar>
 inline EShadowQuality ParseShadowQuality(const TChar* Text, bool& bKnown)
 {
-    static const char* const Names[8] = { "off", "low", "medium", "high", "rt", "rtlow", "rtmedium", "rthigh" };
-    static const EShadowQuality Values[8] = { ShadowQuality_Off, ShadowQuality_Low, ShadowQuality_Medium,
-                                              ShadowQuality_High, ShadowQuality_Rt, ShadowQuality_RtLow,
-                                              ShadowQuality_RtMedium, ShadowQuality_Rt };
+    static const char* const Names[7] = { "off", "low", "medium", "high", "rtlow", "rtmedium", "rthigh" };
+    static const EShadowQuality Values[7] = { ShadowQuality_Off, ShadowQuality_Low, ShadowQuality_Medium,
+                                              ShadowQuality_High, ShadowQuality_RtLow, ShadowQuality_RtMedium,
+                                              ShadowQuality_Rt };
     bKnown = false;
     if (!Text)
         return ShadowQuality_High;
@@ -1825,7 +1921,7 @@ inline EShadowQuality ParseShadowQuality(const TChar* Text, bool& bKnown)
         bKnown = true;
         return (EShadowQuality)(Word[0] - '0');
     }
-    for (int q = 0; q < 8; q++)
+    for (int q = 0; q < 7; q++)
     {
         int k = 0;
         while (Names[q][k] && Names[q][k] == Word[k])
@@ -3744,7 +3840,7 @@ enum EAmbientOcclusion
 
 inline const char* const* AoNames()
 {
-    static const char* const Names[Ao_Count] = { "Off", "SSAO", "RT" };
+    static const char* const Names[Ao_Count] = { "Off", "SSAO", "RTAO" };
     return Names;
 }
 
@@ -3774,7 +3870,7 @@ inline EAmbientOcclusion ParseAmbientOcclusion(const TChar* Text, bool& bKnown)
     while (E > B && (Text[E - 1] == ' ' || Text[E - 1] == '\t'))
         E--;
     const int Len = E - B;
-    const char* const Spellings[Ao_Count] = { "Off", "SSAO", "RT" };
+    const char* const Spellings[Ao_Count] = { "Off", "SSAO", "RTAO" };
     for (int q = 0; q < (int)Ao_Count; q++)
     {
         const char* N = Spellings[q];
@@ -5386,7 +5482,12 @@ enum EPomFlagBits
     // LampShadows: the relief lit and shadowed by the lamps around it (the shader's ReliefLamps).
     PomFlag_Lamps      = 128,
     // A measurement view, marker only: the tessellated relief tinted where it is held down towards an edge.
-    PomFlag_ShowKeep   = 256
+    PomFlag_ShowKeep   = 256,
+    // The surface's vertices carry no axes of the relief - a grown plant's bark: the way to the eye in the texture's
+    // own axes is worked out in the pixel shader, from how the place and the texture run across the screen.
+    PomFlag_Rates      = 512,
+    // With Rates: the height read as fine as the screen asks - a bullet hole's own map, with no displacement to match.
+    PomFlag_Fine       = 1024
 };
 
 // LampShadows: the most of the shadows' lights the relief is lit by in a frame - the shader's rows (RDX_RELIEF_LAMP_MAX).
@@ -6939,30 +7040,71 @@ inline EWater ParseWater(const TChar* Text, bool& bKnown)
 }
 
 // Reflections: what gives a mirror image back - the water's surface, and the levels' glass (IsGlassSurface).
-// Default: none of ours - the water without a mirror image, the glass as the level draws it. High: from the finished
-// picture - what is on the screen can be mirrored, and the sky; on any card. RT: from rays traced through the level -
-// what is off the screen or behind the viewer too; on a card that traces rays, with the shadows on, whose scene the
-// rays are traced against - elsewhere High runs in its place. RTHalf: RT with a quarter of the rays - of each two by
-// two pixels one traces for the others where their rays are alike (SolidPass.hlsl, RtAskLed); in the menu's order
-// between High and RT.
+// Default: none of ours - the water without a mirror image, the glass as the level draws it. Low: no mirror image
+// anywhere - the water's lamps' glints, the wet floors wet, their water and the lamps' streaks on it
+// (docs/terv-nedves-feluletek.md 5.4). Medium: the picture's mirror image with half the steps - the water's, and the wet
+// floors' spread twice as far; the glass its probe alone. High: from the finished picture - what is on the screen can be
+// mirrored, and the sky; on any card. RTHigh: from rays traced through the level - what is off the screen or behind the
+// viewer too; on a card that traces rays, with the shadows on, whose scene the
+// rays are traced against - elsewhere High runs in its place. RTMedium: RTHigh with a quarter of the rays - of each two by
+// two pixels one traces for the others where their rays are alike (SolidPass.hlsl, RtAskLed). RTLow: with about a
+// ninth - of each three by three pixels one, chosen after they asked (RaySparse.hlsl). In the menu's order, the rays'
+// three from the fewest rays up after High.
 enum EReflections
 {
     Reflections_Default = 0,
+    Reflections_Low,
+    Reflections_Medium,
     Reflections_High,
-    Reflections_RtHalf,
-    Reflections_Rt,
+    Reflections_RtLow,
+    Reflections_RtMedium,
+    Reflections_RtHigh,
     Reflections_Count
 };
 
 inline const char* const* ReflectionsNames()
 {
-    static const char* const Names[Reflections_Count] = { "Default", "High", "RTHalf", "RT" };
+    static const char* const Names[Reflections_Count] = { "Default", "Low", "Medium", "High", "RTLow", "RTMedium",
+                                                          "RTHigh" };
     return Names;
 }
 
-inline bool ReflectionsHasMirror(int Level) { return Level >= (int)Reflections_High; }
-// Whether the mirror image comes from rays: RTHalf and RT.
-inline bool ReflectionsTraced(int Level) { return Level >= (int)Reflections_RtHalf; }
+// The reflections as the menu says them: the RT levels with a space, as the shadows' (the ini's have none).
+inline const char* const* ReflectionsMenuNames()
+{
+    static const char* const Names[Reflections_Count] = { "Default", "Low", "Medium", "High", "RT Low", "RT Medium",
+                                                          "RT High" };
+    return Names;
+}
+
+// The water's and the glass's own mirror image: Medium and up.
+inline bool ReflectionsHasMirror(int Level) { return Level >= (int)Reflections_Medium; }
+// The wet floors' image from the picture: Medium and up (Low: their water and the lamps' streaks alone); at Medium with
+// half the steps, spread twice as far.
+inline bool ReflectionsWetImage(int Level) { return Level >= (int)Reflections_Medium; }
+inline bool ReflectionsWetCoarse(int Level) { return Level == (int)Reflections_Medium; }
+// The picture's trace over the glass's probe (where the pane's ray goes away from the eye): High and up; at Medium the
+// probe and the own body alone.
+inline bool ReflectionsGlassTrace(int Level) { return Level >= (int)Reflections_High; }
+// The glass's far image alone - no probe, no trace (SolidPass.hlsl, WaterFarImage): Low.
+inline bool ReflectionsGlassFar(int Level) { return Level == (int)Reflections_Low; }
+// The water's mirror as a water run is told it (SolidPass.hlsl's WaterSpare.x): nought none; a quarter the lamps'
+// glints and the far image alone, no trace (Low, WaterFarImage); three quarters the mirror image with half the trace's
+// steps (Medium); one the full mirror (High and the rays').
+inline float WaterMirrorSwitch(int Level)
+{
+    return (Level == (int)Reflections_Low)      ? 0.25f
+         : (Level == (int)Reflections_Medium)   ? 0.75f
+         : ReflectionsHasMirror(Level)           ? 1.0f
+                                                 : 0.0f;
+}
+// Whether the mirror image comes from rays: RTLow, RTMedium and RTHigh.
+inline bool ReflectionsTraced(int Level) { return Level >= (int)Reflections_RtLow; }
+// RTLow: how many of the lamps that reach a place the mirror rays meet look for what stands in their way - the
+// strongest there; the others' light comes with nothing in its way (RtLampLight.hlsli, RtLowShadowedLamps). 0: all of
+// them; never more than RtLowLampsMost.
+static const int RtLowShadowedLamps = 3;
+static const int RtLowLampsMost     = 4;
 
 template <typename TChar>
 inline void ReflectionsName(EReflections R, TChar* Out, int Max)
@@ -7007,10 +7149,12 @@ inline bool SettingIsWord(const TChar* Text, const char* Word)
 template <typename TChar>
 inline EReflections ParseReflections(const TChar* Text, bool& bKnown)
 {
-    static const char* const Spellings[Reflections_Count + 1] = { "Default", "High", "RTHalf", "RT", "Off" };
-    static const EReflections Means[Reflections_Count + 1]    = { Reflections_Default, Reflections_High,
-                                                                  Reflections_RtHalf, Reflections_Rt,
-                                                                  Reflections_Default };
+    static const char* const Spellings[Reflections_Count + 1] = { "Default", "Low",      "Medium",   "High",
+                                                                  "RTLow",   "RTMedium", "RTHigh",   "Off" };
+    static const EReflections Means[Reflections_Count + 1]    = { Reflections_Default, Reflections_Low,
+                                                                  Reflections_Medium,  Reflections_High,
+                                                                  Reflections_RtLow,   Reflections_RtMedium,
+                                                                  Reflections_RtHigh,  Reflections_Default };
     bKnown = false;
     for (int q = 0; q < (int)(Reflections_Count + 1); q++)
         if (SettingIsWord(Text, Spellings[q]))
@@ -7021,7 +7165,7 @@ inline EReflections ParseReflections(const TChar* Text, bool& bKnown)
     return Reflections_Default;
 }
 
-// The menu's step: Default, High, RTHalf, RT, round again - Step places along (-1 or 1).
+// The menu's step: Default, Low, Medium, High, RTLow, RTMedium, RTHigh, round again - Step places along (-1 or 1).
 inline EReflections ReflectionsStep(EReflections R, int Step)
 {
     int N = ((int)R + Step) % (int)Reflections_Count;
@@ -7066,6 +7210,573 @@ inline bool IsGlassSurface(unsigned int PolyFlags, bool bGlassName)
     return bGlassName && BlendFor(PolyFlags) == Blend_Translucent && !(PolyFlags & RDX_PF_Mirrored);
 }
 
+// The floors that get wet where it rains (docs/terv-nedves-feluletek.md 8.3): the list file SecondRevisionWetSurfaces.txt
+// beside the renderer, a line a texture - its package and its own name as the readout shows them, with their
+// underscores ("Paris.pa_sidewalk_a"), then stone (it soaks the water up and darkens), metal (only a film of water on
+// it) or wood (it soaks the water up and darkens, and gives nothing back). What follows a ';' is a remark, an empty line
+// is nothing, and a line that says anything else is not read.
+// The names are matched with the case of their letters aside, as the engine matches them.
+enum EWetKind
+{
+    Wet_None = 0,
+    Wet_Stone,
+    Wet_Metal,
+    Wet_Wood
+};
+static const int WetNameChars = 64;
+struct FWetSurface
+{
+    char     Name[WetNameChars];
+    EWetKind Kind;
+};
+
+inline unsigned WetLower(unsigned C) { return (C >= 'A' && C <= 'Z') ? C + ('a' - 'A') : C; }
+
+// The list's text (Length bytes; it need not end in a zero) into Out, at most Most of them: how many were read. Bad:
+// the lines that say something and were not read - a kind that is neither, a third word, a name too long, or no room.
+inline int ParseWetSurfaces(const char* Text, int Length, FWetSurface* Out, int Most, int& Bad)
+{
+    Bad = 0;
+    int N = 0;
+    for (int i = 0; i < Length;)
+    {
+        int End = i;
+        while (End < Length && Text[End] != '\n')
+            End++;
+        int Stop = i;
+        while (Stop < End && Text[Stop] != ';' && Text[Stop] != '\r')
+            Stop++;
+        // The line's words: the name, the kind, and whatever is left.
+        int a = i;
+        while (a < Stop && (Text[a] == ' ' || Text[a] == '\t'))
+            a++;
+        int b = a;
+        while (b < Stop && Text[b] != ' ' && Text[b] != '\t')
+            b++;
+        int c = b;
+        while (c < Stop && (Text[c] == ' ' || Text[c] == '\t'))
+            c++;
+        int d = c;
+        while (d < Stop && Text[d] != ' ' && Text[d] != '\t')
+            d++;
+        int e = d;
+        while (e < Stop && (Text[e] == ' ' || Text[e] == '\t'))
+            e++;
+        if (a < Stop)
+        {
+            EWetKind Kind = Wet_None;
+            if (d - c == 4 && WetLower((unsigned char)Text[c]) == 'w' && WetLower((unsigned char)Text[c + 1]) == 'o' &&
+                WetLower((unsigned char)Text[c + 2]) == 'o' && WetLower((unsigned char)Text[c + 3]) == 'd')
+                Kind = Wet_Wood;
+            if (d - c == 5)
+            {
+                char W[6];
+                for (int k = 0; k < 5; k++)
+                    W[k] = (char)WetLower((unsigned char)Text[c + k]);
+                W[5] = 0;
+                Kind = (W[0] == 's' && W[1] == 't' && W[2] == 'o' && W[3] == 'n' && W[4] == 'e') ? Wet_Stone
+                     : (W[0] == 'm' && W[1] == 'e' && W[2] == 't' && W[3] == 'a' && W[4] == 'l') ? Wet_Metal : Wet_None;
+            }
+            if (Kind == Wet_None || b - a >= WetNameChars || e < Stop || N >= Most)
+                Bad++;
+            else
+            {
+                for (int k = 0; k < b - a; k++)
+                    Out[N].Name[k] = Text[a + k];
+                Out[N].Name[b - a] = 0;
+                Out[N].Kind        = Kind;
+                N++;
+            }
+        }
+        i = End + 1;
+    }
+    return N;
+}
+
+// The kind the list gives the texture of that package and that own name (PackageDotName, the readout's form), the
+// case of their letters aside; Wet_None where the list does not name it.
+template <typename TChar>
+inline EWetKind WetKindOf(const FWetSurface* List, int Count, const TChar* PackageDotName)
+{
+    if (!List || !PackageDotName)
+        return Wet_None;
+    for (int i = 0; i < Count; i++)
+    {
+        int k = 0;
+        while (List[i].Name[k] && PackageDotName[k] &&
+               WetLower((unsigned char)List[i].Name[k]) == WetLower((unsigned)PackageDotName[k]))
+            k++;
+        if (!List[i].Name[k] && !PackageDotName[k])
+            return List[i].Kind;
+    }
+    return Wet_None;
+}
+
+// The lamps' bodies' list (SecondRevisionLampSurfaces.txt; docs/terv-nedves-feluletek.md 8.7): a level texture that is
+// a lamp's glass or lens, or an actor class whose model is one - where the puddles' streaks stand. Read as the wet
+// floors' list is: a name and its kind, texture or class, a line each; what follows a ';' is a remark.
+enum ELampKind
+{
+    Lamp_None = 0,
+    Lamp_Texture,
+    Lamp_Class
+};
+struct FLampSurface
+{
+    char      Name[WetNameChars];
+    ELampKind Kind;
+};
+
+// Whether Text[From, To) is Word, the case of its letters aside.
+inline bool WetWordIs(const char* Text, int From, int To, const char* Word)
+{
+    int k = 0;
+    for (; From + k < To && Word[k]; k++)
+        if (WetLower((unsigned char)Text[From + k]) != (unsigned char)Word[k])
+            return false;
+    return From + k == To && !Word[k];
+}
+
+// The list's text (Length bytes; it need not end in a zero) into Out, at most Most of them: how many were read. Bad:
+// the lines that say something and were not read - a kind that is neither, a third word, a name too long, or no room.
+inline int ParseLampSurfaces(const char* Text, int Length, FLampSurface* Out, int Most, int& Bad)
+{
+    Bad = 0;
+    int N = 0;
+    for (int i = 0; i < Length;)
+    {
+        int End = i;
+        while (End < Length && Text[End] != '\n')
+            End++;
+        int Stop = i;
+        while (Stop < End && Text[Stop] != ';' && Text[Stop] != '\r')
+            Stop++;
+        int a = i;
+        while (a < Stop && (Text[a] == ' ' || Text[a] == '\t'))
+            a++;
+        int b = a;
+        while (b < Stop && Text[b] != ' ' && Text[b] != '\t')
+            b++;
+        int c = b;
+        while (c < Stop && (Text[c] == ' ' || Text[c] == '\t'))
+            c++;
+        int d = c;
+        while (d < Stop && Text[d] != ' ' && Text[d] != '\t')
+            d++;
+        int e = d;
+        while (e < Stop && (Text[e] == ' ' || Text[e] == '\t'))
+            e++;
+        if (a < Stop)
+        {
+            const ELampKind Kind = WetWordIs(Text, c, d, "texture") ? Lamp_Texture
+                                 : WetWordIs(Text, c, d, "class")   ? Lamp_Class
+                                                                    : Lamp_None;
+            if (Kind == Lamp_None || b - a >= WetNameChars || e < Stop || N >= Most)
+                Bad++;
+            else
+            {
+                for (int k = 0; k < b - a; k++)
+                    Out[N].Name[k] = Text[a + k];
+                Out[N].Name[b - a] = 0;
+                Out[N].Kind        = Kind;
+                N++;
+            }
+        }
+        i = End + 1;
+    }
+    return N;
+}
+
+// Whether the list names Name (a texture's package and own name, the readout's form, or a class's name) as a Kind,
+// the case of its letters aside.
+template <typename TChar>
+inline bool LampListed(const FLampSurface* List, int Count, const TChar* Name, ELampKind Kind)
+{
+    if (!List || !Name)
+        return false;
+    for (int i = 0; i < Count; i++)
+    {
+        if (List[i].Kind != Kind)
+            continue;
+        int k = 0;
+        while (List[i].Name[k] && Name[k] && WetLower((unsigned char)List[i].Name[k]) == WetLower((unsigned)Name[k]))
+            k++;
+        if (!List[i].Name[k] && !Name[k])
+            return true;
+    }
+    return false;
+}
+
+// A lamp's body for the puddles' streaks: its middle in the world and how far it reaches about it - its glass taken as a
+// ball of that radius, whose size its streak's strength is by -, and the colour its glass shines with, by its
+// brightness; Flicker 1 for a fire's, whose glow wavers (LampFlicker), 0 for a lamp's; and the body's own colour (TR,
+// TG, TB, its strongest 1; all 0: none), the colour its streak takes.
+struct FLampBody
+{
+    float X, Y, Z;
+    float Extent;
+    float R, G, B;
+    float Flicker;
+    float TR, TG, TB;
+};
+
+// A fire's glow at Seconds (the level's time), as a share of its light: a sum of three slow waves of its own phase,
+// within LampFlickerDepth either way of the whole.
+static const float LampFlickerDepth = 0.2f;
+inline float LampFlicker(float Seconds, float Phase)
+{
+    const float W = 0.5f * sinf(Seconds * 7.3f + Phase) + 0.3f * sinf(Seconds * 11.9f + 2.1f * Phase) +
+                    0.2f * sinf(Seconds * 17.7f + 3.7f * Phase);
+    return 1.0f + LampFlickerDepth * W;
+}
+
+// Bodies that stand within Gap of each other, their extents aside, are one lamp - a lantern's several panes: kept as
+// the first of them, at the middle of the two and reaching over both - as long as that reaches no further than Most, a
+// lamp's size: a row of windows side by side stays a row of windows, not one ball over the house. How many are left, the first that many of B.
+inline int MergeLampBodies(FLampBody* B, int Count, float Gap, float Most)
+{
+    for (int i = 0; i < Count; i++)
+        for (int j = i + 1; j < Count;)
+        {
+            const float DX = B[j].X - B[i].X, DY = B[j].Y - B[i].Y, DZ = B[j].Z - B[i].Z;
+            const float D  = sqrtf(DX * DX + DY * DY + DZ * DZ);
+            if (D > B[i].Extent + B[j].Extent + Gap)
+            {
+                j++;
+                continue;
+            }
+            // The least sphere about both: the one where it holds the other, else from the far side of the one to the
+            // far side of the other, its middle on the line between theirs.
+            float Ext = 0.0f, T = 0.0f;
+            if (D + B[j].Extent <= B[i].Extent)
+                Ext = B[i].Extent;
+            else if (D + B[i].Extent <= B[j].Extent)
+            {
+                Ext = B[j].Extent;
+                T   = 1.0f;
+            }
+            else
+            {
+                Ext = 0.5f * (D + B[i].Extent + B[j].Extent);
+                T   = (Ext - B[i].Extent) / D;
+            }
+            if (Ext > Most)
+            {
+                j++;
+                continue;
+            }
+            B[i].X += DX * T;
+            B[i].Y += DY * T;
+            B[i].Z += DZ * T;
+            B[i].Extent = Ext;
+            B[j]        = B[--Count];
+            j           = i + 1;
+        }
+    return Count;
+}
+
+// The bodies' order by Dist, the nearest first, into Order (Count of them): an insertion sort - a level has a few
+// hundred bodies at most, and nearly the same order from frame to frame.
+inline void LampsByDistance(const float* Dist, int Count, int* Order)
+{
+    for (int i = 0; i < Count; i++)
+    {
+        int At = i;
+        while (At > 0 && Dist[Order[At - 1]] > Dist[i])
+        {
+            Order[At] = Order[At - 1];
+            At--;
+        }
+        Order[At] = i;
+    }
+}
+
+// The room for the lamps whose streaks the puddles take a frame (WetReflect.hlsl's WetLamp; FBackend::SetWetLamps):
+// every lamp due a streak, none left out by a count - this is the most a constant buffer can hold, 4096 rows of four,
+// the count's row and two rows a lamp (its place in the view's space and its glass's radius, its glass's colour), far
+// more than a level's lamps. WetLampBytes: a frame's slot of them - the constant buffer's whole 64 KB, which keeps the
+// next frame's slot on a constant buffer's 256-byte alignment.
+enum { WetLampMax = 2047, WetLampBytes = 65536 };
+static_assert(16 * (1 + 2 * WetLampMax) <= WetLampBytes, "a frame's wet lamps fit their slot");
+
+// The rain's cover over the wet floors (docs/terv-nedves-feluletek.md 8.4): a grid over the level's X and Y, a cell
+// WetCoverCell units across, each 255 where the floor there sees the sky and 0 where something overhead keeps the rain
+// off, or where the floor lies in a zone it does not rain in - softened over WetCoverBand units, so that by a roof's
+// edge the wet floor dries gradually rather than at a line: the cover first grown by half the band (ErodeWetCover),
+// then blurred by half the band (BlurWetCover) - nought at the cover's own edge, the full rain a band further out. A
+// box blur along the rows, then along the columns: each cell the average of the 2 * Radius + 1 cells about it, the
+// grid's edge holding its own value beyond it. Work: W * H bytes.
+static const float WetCoverCell = 16.0f;
+static const float WetCoverBand = 64.0f;
+inline int WetCoverRadius(float Cell, float Band = WetCoverBand)
+{
+    const int R = (int)(0.5f * Band / Cell + 0.5f);
+    return (R < 1) ? 1 : R;
+}
+inline void BlurWetCover(unsigned char* Grid, int W, int H, int Radius, unsigned char* Work)
+{
+    if (!Grid || !Work || W <= 0 || H <= 0 || Radius <= 0)
+        return;
+    const int Span = 2 * Radius + 1;
+    for (int Pass = 0; Pass < 2; Pass++)
+    {
+        const int Lines = Pass ? W : H, Along = Pass ? H : W;
+        for (int l = 0; l < Lines; l++)
+        {
+            // The cell k of this line, the grid's edge held beyond it.
+            auto At = [&](int k) -> int {
+                k = (k < 0) ? 0 : ((k >= Along) ? Along - 1 : k);
+                return Pass ? Grid[k * W + l] : Grid[l * W + k];
+            };
+            int Sum = 0;
+            for (int k = -Radius; k <= Radius; k++)
+                Sum += At(k);
+            for (int k = 0; k < Along; k++)
+            {
+                const unsigned char V = (unsigned char)((Sum + Span / 2) / Span);
+                if (Pass)
+                    Work[k * W + l] = V;
+                else
+                    Work[l * W + k] = V;
+                Sum += At(k + Radius + 1) - At(k - Radius);
+            }
+        }
+        for (int i = 0; i < W * H; i++)
+            Grid[i] = Work[i];
+    }
+}
+// The covered cells grown by Radius either way: each cell the least of the 2 * Radius + 1 about it, along the rows and
+// then along the columns, the grid's edge holding its own value beyond it. Work: W * H bytes.
+inline void ErodeWetCover(unsigned char* Grid, int W, int H, int Radius, unsigned char* Work)
+{
+    if (!Grid || !Work || W <= 0 || H <= 0 || Radius <= 0)
+        return;
+    for (int Pass = 0; Pass < 2; Pass++)
+    {
+        const int Lines = Pass ? W : H, Along = Pass ? H : W;
+        for (int l = 0; l < Lines; l++)
+            for (int k = 0; k < Along; k++)
+            {
+                unsigned char Least = 255;
+                for (int d = -Radius; d <= Radius; d++)
+                {
+                    const int           q = (k + d < 0) ? 0 : ((k + d >= Along) ? Along - 1 : k + d);
+                    const unsigned char V = Pass ? Grid[q * W + l] : Grid[l * W + q];
+                    Least                 = (V < Least) ? V : Least;
+                }
+                if (Pass)
+                    Work[k * W + l] = Least;
+                else
+                    Work[l * W + k] = Least;
+            }
+        for (int i = 0; i < W * H; i++)
+            Grid[i] = Work[i];
+    }
+}
+// A floor more than WetUnderFloor below the highest floor near it lies under that one - a pier under its shelter's
+// roof - and takes the lower floors' cover, eased from the edge of the floor above as the cover is (SolidPass.hlsl's
+// WetCoverOf). The highest floors grown for it (GrowWetTop): each cell the highest of the 2 * Radius + 1 cells about it,
+// along the rows and then along the columns, the grid's edge holding its own value beyond it; a cell with no floor
+// holds -1e30 and takes its neighbours'. Work: W * H floats.
+static const float WetUnderFloor = 64.0f;
+inline void GrowWetTop(float* Top, int W, int H, int Radius, float* Work)
+{
+    if (!Top || !Work || W <= 0 || H <= 0 || Radius <= 0)
+        return;
+    for (int Pass = 0; Pass < 2; Pass++)
+    {
+        const int Lines = Pass ? W : H, Along = Pass ? H : W;
+        for (int l = 0; l < Lines; l++)
+            for (int k = 0; k < Along; k++)
+            {
+                float Most = -1e30f;
+                for (int d = -Radius; d <= Radius; d++)
+                {
+                    const int   q = (k + d < 0) ? 0 : ((k + d >= Along) ? Along - 1 : k + d);
+                    const float V = Pass ? Top[q * W + l] : Top[l * W + q];
+                    Most          = (V > Most) ? V : Most;
+                }
+                if (Pass)
+                    Work[k * W + l] = Most;
+                else
+                    Work[l * W + k] = Most;
+            }
+        for (int i = 0; i < W * H; i++)
+            Top[i] = Work[i];
+    }
+}
+
+// The wet look (docs/terv-nedves-feluletek.md 8.5): where a wet floor is wetter, how high the water stands in its
+// hollows, and what the floor's shader leaves for the late reflection pass. SolidPass.hlsl's WetPatch and its
+// neighbours do the same arithmetic with these numbers, which reach it in the wet block (FSolidPass::SetWetBlocks).
+//
+// The patches: a noise fixed to the level over its X and Y - the same in every view and every frame, and going on over
+// the seam between a pavement and the road beside it. A gradient noise of whole-number hashing, as the fountains'
+// (SolidPass.hlsl's FieldLean): the same from the same place on every card, however large the place's numbers are.
+// Three sizes summed, the largest WetPatchUnits across; about zero on the whole, within about a half either way.
+static const float WetPatchUnits     = 160.0f;
+// How wet the floor is, 0..1, from the patch value N: everything the rain falls on is wet, the patches the most.
+static const float WetLevelBase      = 0.8f;
+static const float WetLevelSpread    = 0.8f;
+// The stone's colour where it is wet through (Lagarde, "Water drop 2b": the diffuse times lerp(1, 0.3, wetness)); the
+// water in its hollows darkens it as much. Wood soaks the water up alike; metal does not.
+static const float WetStoneDarkest   = 0.3f;
+// How high the water stands, in the relief's own height (0 its deepest, 1 its top): from WetFloodLeast in the driest
+// patches to WetFloodMost in the wettest - over the stones' tops, the puddles. WetPuddleEdge: how much of the relief's
+// height the water's edge is spread over.
+static const float WetFloodLeast     = 0.05f;
+static const float WetFloodMost      = 1.1f;
+static const float WetFloodSpread    = 1.6f;
+static const float WetPuddleEdge     = 0.06f;
+// The late reflection pass (FWetReflect): how much of what the water's surface would give back the film on the damp
+// stone gives back, at its wettest - by the stone's own relief, where it has one; and how far across the damp stone
+// spreads the image, for each unit the reflected ray goes - its roughness, as a cone's width (the water standing in a
+// puddle spreads none).
+static const float WetFilmShare      = 1.0f;
+static const float WetDampSpread     = 0.05f;
+// A lamp's streak on the wet floor (docs/terv-nedves-feluletek.md 8.7): its light given back as a rough mirror gives it
+// back - the GGX lobe, whose roughness is WetStreakRough on the damp stone and WetStreakPuddleRough on the water (not a
+// needle: no sparkle smaller than a pixel, 9.3) - by WetStreakStrength, one being the lamp's own colour at half its reach.
+static const float WetStreakRough       = 0.15f;
+static const float WetStreakPuddleRough = 0.08f;
+static const float WetStreakStrength    = 1.0f;
+// The wet block's numbers after the view's rows and its screen: the patches' size and the look's numbers above.
+static const int   WetBlockFloats    = 4 * 4 + 4 + 2 * 4 + 4;
+// A floor gets wet where it slopes by no more than 40 degrees (the cosine): the same texture on a wall or a steeper
+// ramp stays dry. Its puddles lie as on a flat floor - they do not run (docs/terv-nedves-feluletek.md 8.2, decision 3).
+static const float WetFloorUpMin     = 0.766044f;
+
+// The hash of a grid point the noise leans by there, both ways -1..1: SolidPass.hlsl's FieldLean, bit for bit.
+inline void WetLean(int Qx, int Qy, float& Gx, float& Gy)
+{
+    unsigned H = (unsigned)Qx * 0x9E3779B9u + (unsigned)Qy * 0xBB67AE85u;
+    H ^= H >> 15;
+    H *= 0x6A09E667u;
+    H ^= H >> 13;
+    H *= 0x510E527Fu;
+    H ^= H >> 16;
+    Gx = (float)(H & 0xFFFFu) * (2.0f / 65535.0f) - 1.0f;
+    Gy = (float)(H >> 16) * (2.0f / 65535.0f) - 1.0f;
+}
+
+// The gradient noise at a place of the grid: zero at every grid point, leaning there as WetLean says, smooth between.
+inline float WetNoise(float X, float Y)
+{
+    const float Ix = PomFloor(X), Iy = PomFloor(Y);
+    const float Fx = X - Ix, Fy = Y - Iy;
+    const float Ux = Fx * Fx * Fx * (Fx * (Fx * 6.0f - 15.0f) + 10.0f);
+    const float Uy = Fy * Fy * Fy * (Fy * (Fy * 6.0f - 15.0f) + 10.0f);
+    const int   Qx = (int)Ix, Qy = (int)Iy;
+    float G[8];
+    WetLean(Qx, Qy, G[0], G[1]);
+    WetLean(Qx + 1, Qy, G[2], G[3]);
+    WetLean(Qx, Qy + 1, G[4], G[5]);
+    WetLean(Qx + 1, Qy + 1, G[6], G[7]);
+    const float V00 = G[0] * Fx + G[1] * Fy;
+    const float V10 = G[2] * (Fx - 1.0f) + G[3] * Fy;
+    const float V01 = G[4] * Fx + G[5] * (Fy - 1.0f);
+    const float V11 = G[6] * (Fx - 1.0f) + G[7] * (Fy - 1.0f);
+    return V00 + Ux * (V10 - V00) + Uy * (V01 - V00) + Ux * Uy * (V00 - V10 - V01 + V11);
+}
+
+// The patch value at a place of the level (its X and Y): three sizes of the noise, each half the one before.
+inline float WetPatch(float LevelX, float LevelY)
+{
+    float X = LevelX / WetPatchUnits, Y = LevelY / WetPatchUnits;
+    float Sum = 0.0f, Amp = 1.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        Sum += Amp * WetNoise(X, Y);
+        X    = X * 2.03f + 17.7f;
+        Y    = Y * 2.03f + 31.3f;
+        Amp *= 0.5f;
+    }
+    return Sum;
+}
+
+inline float WetSaturate(float V) { return (V < 0.0f) ? 0.0f : (V > 1.0f) ? 1.0f : V; }
+// How wet the floor is at a place with the patch value N.
+inline float WetLevelOf(float N) { return WetSaturate(WetLevelBase + WetLevelSpread * N); }
+// How high the water stands there, in the relief's own height.
+inline float WetFloodOf(float N)
+{
+    return WetFloodLeast + (WetFloodMost - WetFloodLeast) * WetSaturate(0.5f + WetFloodSpread * N);
+}
+// How much of a pixel whose relief stands at H (0..1) is under water standing at Flood: a soft edge, half at the line.
+inline float WetPuddleOf(float Flood, float H) { return WetSaturate((Flood - H) / WetPuddleEdge + 0.5f); }
+// What the colour is multiplied by: the stone or the wood (bSoaks) darker the wetter it is, and under the water as dark
+// as it gets.
+inline float WetDarkOf(bool bSoaks, float Wet, float Puddle)
+{
+    const float W = (Wet > Puddle) ? Wet : Puddle;
+    return bSoaks ? 1.0f + (WetStoneDarkest - 1.0f) * W : 1.0f;
+}
+
+// The floor's mark for the late reflection pass (WetMark, R32 twice the scene's width: a pixel's mark at its even
+// column, the word WetTiltPack makes at its odd one): the top bits of the depth's float - larger the nearer, so an
+// atomic maximum keeps the nearest wet floor at a pixel whatever order the floors are drawn in, and the pass tells by
+// them whether it is still the floor that is seen there - then the share of the pixel under water and the kind. Zero:
+// no wet floor.
+static const unsigned WetMarkDepthBits = 0xFFFFF000u;
+static const unsigned WetMarkPuddleMost = 63u;
+static const unsigned WetMarkMetalBit   = 64u;
+inline unsigned WetFloatBits(float F)
+{
+    union
+    {
+        float    F;
+        unsigned U;
+    } B;
+    B.F = F;
+    return B.U;
+}
+inline unsigned WetMarkPack(float Depth, float Puddle, bool bMetal)
+{
+    const unsigned P = (unsigned)(WetSaturate(Puddle) * (float)WetMarkPuddleMost + 0.5f);
+    return (WetFloatBits(Depth) & WetMarkDepthBits) | P | (bMetal ? WetMarkMetalBit : 0u);
+}
+// Whether the mark is of what is seen at a pixel of that depth: its depth's bits the same, or a step off - a step being
+// a part in four thousand of the depth.
+inline bool WetMarkHolds(unsigned Mark, float Depth)
+{
+    if (Mark == 0u)
+        return false;
+    const unsigned A = Mark >> 12, B = WetFloatBits(Depth) >> 12;
+    return (A > B ? A - B : B - A) <= 1u;
+}
+inline float WetMarkPuddle(unsigned Mark) { return (float)(Mark & WetMarkPuddleMost) / (float)WetMarkPuddleMost; }
+inline bool  WetMarkMetal(unsigned Mark) { return (Mark & WetMarkMetalBit) != 0u; }
+// Beside the mark, the normal of the floor's relief where the eye met it (SolidPass.hlsl's WetTiltOf): the top twelve
+// bits of the depth's float - the nearest floor's again the larger, kept by the same atomic maximum - then the normal's
+// X and Y in the level, ten bits each from 1. A floor with no relief (Geometry off, or no height map) leaves its depth's
+// bits alone: the damp stone there gives nothing back, the water standing on it does.
+static const unsigned WetTiltDepthBits = 0xFFF00000u;
+static const unsigned WetTiltSteps     = 1022u;
+inline unsigned WetTiltPack(float Depth, float X, float Y, bool bRelief)
+{
+    const unsigned Tag = WetFloatBits(Depth) & WetTiltDepthBits;
+    if (!bRelief)
+        return Tag;
+    const unsigned Qx = (unsigned)(WetSaturate(X * 0.5f + 0.5f) * (float)WetTiltSteps + 1.5f);
+    const unsigned Qy = (unsigned)(WetSaturate(Y * 0.5f + 0.5f) * (float)WetTiltSteps + 1.5f);
+    return Tag | (Qx << 10) | Qy;
+}
+// The relief's normal in the level from the word beside a mark (WetReflect.hlsl's WetTiltNormal): false where the
+// floor had none, or where the word is another floor's than the mark's - their depths' top bits more than a step apart.
+inline bool WetTiltNormal(unsigned Tilt, unsigned Mark, float& X, float& Y, float& Z)
+{
+    X = Y = 0.0f;
+    Z     = 1.0f;
+    const unsigned A = Tilt >> 20, B = Mark >> 20;
+    if ((Tilt & 0xFFC00u) == 0u || (A > B ? A - B : B - A) > 1u)
+        return false;
+    X             = ((float)((Tilt >> 10) & 1023u) - 1.0f) * (2.0f / (float)WetTiltSteps) - 1.0f;
+    Y             = ((float)(Tilt & 1023u) - 1.0f) * (2.0f / (float)WetTiltSteps) - 1.0f;
+    const float S = 1.0f - X * X - Y * Y;
+    Z             = (S > 0.0f) ? sqrtf(S) : 0.0f;
+    return true;
+}
+
 // A pane's normal, on the camera's side, from its polygon's corners in view space - where the camera is the origin.
 // The widest of the fan's triangles about the first corner says it: the engine hands a polygon over cut to the view,
 // and a cut can leave three corners in a row all but on one line. False for a polygon with no area.
@@ -7104,7 +7815,7 @@ template <typename TChar>
 inline EReflections ReflectionsOfOldWater(const TChar* WaterText)
 {
     if (SettingIsWord(WaterText, "RT"))
-        return Reflections_Rt;
+        return Reflections_RtHigh;
     if (SettingIsWord(WaterText, "Medium") || SettingIsWord(WaterText, "High"))
         return Reflections_High;
     return Reflections_Default;
@@ -7417,6 +8128,10 @@ enum { RainRippleEvery = 4 };
 // around the player, so a shore with only a corner of the rain over water has them as well - below it they fade, and
 // with no drop going in there are none.
 static const float RainRingFullRate = 40.0f;
+// The wet floors' puddles ring (WetReflect.hlsl, RainRingsAt) at full strength where this many of the game's raindrops
+// are falling around the camera, within the ripples' reach of it: the game's rain keeps about twice as many there.
+// Below it they fade; with none falling - a level whose rain does not fall - there are none.
+static const float FloorRainFullDrops = 40.0f;
 
 // The most the ripples may lift or lower the surface, world units: a bound on the field, whatever pushes it.
 static const float RippleLimit = 24.0f;
@@ -8809,11 +9524,11 @@ inline float GrassKeep(float Dist)
     return R * R * ((F < 1.0f) ? F : 1.0f);
 }
 
-// The grass's levels (Grass3D): Off, or Low - the grass as it was made - Medium and High. A level stretches the keep
-// rule by its reach - GrassKeep is asked at the distance over it, so the blades thin out that much further off and are
-// gone that much further - and gives a root its own number of blades: Medium a little denser and half as far again,
-// High twice as far and the densest - two clumps to a root's cell (GrassClumpsOf) - near the eye, thinning off to Low's
-// where a blade would be under a pixel wide (GrassThinFarOf). The ini key takes True (Low) and False (Off) too.
+// The grass's levels (Grass3D): Off, Low, Medium and High - all three High's grass near the eye: the densest, two
+// clumps to a root's cell (GrassClumpsOf), thinning off to the grass as it was made as High's does (GrassThinFarOf).
+// A level stretches the grass as it was made by its reach - GrassKeep is asked at the distance over it, so it thins out
+// that much further off and is gone that much further: Low as far as it was made, Medium half as far again, High twice.
+// The ini key takes True (Low) and False (Off) too.
 enum EGrass
 {
     Grass_Off = 0,
@@ -8834,20 +9549,20 @@ inline float GrassReachOf(EGrass L)
 }
 inline int GrassBladesOf(EGrass L)
 {
-    static const int Blades[Grass_Count] = { 0, GrassBladesPerRoot, GrassBladesPerRoot + 1, 2 * (GrassBladesPerRoot + 2) };
-    return Blades[(L >= 0 && L < Grass_Count) ? (int)L : 0];
+    return (L > Grass_Off && L < Grass_Count) ? 2 * (GrassBladesPerRoot + 2) : 0;
 }
-// The clumps a root's blades are shared among, each in its own place in the root's cell: one, High's two.
+// The clumps a root's blades are shared among, each in its own place in the root's cell: two.
 inline int GrassClumpsOf(EGrass L)
 {
-    return (L == Grass_High) ? 2 : 1;
+    return (L > Grass_Off && L < Grass_Count) ? 2 : 1;
 }
-// How much nearer a root's blades beyond Low's - its further clumps, and the more blades of its first - thin out than
-// the root itself (GrassShader.h, GSpare[1].x): High's 2.5, so that near the eye its grass is all of its own and off
-// where a blade would be under a pixel wide only Low's - grown in again as the eye comes nearer; none for the others.
+// How much nearer a root's blades beyond the grass as it was made - its further clumps, and the more blades of its
+// first - thin out than the root itself (GrassShader.h, GSpare[1].x): High's 2.5, so that near the eye the grass is all
+// of its own and off where a blade would be under a pixel wide only the grass as it was made - grown in again as the
+// eye comes nearer; at the other levels as much less as their reach is, so those blades thin out where High's do.
 inline float GrassThinFarOf(EGrass L)
 {
-    return (L == Grass_High) ? 2.5f : 1.0f;
+    return (L > Grass_Off && L < Grass_Count) ? 2.5f * GrassReachOf(L) / GrassReachOf(Grass_High) : 1.0f;
 }
 template <typename TChar>
 inline void GrassName(EGrass L, TChar* Out, int Max)
@@ -9121,10 +9836,154 @@ inline bool GrassInside(const float* Row, float X, float Y)
     return !(Neg && Pos);
 }
 
+// The geometry pass's vertices a frame (FSolidPass): each frame slot's buffer starts with VertexRoomFirst of them, and
+// grows - never shrinks - as the frames ask for more, up to VertexRoomMost. The spherifier cuts the largest levels into
+// many more triangles than the engine draws them with, and a frame of those with much in view outgrew the first room:
+// what came after - the HUD last of all - was not drawn.
+static const int VertexRoomFirst = 400000;
+static const int VertexRoomMost  = 2000000;
+static const int VertexRoomStep  = 65536;
+// The room for frames that ask for Asked vertices, where Have is held now: Have while Asked is within three quarters of
+// it; else half as much again as Asked, in whole steps, at the most VertexRoomMost - never less than Have.
+inline int VertexRoomFor(int Asked, int Have)
+{
+    if ((long long)Asked * 4 <= (long long)Have * 3)
+        return Have;
+    long long Want = (long long)Asked + Asked / 2;
+    Want = (Want + VertexRoomStep - 1) / VertexRoomStep * VertexRoomStep;
+    if (Want > VertexRoomMost)
+        Want = VertexRoomMost;
+    return (Want > Have) ? (int)Want : Have;
+}
+
+// The grass's ground less what lies on it: a floor the level lays a few units over its lawn - a paved path brushed on
+// as a semisolid, which does not cut the lawn's polygons - would have the blades growing up through it. A convex
+// polygon of the ground, by its X and Y, less a convex polygon that covers it: the pieces left, each convex, at most
+// GrassPieceMost of them with GrassPieceCorners corners each.
+static const int GrassPieceMost    = 64;
+static const int GrassPieceCorners = 48;
+
+// Twice a polygon's area by its X, Y pairs: above zero where its corners go round anticlockwise.
+inline float GrassTwiceArea(const float* P, int N)
+{
+    float Sum = 0.0f;
+    for (int i = 0; i < N; i++)
+    {
+        const int j = (i + 1 < N) ? i + 1 : 0;
+        Sum += P[2 * i] * P[2 * j + 1] - P[2 * j] * P[2 * i + 1];
+    }
+    return Sum;
+}
+
+// The part of a convex polygon on one side of the line through A and B - the left (bLeft) or the right, the line kept -
+// into Out: how many corners, none where nothing is left, -1 where they would be more than Most.
+inline int GrassClipSide(const float* In, int N, float Ax, float Ay, float Bx, float By, bool bLeft, float* Out,
+                         int Most)
+{
+    int M = 0;
+    for (int i = 0; i < N; i++)
+    {
+        const float* const P = In + 2 * i;
+        const float* const Q = In + 2 * ((i + 1 < N) ? i + 1 : 0);
+        float Sp = (Bx - Ax) * (P[1] - Ay) - (By - Ay) * (P[0] - Ax);
+        float Sq = (Bx - Ax) * (Q[1] - Ay) - (By - Ay) * (Q[0] - Ax);
+        if (!bLeft)
+        {
+            Sp = -Sp;
+            Sq = -Sq;
+        }
+        if (Sp >= 0.0f)
+        {
+            if (M >= Most)
+                return -1;
+            Out[2 * M]     = P[0];
+            Out[2 * M + 1] = P[1];
+            M++;
+        }
+        if ((Sp >= 0.0f) != (Sq >= 0.0f))
+        {
+            if (M >= Most)
+                return -1;
+            const float T  = Sp / (Sp - Sq);
+            Out[2 * M]     = P[0] + (Q[0] - P[0]) * T;
+            Out[2 * M + 1] = P[1] + (Q[1] - P[1]) * T;
+            M++;
+        }
+    }
+    return (M >= 3) ? M : 0;
+}
+
+// The convex polygon P less the convex polygon Q, X and Y alone: the pieces of P outside Q, one for each of Q's edges
+// it reaches past - each into Pieces, GrassPieceCorners corners' room apiece, its count into Counts. How many pieces;
+// -1 where they would be more than Most, or a piece more than its room. Slivers of no area are left out. P and Q go
+// round either way.
+inline int GrassSubtract(const float* P, int Np, const float* Q, int Nq, float* Pieces, int* Counts, int Most)
+{
+    if (Np < 3 || Nq < 3 || Np > GrassPieceCorners)
+        return -1;
+    // The inside of Q on the left of each of its edges.
+    const bool bLeft = GrassTwiceArea(Q, Nq) > 0.0f;
+    float Rest[2 * GrassPieceCorners], Next[2 * GrassPieceCorners];
+    int   N = Np;
+    for (int k = 0; k < 2 * Np; k++)
+        Rest[k] = P[k];
+    int Made = 0;
+    for (int e = 0; e < Nq && N >= 3; e++)
+    {
+        const float Ax = Q[2 * e], Ay = Q[2 * e + 1];
+        const int   f  = (e + 1 < Nq) ? e + 1 : 0;
+        const float Bx = Q[2 * f], By = Q[2 * f + 1];
+        float     Out[2 * GrassPieceCorners];
+        const int No = GrassClipSide(Rest, N, Ax, Ay, Bx, By, !bLeft, Out, GrassPieceCorners);
+        if (No < 0)
+            return -1;
+        if (No >= 3 && (GrassTwiceArea(Out, No) > 1e-3f || GrassTwiceArea(Out, No) < -1e-3f))
+        {
+            if (Made >= Most)
+                return -1;
+            for (int k = 0; k < 2 * No; k++)
+                Pieces[2 * GrassPieceCorners * Made + k] = Out[k];
+            Counts[Made++] = No;
+        }
+        N = GrassClipSide(Rest, N, Ax, Ay, Bx, By, bLeft, Next, GrassPieceCorners);
+        if (N < 0)
+            return -1;
+        for (int k = 0; k < 2 * N; k++)
+            Rest[k] = Next[k];
+    }
+    return Made;
+}
+
 // Whether such a triangle reaches into the box from (X0, Y0) to (X1, Y1), edges kept: its footprint overlaps the box,
 // and the box does not lie wholly past one of its edges - which together is exact for a triangle and a box.
-// The ways the game's trees and bushes grow again (Trees3D): none, EZ-Tree's, the renderer's own, half of each.
-enum { Trees_Off = 0, Trees_Ez = 1, Trees_Own = 2, Trees_Mixed = 3 };
+// The game's trees and bushes grown again (Trees3D): none, or half of each kind's plants EZ-Tree's way and half the
+// renderer's own, at three levels of how a far plant is drawn - High as they always were, Medium and Low with fewer of
+// its leaves and only its thicker wood, from nearer on.
+enum { Trees_Off = 0, Trees_Low = 1, Trees_Medium = 2, Trees_High = 3, Trees_Count = 4 };
+inline const char* const* TreesNames()
+{
+    static const char* const Names[Trees_Count] = { "off", "low", "medium", "high" };
+    return Names;
+}
+// A plant draws all of its leaves within this many of its crowns' reach of the eye, and beyond a share falling as the
+// square of the way, to TreeLeastShareOf at the least - each leaf larger by as much, so the crown covers as much (the
+// renderer's DrawTreeInstance). High's reaches twice as far as the plants' first one did.
+inline float TreeFullReachOf(int L)
+{
+    return (L == Trees_Low) ? 4.0f : (L == Trees_Medium) ? 6.0f : 20.0f;
+}
+inline float TreeLeastShareOf(int L)
+{
+    return (L == Trees_Low) ? 0.05f : (L == Trees_Medium) ? 0.08f : 0.12f;
+}
+// A far plant's bark at the lower levels: only its thicker wood, plain (TreeGen.h's Build, bPlain and Least) - from two
+// twigs' radius on where the wood left out comes to fewer of the picture's pixels across than this, from four where
+// that wood does. The thinner wood is most of the bark, and mostly under the leaves. None at High, whose bark is
+// whole at every distance.
+inline float TreeThinPixelsOf(int L)
+{
+    return (L == Trees_Low) ? 3.0f : (L == Trees_Medium) ? 1.5f : 0.0f;
+}
 
 // Which of a key's words (lower case, Names) the value is, in any case and with blanks before it: its index, -1 none.
 inline int WordOf(const char* V, const char* const* Names, int Count)
@@ -9143,6 +10002,24 @@ inline int WordOf(const char* V, const char* const* Names, int Count)
             return i;
     }
     return -1;
+}
+
+// The Trees3D key's word: Off, Low, Medium, High; -1 for any other.
+// -1 for anything else.
+inline int ParseTrees(const char* V)
+{
+    return WordOf(V, TreesNames(), Trees_Count);
+}
+// The Trees3D key's word as the settings file and the log have it: Off, Low, Medium, High.
+template <typename TChar>
+inline void TreesName(int L, TChar* Out, int Max)
+{
+    static const char* const Names[Trees_Count] = { "Off", "Low", "Medium", "High" };
+    const char* const N = Names[(L >= 0 && L < Trees_Count) ? L : 0];
+    int k = 0;
+    for (; N[k] && k < Max - 1; k++)
+        Out[k] = (TChar)N[k];
+    Out[k] = (TChar)0;
 }
 
 // Original (the game's own) or Fixed (the renderer's) - the Fog and Flashlight keys: 1 Fixed, 0 Original, -1 neither.
@@ -9184,15 +10061,47 @@ struct FPresetPicture
     EGrass            Grass;
     int               Trees;
     bool              bWind;
+    bool              bPuddles;         // the floors outdoors wet in the rain (Puddles=On|Off)
     bool              bAntiLag;
+    bool              bSpherifier;      // the level's and the models' round shapes rounded (Spherifier=On|Off)
 };
+
+// The spherifier's distance (SpherifierDistance=<units>, the settings file's alone - no preset and no menu line holds
+// it): the most it moves a wall. The collision stays the level's own walls, so what is drawn keeps near them.
+static const int SpherifierDistanceDefault = 8;
+static const int SpherifierDistanceLeast   = 1;
+static const int SpherifierDistanceMost    = 16;
+// The spherifier's angle (SpherifierAngle=<degrees>, the settings file's alone as well): two neighbouring faces that
+// meet at this angle or wider are one round surface, a sharper meeting stays an edge - 105 rounds a hexagon (its faces
+// meet at 120) and keeps a box's 90. Read in steps of SpherifierAngleStep between the least and the most.
+static const int SpherifierAngleDefault = 105;
+static const int SpherifierAngleLeast   = 90;
+static const int SpherifierAngleMost    = 175;
+static const int SpherifierAngleStep    = 5;
+
+// The distance as read: held to its range.
+inline int SpherifierDistanceOf(int Units)
+{
+    return (Units < SpherifierDistanceLeast) ? SpherifierDistanceLeast
+           : (Units > SpherifierDistanceMost) ? SpherifierDistanceMost : Units;
+}
+
+// The angle as read: held to its range and to its steps.
+inline int SpherifierAngleOf(int Degrees)
+{
+    const int Held = (Degrees < SpherifierAngleLeast) ? SpherifierAngleLeast
+                     : (Degrees > SpherifierAngleMost) ? SpherifierAngleMost : Degrees;
+    return SpherifierAngleLeast +
+           ((Held - SpherifierAngleLeast + SpherifierAngleStep / 2) / SpherifierAngleStep) * SpherifierAngleStep;
+}
 
 // The presets' pictures (Laci's table). Vanilla: the game as it shipped, every extra off and each fix of ours the game's
 // own way. Recommended: the picture that runs everywhere - High shadows, the SSAO, ten-bit SDR, High water and its
 // reflections, the relief by POM, the soft particles, the 3D smoke and fire, the depth of field, the endless water,
-// the fixed fog and flashlight, the 3D force fields, the grass at High, the trees both ways and the wind.
-// INeverAskedForThis: the same with everything the rays can do - the shadows, the occlusion, the reflections - HDR on
-// and the relief raised by displacement mapping. The latency's driver help (AntiLag) is off in all three. Custom has no
+// the fixed fog and flashlight, the 3D force fields, the grass and the trees at Medium and the wind, and the level's
+// and the models' round shapes rounded (the spherifier on).
+// INeverAskedForThis: the same with everything the rays can do - the shadows, the occlusion, the reflections - HDR on,
+// the relief raised by displacement mapping, and the grass and the trees at High. The latency's driver help (AntiLag) is off in all three. Custom has no
 // picture: asked, it answers with Recommended's.
 inline FPresetPicture PresetPicture(EPreset P)
 {
@@ -9205,7 +10114,7 @@ inline FPresetPicture PresetPicture(EPreset P)
     S.Hdr             = bVanilla ? Hdr_Off : (bRays ? Hdr_On : Hdr_Ten);
     S.Ao              = bVanilla ? Ao_Off : (bRays ? Ao_Rt : Ao_Ssao);
     S.Water           = bVanilla ? Water_Off : Water_High;
-    S.Reflections     = bVanilla ? Reflections_Default : (bRays ? Reflections_RtHalf : Reflections_High);
+    S.Reflections     = bVanilla ? Reflections_Default : (bRays ? Reflections_RtMedium : Reflections_High);
     S.FpsLimit        = bVanilla ? (int)FpsLimit_Off : (int)FpsLimit_Auto;
     S.bVsync          = false;
     S.bFrameGen       = false;
@@ -9225,10 +10134,12 @@ inline FPresetPicture PresetPicture(EPreset P)
     S.bFogRooms       = !bVanilla;
     S.Flashlight      = bVanilla ? Flashlight_Original : (bRays ? Flashlight_Everybody : Flashlight_Fixed);
     S.ForceField      = bVanilla ? ForceField_Engine : ForceField_Volume;
-    S.Grass           = bVanilla ? Grass_Off : Grass_High;
-    S.Trees           = bVanilla ? Trees_Off : Trees_Mixed;
+    S.Grass           = bVanilla ? Grass_Off : (bRays ? Grass_High : Grass_Medium);
+    S.Trees           = bVanilla ? Trees_Off : (bRays ? Trees_High : Trees_Medium);
     S.bWind           = !bVanilla;
+    S.bPuddles        = !bVanilla;
     S.bAntiLag        = false;
+    S.bSpherifier     = !bVanilla;
     return S;
 }
 
@@ -9320,6 +10231,325 @@ inline bool GrassTriangleRows(const float* Row, int X0, int Y0, int X1, int Y1, 
         Out[2 * (y - Y0) + 1] = (short)((First > X1) ? X1 : Last);
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// The probe gathered from the picture (docs/tukrozodes-szonda-terv.md): a cube of the level round a point, filled from
+// what the player's own views showed of it - each texel the nearest point of the level seen along its direction from
+// the probe's centre, with that point's colour, how far it lies, how much it is trusted and when it was last seen. The
+// mirror layers read it where the picture cannot give what a ray meets: behind the eye, off the picture's edge. These
+// are the shaders' rules, written once more here to be tested.
+// ---------------------------------------------------------------------------
+
+// A direction's face of the cube and place on it, as Direct3D lays a cube's faces (and the far probe's FarCS reads
+// them): 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z; U across the face and V down it, each in -1 .. 1. False for a direction of
+// no length.
+inline bool ProbeFaceOf(const FVec3& D, int& Face, float& U, float& V)
+{
+    const float Ax = (D.X < 0.0f) ? -D.X : D.X, Ay = (D.Y < 0.0f) ? -D.Y : D.Y, Az = (D.Z < 0.0f) ? -D.Z : D.Z;
+    if (Ax >= Ay && Ax >= Az)
+    {
+        if (!(Ax > 0.0f))
+            return false;
+        Face = (D.X > 0.0f) ? 0 : 1;
+        U    = ((D.X > 0.0f) ? -D.Z : D.Z) / Ax;
+        V    = -D.Y / Ax;
+    }
+    else if (Ay >= Az)
+    {
+        Face = (D.Y > 0.0f) ? 2 : 3;
+        U    = D.X / Ay;
+        V    = ((D.Y > 0.0f) ? D.Z : -D.Z) / Ay;
+    }
+    else
+    {
+        Face = (D.Z > 0.0f) ? 4 : 5;
+        U    = ((D.Z > 0.0f) ? D.X : -D.X) / Az;
+        V    = -D.Y / Az;
+    }
+    return true;
+}
+// And back: the direction (not of length one) through a place on a face.
+inline FVec3 ProbeDirOf(int Face, float U, float V)
+{
+    switch (Face)
+    {
+        case 0:  return { 1.0f, -V, -U };
+        case 1:  return { -1.0f, -V, U };
+        case 2:  return { U, 1.0f, V };
+        case 3:  return { U, -1.0f, -V };
+        case 4:  return { U, -V, 1.0f };
+        default: return { -U, -V, -1.0f };
+    }
+}
+// The texel a place on a face of Side texels falls in; and a texel's middle as a place on its face.
+inline void ProbeTexelOf(float U, float V, int Side, int& X, int& Y)
+{
+    X = (int)((U * 0.5f + 0.5f) * (float)Side);
+    Y = (int)((V * 0.5f + 0.5f) * (float)Side);
+    X = (X < 0) ? 0 : ((X >= Side) ? Side - 1 : X);
+    Y = (Y < 0) ? 0 : ((Y >= Side) ? Side - 1 : Y);
+}
+inline void ProbeTexelMiddle(int X, int Y, int Side, float& U, float& V)
+{
+    U = ((float)X + 0.5f) / (float)Side * 2.0f - 1.0f;
+    V = ((float)Y + 0.5f) / (float)Side * 2.0f - 1.0f;
+}
+
+// A texel of the probe: the point it holds - how far from the centre, its colour -, how much it is trusted (0 knows
+// nothing), and the frame it was last seen in.
+struct FProbeTexel
+{
+    float Dist;
+    FVec3 Colour;
+    float Trust;
+    int   Frame;
+};
+// How close two points along a texel's direction are taken for the same one - a share of their distance: the texel
+// spans that much across at the distance, and the depth it is read from is no finer.
+const float ProbeSameShare = 0.02f;
+// A point of the level seen in Frame, Dist from the centre along the texel's direction, with its colour: the texel
+// keeps the nearest point it knows. The same one seen again - about as far - refreshes it; a nearer one takes its
+// place; a further one is behind what the texel holds, and seen from the centre would not show. A texel that knows
+// nothing takes any.
+inline void ProbeGather(FProbeTexel& T, float Dist, const FVec3& Colour, int Frame)
+{
+    if (T.Trust <= 0.0f || Dist < T.Dist * (1.0f - ProbeSameShare))
+    {
+        T.Dist   = Dist;
+        T.Colour = Colour;
+        T.Trust  = 1.0f;
+        T.Frame  = Frame;
+    }
+    else if (Dist <= T.Dist * (1.0f + ProbeSameShare))
+    {
+        T.Colour = Colour;
+        T.Trust  = 1.0f;
+        T.Frame  = Frame;
+    }
+}
+// Whether a texel's point is gone: seen now from the eye, PointAt along the eye's line through it, where the picture
+// shows something PictureAt along the same line - further than the point by more than Slack: the eye sees past where
+// the point stood (a door opened, someone moved away). Nearer, the point is behind something and may still be there.
+inline bool ProbeCarved(float PointAt, float PictureAt, float Slack)
+{
+    return PictureAt > PointAt + Slack;
+}
+// The slack the probe's carving gives a point (MirrorProbe.hlsl, CarveCS): this many units, and this share of the
+// point's depth - the depth it is held against is read a pixel away from where it falls, on a surface that may lean.
+const float ProbeCarveSlack = 4.0f;
+const float ProbeCarveShare = 0.01f;
+inline float ProbeCarveSlackAt(float PointAt)
+{
+    return ProbeCarveSlack + PointAt * ProbeCarveShare;
+}
+// The probe's numbers (RenderLimits.h): texels a face of the finest level, the pyramid's levels, how many levels up a
+// hole takes its colour from, and the mirror rays' march.
+enum
+{
+    ProbeSide     = RDX_PROBE_SIDE_VALUE,
+    ProbeLevels   = RDX_PROBE_LEVELS_VALUE,
+    ProbeFillUp   = RDX_PROBE_FILL_UP_VALUE,
+    ProbeSteps    = RDX_PROBE_STEPS_VALUE,
+    ProbeHalvings = RDX_PROBE_HALVINGS_VALUE
+};
+// Where a level of the pyramid starts among its entries (six faces of each level before it - the sum's closed form holds
+// while the level's side is a whole number), and how many it has in all.
+inline int ProbeLevelStart(int Level)
+{
+    const int S = ProbeSide, L = ProbeSide >> Level;
+    return 8 * (S * S - L * L);
+}
+inline int ProbeEntries()
+{
+    const int Last = ProbeSide >> (ProbeLevels - 1);
+    return ProbeLevelStart(ProbeLevels - 1) + 6 * Last * Last;
+}
+
+// Where the probe stands (FMirrorProbe): before the pane of glass that takes up the most of the screen, ProbeAhead
+// units out on the camera's side - one or two metres before the pane, where what it mirrors is seen from (the plan's
+// 6.3). It holds the level ProbeReach round that point. It stays while the camera is within ProbeKeepReach of it - a
+// look round from where one stands is what fills it - and only beyond that goes over to another pane, once that one has
+// been the larger by ProbeMoveShare for ProbeMoveFrames frames running. A pane whose probe would stand within
+// ProbeSamePlace of it is its own.
+// With no pane in sight it stands where the camera is and follows it, ProbeFollowReach behind at the most - what it holds
+// goes with it as it moves (FMirrorProbe), so the panes the camera turns to find it full of what was seen on the way;
+// the first pane drawn takes it at once. One that stands before a pane goes back to following once the camera is off
+// beyond ProbeKeepReach and no pane has been drawn for ProbeMoveFrames frames.
+const float ProbeAhead        = 80.0f;
+const float ProbeReach        = 2048.0f;
+const float ProbeKeepReach    = 768.0f;
+const float ProbeFollowReach  = 384.0f;
+const float ProbeSamePlace    = 64.0f;
+const float ProbeMoveShare    = 1.5f;
+const int   ProbeMoveFrames   = 30;
+struct FProbePlace
+{
+    bool  bPlaced  = false;
+    bool  bAtPane  = false;     // before a pane; otherwise following the camera
+    FVec3 Centre   = { 0.0f, 0.0f, 0.0f };
+    // The pane it stands before: its middle, and its normal towards the camera (the own body is mirrored by it).
+    FVec3 PaneMiddle = { 0.0f, 0.0f, 0.0f };
+    FVec3 PaneNormal = { 0.0f, 0.0f, 0.0f };
+    // The frame's panes so far: the largest and where its probe would stand, and what the probe's own pane takes up.
+    float BestArea = 0.0f;
+    FVec3 Best     = { 0.0f, 0.0f, 0.0f };
+    FVec3 BestMiddle = { 0.0f, 0.0f, 0.0f };
+    FVec3 BestNormal = { 0.0f, 0.0f, 0.0f };
+    float HereArea = 0.0f;
+    int   Waiting  = 0;
+    int   NoPane   = 0;         // frames running with no pane drawn
+
+    // A pane drawn this frame: its middle and its normal (of length one, towards the camera) in the world, and how much
+    // of the screen it takes up.
+    void Note(const FVec3& Middle, const FVec3& Normal, float Area)
+    {
+        if (!(Area > 0.0f))
+            return;
+        const FVec3 At = { Middle.X + Normal.X * ProbeAhead, Middle.Y + Normal.Y * ProbeAhead,
+                           Middle.Z + Normal.Z * ProbeAhead };
+        const FVec3 Off = { At.X - Centre.X, At.Y - Centre.Y, At.Z - Centre.Z };
+        if (bPlaced && Dot(Off, Off) <= ProbeSamePlace * ProbeSamePlace)
+            HereArea += Area;
+        if (Area > BestArea)
+        {
+            BestArea   = Area;
+            Best       = At;
+            BestMiddle = Middle;
+            BestNormal = Normal;
+        }
+    }
+    // The frame is over, its camera at Eye: where the probe stands next. True where it stood anew.
+    bool Choose(const FVec3& Eye)
+    {
+        bool        bMoved = false;
+        const FVec3 Away   = { Eye.X - Centre.X, Eye.Y - Centre.Y, Eye.Z - Centre.Z };
+        const float Far2   = Dot(Away, Away);
+        if (BestArea > 0.0f)
+        {
+            NoPane = 0;
+            const FVec3 Off = { Best.X - Centre.X, Best.Y - Centre.Y, Best.Z - Centre.Z };
+            if (!bPlaced || !bAtPane)
+            {
+                bPlaced    = true;
+                bAtPane    = true;
+                Centre     = Best;
+                PaneMiddle = BestMiddle;
+                PaneNormal = BestNormal;
+                bMoved     = true;
+                Waiting    = 0;
+            }
+            else if (Far2 > ProbeKeepReach * ProbeKeepReach && Dot(Off, Off) > ProbeSamePlace * ProbeSamePlace &&
+                     BestArea > HereArea * ProbeMoveShare)
+            {
+                if (++Waiting >= ProbeMoveFrames)
+                {
+                    Centre     = Best;
+                    PaneMiddle = BestMiddle;
+                    PaneNormal = BestNormal;
+                    bMoved     = true;
+                    Waiting    = 0;
+                }
+            }
+            else
+                Waiting = 0;
+        }
+        else
+        {
+            NoPane++;
+            Waiting = 0;
+            const bool bFollow = !bPlaced ||
+                                 (!bAtPane && Far2 > ProbeFollowReach * ProbeFollowReach) ||
+                                 (bAtPane && Far2 > ProbeKeepReach * ProbeKeepReach && NoPane >= ProbeMoveFrames);
+            if (bFollow)
+            {
+                bPlaced = true;
+                bAtPane = false;
+                Centre  = Eye;
+                bMoved  = true;
+            }
+        }
+        BestArea = 0.0f;
+        HereArea = 0.0f;
+        return bMoved;
+    }
+    void Forget()
+    {
+        *this = FProbePlace();
+    }
+};
+// A coarser level's texel from the four under it: their colours weighed by how much each is trusted, the trust their
+// average - an unknown texel adds nothing to the colour and only takes from the trust; the nearest point the four
+// hold (a ray must not pass a surface any one of them knows); the latest frame.
+inline FProbeTexel ProbeMipOf(const FProbeTexel* Four)
+{
+    FProbeTexel Out = { 1e30f, { 0.0f, 0.0f, 0.0f }, 0.0f, -1 };
+    float       Weight = 0.0f;
+    for (int k = 0; k < 4; k++)
+    {
+        const FProbeTexel& T = Four[k];
+        if (T.Trust <= 0.0f)
+            continue;
+        Out.Colour.X += T.Colour.X * T.Trust;
+        Out.Colour.Y += T.Colour.Y * T.Trust;
+        Out.Colour.Z += T.Colour.Z * T.Trust;
+        Weight += T.Trust;
+        Out.Dist  = (T.Dist < Out.Dist) ? T.Dist : Out.Dist;
+        Out.Frame = (T.Frame > Out.Frame) ? T.Frame : Out.Frame;
+    }
+    if (Weight > 0.0f)
+    {
+        Out.Colour.X /= Weight;
+        Out.Colour.Y /= Weight;
+        Out.Colour.Z /= Weight;
+    }
+    Out.Trust = Weight * 0.25f;
+    return Out;
+}
+// What a ray from At along Way (of length one) meets of what the probe round Centre holds: the ray marched in Steps
+// even steps out to Reach, each step's place looked up by its direction from the centre (Lookup(Face, X, Y) gives the
+// texel, Side across a face); where the place lies as far from the centre as the texel's point or further, the ray
+// has passed that point's surface, and Halvings halvings of the step find the crossing more closely. A texel that
+// knows nothing stops no ray - the ray goes on to the next that does. T: how far along the ray; false where no known
+// point was met within Reach. Exact where the room is seen whole from the centre (every point of it on the centre's
+// line of sight); round a corner the centre cannot see past, the nearest point it saw stands in.
+template <typename TLookup>
+inline bool ProbeMarch(const FVec3& Centre, int Side, const FVec3& At, const FVec3& Way, float Reach, int Steps,
+                       int Halvings, TLookup Lookup, float& T)
+{
+    auto Passed = [&](float S)
+    {
+        const FVec3 Q = { At.X + Way.X * S - Centre.X, At.Y + Way.Y * S - Centre.Y, At.Z + Way.Z * S - Centre.Z };
+        int         Face;
+        float       U, V;
+        if (!ProbeFaceOf(Q, Face, U, V))
+            return false;
+        int X, Y;
+        ProbeTexelOf(U, V, Side, X, Y);
+        const FProbeTexel* Tx = Lookup(Face, X, Y);
+        return Tx && Tx->Trust > 0.0f && Sqrt(Dot(Q, Q)) >= Tx->Dist;
+    };
+    float Prev = 0.0f;
+    for (int i = 1; i <= Steps; i++)
+    {
+        const float S = Reach * (float)i / (float)Steps;
+        if (Passed(S))
+        {
+            float Lo = Prev, Hi = S;
+            for (int h = 0; h < Halvings; h++)
+            {
+                const float M = 0.5f * (Lo + Hi);
+                if (Passed(M))
+                    Hi = M;
+                else
+                    Lo = M;
+            }
+            T = Hi;
+            return true;
+        }
+        Prev = S;
+    }
+    return false;
 }
 
 } // namespace RdxMath

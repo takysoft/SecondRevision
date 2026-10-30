@@ -78,16 +78,23 @@ public:
     // a surface's pixels write down the rays each would trace, the host answers each with what it met, and the
     // surface is drawn reading the answers.
     // BeginAsk: the list emptied - its count back at the start, no block at any pixel - and the requests and the
-    // heads as a pixel shader writes them. False: the share has no list.
-    UBOOL BeginAsk(ID3D12GraphicsCommandList* Cmd);
+    // heads as a pixel shader writes them; bLow: the own list too (GetLow). False: the share has no list.
+    UBOOL BeginAsk(ID3D12GraphicsCommandList* Cmd, UBOOL bLow);
+    // Reflections=RTLow's own list (FRaySparse): the pixels write all they ask into it, a list of this process's own
+    // as long as the host's, and the pass puts the requests the host is to trace into the host's. Made for the share
+    // the first time it is asked for (EnsureLow; False, said once, where the card refused it), and let go with the
+    // share. It stays an UNORDERED_ACCESS resource from BeginAsk to FeedList, and is readable by a pixel shader after.
+    UBOOL EnsureLow(ID3D12Device* Device);
+    ID3D12Resource* GetLow() const { return Low.Get(); }
     // After the asking draws, in Feed's place for a frame whose one pass is the list's: the requests as they change
     // hands and the heads readable, the scene's copies, the masks, the list pass's own constants - how many slots
     // it may read, and the player's own body among the bodies (OwnBody, -1: not there) - and its table: each body's
     // first vertex among the texture places. And what the host traces on by from what a ray met - the frame's table
     // of the mirror rays (FRtPass::PrepareWater's, filled by now) and the level's surfaces - with the passed
-    // surfaces' count back at its start. Handover follows it.
+    // surfaces' count back at its start. Handover follows it. bLow: the round's pixels wrote into the own list
+    // (GetLow) - its count is the one read back, the host's beside it.
     UBOOL FeedList(ID3D12GraphicsCommandList* Cmd, FHost64Link& Link, const FRtPass& Rt, FShadowMaps& Shadow,
-                   INT FrameIndex, INT Bodies, INT OwnBody);
+                   INT FrameIndex, INT Bodies, INT OwnBody, UBOOL bLow);
     // What the drawing that reads the answers binds: the pixels' heads - a texture of this process's own - the
     // requests, for a block's key, and the answers; and a number that changes when they are other resources. The
     // two buffers are readable by a pixel shader (bOn) from the hand-over's end until the next hand-over, which
@@ -97,6 +104,18 @@ public:
     ID3D12Resource* GetAnswers() const  { return Shared[Host64::Ray_Answers].Get(); }
     UBOOL HasList() const { return Heads && GetRequests() && GetAnswers() && ListRoom >= 2; }
     INT   GetListRoom() const { return ListRoom; }
+    // The corners the rays are traced against, as the host has them, for the build that reads the answers to meet
+    // a borrowed answer's triangle with a ray of its own (RTLow): the level's (Which 0), the frame's bodies' (1) and
+    // the arena's (2) - twelve bytes a corner, null where the share has none - and how many bytes of each. In COMMON
+    // between the frames' copies, which a pixel shader may read as they are.
+    ID3D12Resource* GetCorners(INT Which) const
+    {
+        return Shared[(Which == 0) ? Host64::Ray_Level : (Which == 1) ? Host64::Ray_FrameXyz : Host64::Ray_ArenaXyz].Get();
+    }
+    UINT64 GetCornerBytes(INT Which) const
+    {
+        return (Which == 0) ? (UINT64)StaticVertices[0] * 12 : (Which == 1) ? FrameBytes : ArenaBytes;
+    }
     // The see-through surfaces the rays passed, as the host wrote them - null where the share has no buffer of
     // them - and its slots. Readable with the answers.
     ID3D12Resource* GetPassed() const   { return Shared[Host64::Ray_Passed].Get(); }
@@ -114,10 +133,12 @@ public:
     // and how many hand-overs they made; the requests they asked and the see-through surfaces their rays passed, a
     // frame's hand-overs together - summed over the frames, and the most a frame had; and the requests by which
     // of its frame's hand-overs asked them, the first one first. False: no frame had any.
+    // Traced: of the requests asked, the ones the host traced, where a round's pixels wrote into the own list (the rest
+    // borrowed answers, RTLow); the requests asked otherwise.
     struct FListCounts
     {
         INT   Frames, Handovers, AskedMost, PassedMost;
-        INT64 Asked, Passed;
+        INT64 Asked, Passed, Traced;
         INT64 Each[LIST_BACK_MOST];
     };
     UBOOL TakeListCounts(FListCounts& Out);
@@ -134,7 +155,7 @@ public:
 private:
     // An older share's resources wait in their own places: the shared ones, and the three of this process's own
     // that go with a share - the pixels' heads, their target's heap, the list's upload buffer. Room for three shares.
-    enum { OWN_COUNT = 3, OLD_ROOM = 3 * (Host64::Ray_Count + OWN_COUNT) };
+    enum { OWN_COUNT = 4, OLD_ROOM = 3 * (Host64::Ray_Count + OWN_COUNT) };
     UBOOL MakeShare(ID3D12Device* Device, FHost64Link& Link, const FRtPass& Rt, const FShadowMaps& Shadow,
                     const FViews& Views, INT Bodies);
     UBOOL Retire();
@@ -158,6 +179,8 @@ private:
     INT                     FactorW, FactorH;
     INT                     AskW, AskH;        // the asking picture's size; 0: the share has no list
     UBOOL                   bStaticCopied;     // the level's triangles have gone into this share
+    UINT64                  ArenaCopied;       // the arena's bytes that have gone into it, of the arena as
+    INT                     ArenaCopiedGen;    // ArenaCopiedGen had it (FShadowMaps::GetArenaGen)
     INT                     ShareSerial;       // counts the shares made - see GetShareSerial
     INT                     FrameSerial;       // counts the frames (Tick); the one whose scene was last copied over, and
     INT                     SceneCopiedAt;     // the one a hand-over last had the host make its scene in
@@ -169,6 +192,12 @@ private:
     TComRef<ID3D12DescriptorHeap> HeadsRtvHeap;
     INT                     ListRoom;
     D3D12_RESOURCE_STATES   HeadsState, AskedState, AnswersState;
+    // RTLow's own list (EnsureLow) and its state; whether the card refused it for this share; and which of a frame
+    // slot's hand-overs read their count back from it (a bit each).
+    TComRef<ID3D12Resource> Low;
+    D3D12_RESOURCE_STATES   LowState    = D3D12_RESOURCE_STATE_COMMON;
+    UBOOL                   bLowRefused = 0;
+    UINT                    LowBackMask[BACKEND_FRAME_COUNT] = {};
     // The list pass's constants and its table of the bodies' first vertices: an upload buffer of ours, a frame slot's
     // worth each (ListSlotBytes), copied into the shared tables with the rest; and where that table lies there.
     // After the frame slots' own, the requests' slot 0 as a frame starts with it (ListStartAt).

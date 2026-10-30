@@ -8,6 +8,7 @@
 #pragma once
 
 class FShadowMaps;
+class FCardWriter;
 
 class FRtPass
 {
@@ -19,6 +20,9 @@ public:
     // frame's bodies as a list (ListScene) and the shadows' constants and table (FillShadowExclusion) are kept from
     // here on. No pipeline and no structure is made. False, logged, where the constants' buffer could not be made.
     UBOOL InitHosted(ID3D12Device5* Device);
+    // The far probe's shader compiled, nothing made of it: for a start with the rays off (FBackend::WarmShaders) - the
+    // same as InitFar asks for, so the shader cache knows it when the rays are switched on.
+    static void WarmShaders();
     void  Shutdown();
     // IsHosted: InitHosted made the pass. IsReady: and its lists can be kept - no longer from the frame on where the
     // machine gave no memory for them, and the settings on rays run their fallbacks from there.
@@ -60,7 +64,7 @@ public:
     INT    GetMaterialSerial() const { return MaterialSerial; }
     UBOOL  CopyMaterial(ID3D12GraphicsCommandList* Cmd, ID3D12Resource* To) const;
 
-    // The level's triangles, as the shadow maps get them (FBackend::SetShadowWorld), into a buffer of the scene's own - the
+    // The level's triangles, as the shadow maps get them (FBackend::SetShadowRtWorld), into a buffer of the scene's own - the
     // long ones cut into pieces first (RdxMath::SplitTriangle), for the rays' sake. The host makes its structure of
     // the level from it (FHostRayFeed). None: no level.
     // For the RT water: each triangle's surface (Surf, one a triangle; a piece takes its triangle's), and each surface's
@@ -72,9 +76,11 @@ public:
     // and each one's surface. A structure of their own, which only the mirror rays ask (RT_MASK_THIN) on their way
     // to what they meet: such a surface stops no ray, it adds its colour to what lies behind it (SolidPass.hlsl,
     // RtThinOver). None: the level has none.
-    void  SetThin(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf);
+    // The triangles of all three go on the card's own memory where Card can put them there (CardWriter.h), otherwise
+    // in an upload heap.
+    void  SetThin(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, FCardWriter* Card);
     void  SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, const DWORD* Albedo, INT SurfCount,
-                   const FLOAT* Sky, INT SkyVertexCount);
+                   const FLOAT* Sky, INT SkyVertexCount, FCardWriter* Card);
     // A surface's light for the RT water - its light map's average (RdxMath::RtLightAverage) - with the light map's
     // identity (the engine's CacheID), so that the same light map is not averaged again: WantsSurfaceLight says whether this
     // one is new for the surface.
@@ -107,12 +113,12 @@ public:
     void  SetLamps(const BYTE* Blob, INT Bytes, const DWORD* Part, INT Count, INT Large, FLOAT Cell, FLOAT Gain);
     // Before the frame's rays are asked, after ListScene (FBackend::BeginRayAsk): the level's colours onto the card
     // where they changed, and the RT water's table (SolidPass.hlsl's RtWater, a buffer) for the frame slot - the camera
-    // (Eye, world units) and whether a quarter of the rays are asked (bHalf: Reflections=RTHalf), where the surfaces'
-    // records start and the measuring view (View, FBackend::RequestRtWaterView), then a row for each actor geometry
+    // (Eye, world units) and whether fewer rays than pixels are traced (Sparse: RtTables.hlsli's RtEye.w), where the
+    // surfaces' records start and the measuring view (View, FBackend::RequestRtWaterView), then a row for each actor geometry
     // (RdxMath::RtGeoUints): its first vertex in the shadow maps' buffers, and what the rays show of it
     // (FShadowMaps::FCasterRt). The table's address; 0 when there is nothing to trace against.
     D3D12_GPU_VIRTUAL_ADDRESS PrepareWater(ID3D12GraphicsCommandList* Cmd, INT FrameIndex, const FShadowMaps& Shadow,
-                                           const FLOAT* Eye, INT View, UBOOL bHalf);
+                                           const FLOAT* Eye, INT View, INT Sparse);
     // The level's colours as the RT water reads them (SolidPass.hlsl's LevelMaterial); 0 before a level.
     D3D12_GPU_VIRTUAL_ADDRESS GetLevelMaterial() const;
     // The far probe (Reflections=RT): what the picture shows far off, by direction - a cube, FAR_SIZE texels a face,
@@ -145,8 +151,9 @@ public:
     enum { RT_MASK_LEVEL = 0x01, RT_MASK_ACTORS = 0x02, RT_MASK_SKY = 0x04, RT_MASK_THIN = 0x08 };
 
 private:
-    // An upload buffer holding Floats floats from Src, for a structure to be made from; null when it cannot be made.
-    ID3D12Resource* MakeVertexBuffer(const FLOAT* Src, INT Floats, const TCHAR* What);
+    // A buffer holding Floats floats from Src, for a structure to be made from - on the card's own memory where Card
+    // can put it there, otherwise in an upload heap; null when it cannot be made.
+    ID3D12Resource* MakeVertexBuffer(const FLOAT* Src, INT Floats, const TCHAR* What, FCardWriter* Card);
 
     ID3D12Device5*               Device;          // the backend's, while InitHosted holds
     UBOOL                        bReady;
