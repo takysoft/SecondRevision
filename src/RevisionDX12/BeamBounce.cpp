@@ -376,6 +376,7 @@ UBOOL FBeamBounce::HoldVertices(ID3D12Device* Device, INT Slot, INT Wanted)
         Vertices[Slot]->Unmap(0, nullptr);
     Vertices[Slot].Release();
     *Vertices[Slot].Slot() = Made;
+    RdxUploadCensus::Note(Made, Bd.Width, L"beams' bounces");
     VerticesMapped[Slot] = MadeAt;
     VerticesRoom[Slot]   = Larger;
     return 1;

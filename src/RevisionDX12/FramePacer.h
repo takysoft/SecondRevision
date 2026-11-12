@@ -120,6 +120,10 @@ private:
     // Until the queue has reached Value (0: nothing), half a second at most.
     void   WaitThrough(UINT64 Value);
     void   NoteResult(HRESULT Hr);
+    // The job's host picture and fence taken over from it into its held slot, the slot's earlier ones let go (LetGoHeld).
+    void   HoldHostPicture(FJob& J);
+    // A held slot let go once this queue is past it - waited for a while, and let go after that as everything else here.
+    void   LetGoHeld(INT H);
     static DWORD WINAPI ThreadMain(void* Self);
     void   Run();
 
@@ -148,6 +152,13 @@ private:
     volatile LONG                      Result;            // see Submit
     volatile LONG                      Dropped;           // see TakeDropped
     FJob                               Ring[Jobs];
+    // The host's picture and fence a job used (Submit takes a reference to both), held by the thread after the job until
+    // this queue has gone past it (HeldUntil, on Fence): the host may be let go of on the engine's thread while the job's
+    // copy, or its wait for the host's fence, is still queued here. A job's slot is its number's, Jobs apart; Shutdown
+    // lets go of what is left.
+    ID3D12Resource*                    HeldPicture[Jobs];
+    ID3D12Fence*                       HeldFence[Jobs];
+    UINT64                             HeldUntil[Jobs];
     DOUBLE                             LastGenAt;         // the thread's: when the last generated picture went out
     DOUBLE                             GenThroughAt;      // ... this frame's generated picture (0: it had none)
     DOUBLE                             LastRealAt;        // ... and the last real picture

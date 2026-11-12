@@ -128,8 +128,20 @@ FBackend::FBackend()
     for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
     {
         TimePlaced[s] = 0;
-        TimeLive[s]   = 0;
+        TimeLive[s]    = 0;
+        StatsSeg[s]    = 0;
+        StatsOpen[s]   = 0;
+        StatsPaused[s] = 0;
+        StatsDone[s]   = 0;
+        StatsBad[s]    = 0;
+        StatsLive[s]   = 0;
     }
+    bGpuStats    = 0;
+    bStatsFailed = 0;
+    StatsMapped  = nullptr;
+    StatsFrames  = 0;
+    for (INT k = 0; k < GPU_STATS_FIELDS; k++)
+        StatsSum[k] = 0.0;
     for (INT k = 0; k < GPU_TIME_PARTS; k++)
     {
         TimeSum[k]   = 0.0;
@@ -1398,19 +1410,12 @@ void FBackend::PresentCompiling()
     // end for a longer list: the process then ends inside the driver (a fail-fast no handler sees), with no line in
     // any log. Half of what that driver holds.
     enum { RECTS_MAX = 800, RECTS_A_CLEAR = 16 };
-    // The text names the shader about to compile (Now). Where the cache's file gave nothing the start compiles every
-    // shader the renderer has: their number is known (START_SHADERS), and the bar shows the ones done. Where it gave
-    // some - a new renderer over the file of an older one - only the shaders that changed compile, and how many is not
-    // known before: the count alone, with no bar.
-    const INT   Done   = RdxStartupShaders();
-    const INT   Now    = Done + 1;
-    const UBOOL bWhole = RdxShaderCacheRead() == 0;
-    const INT   Total  = Max(Now, (INT)START_SHADERS);
+    // The text names the shader about to compile (Now) of all the start compiles; the bar shows the ones done.
+    const INT Done  = RdxStartupShaders();
+    const INT Now   = Done + 1;
+    const INT Total = Max(Now, (INT)START_SHADERS);
     char Text[64];
-    if (bWhole)
-        _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i / %i", Now, Total);
-    else
-        _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i", Now);
+    _snprintf_s(Text, sizeof(Text), _TRUNCATE, "COMPILING SHADERS  %i / %i", Now, Total);
     INT Chars = 0;
     while (Text[Chars])
         Chars++;
@@ -1482,12 +1487,9 @@ void FBackend::PresentCompiling()
     // The caption's rectangles a few to a clear, never the whole list in one (RECTS_A_CLEAR).
     for (INT First = 0; First < Count; First += RECTS_A_CLEAR)
         CommandList->ClearRenderTargetView(Rtv, Pale, (UINT)Min(Count - First, (INT)RECTS_A_CLEAR), Rects + First);
-    if (bWhole)
-    {
-        CommandList->ClearRenderTargetView(Rtv, Dim, 4, Rim);
-        if (Fill.right > Fill.left && Fill.bottom > Fill.top)
-            CommandList->ClearRenderTargetView(Rtv, Pale, 1, &Fill);
-    }
+    CommandList->ClearRenderTargetView(Rtv, Dim, 4, Rim);
+    if (Fill.right > Fill.left && Fill.bottom > Fill.top)
+        CommandList->ClearRenderTargetView(Rtv, Pale, 1, &Fill);
     Barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     Barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     CommandList->ResourceBarrier(1, &Barrier);
@@ -1947,6 +1949,7 @@ FLOAT* FBackend::MotionVertices(INT VertexCount, INT& First)
                        TEXT("CreateCommittedResource(motion bodies)")) ||
                 FAILED(MotionVb[s]->Map(0, nullptr, &Mapped)) || !Mapped)
                 MotionVbState = -1;
+            RdxUploadCensus::Note(MotionVb[s].Get(), Desc.Width, L"motion bodies");
             MotionVbMapped[s] = (FLOAT*)Mapped;
         }
         RdxLog(TEXT("motion vectors (objects): the bodies' own buffer %s - %i vertices a frame"),
@@ -2805,6 +2808,7 @@ void FBackend::UploadOwnTable()
                         "them"));
             return;
         }
+        RdxUploadCensus::Note(OwnTableUpload.Get(), UpDesc.Width, L"own lamps' table");
         OwnTableState = D3D12_RESOURCE_STATE_COPY_DEST;
         D3D12_SHADER_RESOURCE_VIEW_DESC Srv;
         appMemzero(&Srv, sizeof(Srv));
@@ -5091,7 +5095,9 @@ void FBackend::ApplyShadows(ID3D12GraphicsCommandList* Cmd)
         GpuTime(Cmd, 18);
         bRtHostTraced = Mapped && RayParams &&
                         RayFeed.Feed(Cmd, Host.GetLink(), Rt, Shadow, HostViews, (INT)FrameIndex, RtHostBodies, Passes) &&
-                        (NoteFrameSubmit(1), RayFeed.Handover(Cmd, Allocators[FrameIndex], Queue.Get(), Host.GetLink()));
+                        (NoteFrameSubmit(1), StatsSplit(Cmd, 0, 1),
+                         RayFeed.Handover(Cmd, Allocators[FrameIndex], Queue.Get(), Host.GetLink()));
+        StatsSplit(Cmd, 1, bRtHostTraced);
         if (bRtHostTraced)
         {
             bRtSurfaceTraced = bRtSurface;
@@ -5305,6 +5311,77 @@ void FBackend::CreateGpuTimer()
     RDX_LOGF("gpu timing: up - %i timestamps per frame, logged every %i frames", (INT)GPU_TIME_POINTS, (INT)GPU_TIME_LOG_FRAMES);
 }
 
+// The pipeline's counts' query heap and its readback buffer (RequestGpuStats), mapped for as long as they live. Should
+// either fail, the counts are off for the run - they only write the log.
+void FBackend::CreateGpuStats()
+{
+    D3D12_QUERY_HEAP_DESC Q;
+    appMemzero(&Q, sizeof(Q));
+    Q.Type  = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+    Q.Count = BACKEND_FRAME_COUNT * GPU_STATS_SEGMENTS;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC R;
+    appMemzero(&R, sizeof(R));
+    R.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    R.Width            = (UINT64)Q.Count * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+    R.Height           = 1;
+    R.DepthOrArraySize = 1;
+    R.MipLevels        = 1;
+    R.SampleDesc.Count = 1;
+    R.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(Device->CreateQueryHeap(&Q, __uuidof(ID3D12QueryHeap), (void**)StatsHeap.Slot())) ||
+        FAILED(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &R, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               __uuidof(ID3D12Resource), (void**)StatsReadback.Slot())) ||
+        FAILED(StatsReadback->Map(0, nullptr, (void**)&StatsMapped)) || !StatsMapped)
+    {
+        StatsMapped = nullptr;
+        StatsReadback.Release();
+        StatsHeap.Release();
+        bStatsFailed = 1;
+        RDX_LOG("gpu stats: the pipeline statistics queries could NOT be created - the counts are off");
+        return;
+    }
+    for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
+    {
+        StatsSeg[s]  = StatsLive[s] = 0;
+        StatsOpen[s] = StatsPaused[s] = StatsDone[s] = StatsBad[s] = 0;
+    }
+    RDX_LOG("gpu stats: up - the pipeline's counts over the world drawn before the shadows");
+}
+
+// A split of the frame's list - a hand-over to the host: what was recorded so far executed, the list opened again. The
+// pipeline's counts may not stay open across it: before, the open query is ended; after, the frame's next one is begun -
+// unless the hand-over failed (the list is lost with the frame) or the frame has no more, and the frame is left out.
+void FBackend::StatsSplit(ID3D12GraphicsCommandList* Cmd, UBOOL bAfter, UBOOL bOk)
+{
+    if (!StatsHeap || !Cmd || FrameIndex >= BACKEND_FRAME_COUNT)
+        return;
+    const UINT Base = FrameIndex * GPU_STATS_SEGMENTS;
+    if (!bAfter)
+    {
+        if (StatsOpen[FrameIndex])
+        {
+            Cmd->EndQuery(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, Base + (UINT)StatsSeg[FrameIndex] - 1);
+            StatsOpen[FrameIndex]   = 0;
+            StatsPaused[FrameIndex] = 1;
+        }
+        return;
+    }
+    if (!StatsPaused[FrameIndex])
+        return;
+    StatsPaused[FrameIndex] = 0;
+    if (!bOk || StatsSeg[FrameIndex] >= GPU_STATS_SEGMENTS)
+    {
+        StatsBad[FrameIndex] = 1;
+        return;
+    }
+    Cmd->BeginQuery(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, Base + (UINT)StatsSeg[FrameIndex]);
+    StatsSeg[FrameIndex]++;
+    StatsOpen[FrameIndex] = 1;
+}
+
 void FBackend::GpuTime(ID3D12GraphicsCommandList* Cmd, INT Point)
 {
     if (!TimeHeap || !TimeMapped || !Cmd || Point < 0 || Point >= GPU_TIME_POINTS || FrameIndex >= BACKEND_FRAME_COUNT)
@@ -5313,6 +5390,24 @@ void FBackend::GpuTime(ID3D12GraphicsCommandList* Cmd, INT Point)
     {
         TimePlaced[FrameIndex] = 0;
         TimeRound              = 0;
+        if (bGpuStats && !StatsHeap && !bStatsFailed)
+            CreateGpuStats();
+        if (bGpuStats && StatsHeap)
+        {
+            Cmd->BeginQuery(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, FrameIndex * GPU_STATS_SEGMENTS);
+            StatsSeg[FrameIndex]    = 1;
+            StatsOpen[FrameIndex]   = 1;
+            StatsPaused[FrameIndex] = 0;
+            StatsDone[FrameIndex]   = 0;
+            StatsBad[FrameIndex]    = 0;
+        }
+    }
+    if (Point == 1 && StatsHeap && StatsOpen[FrameIndex])
+    {
+        Cmd->EndQuery(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                      FrameIndex * GPU_STATS_SEGMENTS + (UINT)StatsSeg[FrameIndex] - 1);
+        StatsOpen[FrameIndex] = 0;
+        StatsDone[FrameIndex] = 1;
     }
     Cmd->EndQuery(TimeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, FrameIndex * GPU_TIME_POINTS + (UINT)Point);
     TimePlaced[FrameIndex] |= (UINT64)1 << Point;
@@ -5331,6 +5426,17 @@ void FBackend::ReadGpuTime(UINT Slot)
     if (!TimeMapped || Slot >= BACKEND_FRAME_COUNT || !TimeLive[Slot] || TimeTick <= 0.0)
         return;
     TimeLive[Slot] = 0;
+    if (StatsMapped && StatsLive[Slot] > 0)
+    {
+        for (INT g = 0; g < StatsLive[Slot]; g++)
+        {
+            const UINT64* const S = StatsMapped + (Slot * GPU_STATS_SEGMENTS + (UINT)g) * GPU_STATS_FIELDS;
+            for (INT k = 0; k < GPU_STATS_FIELDS; k++)
+                StatsSum[k] += (DOUBLE)S[k];
+        }
+        StatsFrames++;
+    }
+    StatsLive[Slot] = 0;
     const UINT64* const T      = TimeMapped + Slot * GPU_TIME_POINTS;
     const UINT64        Placed = TimePlaced[Slot];
     // The input latency measurement's: the moments the GPU began this frame and was through it (its points 0 and 5),
@@ -5364,11 +5470,12 @@ void FBackend::ReadGpuTime(UINT Slot)
     // frame 0-5, the motion vectors 6-7, the upscaler 8-9, the ambient occlusion 10-11, the water's copies 12-13, the
     // ripples' steps 14-15, the splashes 16-17, the ray tracing scene 18-19, the volumetric smoke 20-21, the
     // motion blur 22-23, the lens and the film 24-25; through the host, the copies into its textures 8-26 and the rest
-    // 26-9 (the crossing both ways, its work, the draw back); the depth of field 27-28; the fog in its rooms 29-30.
+    // 26-9 (the crossing both ways, its work, the draw back); the depth of field 27-28; the fog in its rooms 29-30; the
+    // world drawn before the shadows 0-1, and from the shadows' end to the frame's 4-5.
     static const INT From[GPU_TIME_PARTS] = { 1, 2, 11, 1, 0, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 8,  26, 27, 29,
-                                              31, 32, 33 };
+                                              31, 32, 33, 0, 4 };
     static const INT To[GPU_TIME_PARTS]   = { 2, 3, 4,  4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 26, 9,  28, 30,
-                                              32, 33, 34 };
+                                              32, 33, 34, 1, 5 };
     for (INT k = 0; k < GPU_TIME_PARTS; k++)
     {
         if (!((Placed >> From[k]) & 1) || !((Placed >> To[k]) & 1) || T[To[k]] < T[From[k]])
@@ -5450,15 +5557,36 @@ void FBackend::ReadGpuTime(UINT Slot)
                  TimeSum[19] / TimeCount[19] * Ms, TimeMax[19] * Ms,
                  TimeCount[20] ? TimeSum[20] / TimeCount[20] * Ms : 0.0, TimeMax[20] * Ms,
                  TimeCount[21] ? TimeSum[21] / TimeCount[21] * Ms : 0.0, TimeMax[21] * Ms, TimeCount[19]);
-    // The caustics have no timer of their own - the net is in the frame's total, the laying-on in the water's copies -
-    // but how often they ran says whether they were asked for at all.
+    // The caustics have no timer of their own - the net and the laying-on are in the water's copies - but how often
+    // they ran says whether they were asked for at all, and how often the net was drawn whether the picture held
+    // anything in a liquid (LayCaustics).
     if (CausticNetFrames || CausticLaidFrames)
-        RDX_LOGF("caustics (%i frames): the net drawn in %i of the frames, laid on the picture in %i", TimeFrames,
-                 CausticNetFrames, CausticLaidFrames);
-    CausticNetFrames = CausticLaidFrames = 0;
+        RDX_LOGF("caustics (%i frames): the net asked for in %i of the frames, laid on the picture in %i; of %i layings-on "
+                 "known by now, %i drew the net - a pixel in a liquid, or the camera in one - and the others passed it "
+                 "over", TimeFrames, CausticNetFrames, CausticLaidFrames, CausticNetKnown, CausticNetDrawn);
+    CausticNetFrames = CausticLaidFrames = CausticNetKnown = CausticNetDrawn = 0;
     if (TimeCount[10])
         RDX_LOGF("gpu time (%i frames, ms, mean / max): the water's splashes %.3f / %.2f, in %i of the frames", TimeFrames,
                  TimeSum[10] / TimeCount[10] * Ms, TimeMax[10] * Ms, TimeCount[10]);
+    if (TimeCount[22] || TimeCount[23])
+        RDX_LOGF("gpu time (%i frames, ms, mean / max): the world drawn before the shadows %.3f / %.2f, from the "
+                 "shadows' end to the frame's %.3f / %.2f", TimeFrames,
+                 TimeCount[22] ? TimeSum[22] / TimeCount[22] * Ms : 0.0, TimeMax[22] * Ms,
+                 TimeCount[23] ? TimeSum[23] / TimeCount[23] * Ms : 0.0, TimeMax[23] * Ms);
+    // D3D12_QUERY_DATA_PIPELINE_STATISTICS's order: vertices and primitives in, the vertex shader, the geometry
+    // shader and its primitives, the clipper's primitives in and out, the pixel shader, the hull and domain shaders,
+    // the compute shader.
+    if (StatsFrames > 0)
+    {
+        const DOUBLE F = 1.0 / (DOUBLE)StatsFrames;
+        RDX_LOGF("gpu stats (%i frames, a frame's mean, the world drawn before the shadows): vertices %.0f, primitives "
+                 "%.0f, vertex shader %.0f, hull shader %.0f, domain shader %.0f, to the clipper %.0f, out of it %.0f, "
+                 "pixel shader %.0f", StatsFrames, StatsSum[0] * F, StatsSum[1] * F, StatsSum[2] * F, StatsSum[8] * F,
+                 StatsSum[9] * F, StatsSum[5] * F, StatsSum[6] * F, StatsSum[7] * F);
+    }
+    for (INT k = 0; k < GPU_STATS_FIELDS; k++)
+        StatsSum[k] = 0.0;
+    StatsFrames = 0;
     if (TimeCount[11])
         RDX_LOGF("gpu time (%i frames, ms, mean / max): the ray tracing scene %.3f / %.2f, in %i of the frames", TimeFrames,
                  TimeSum[11] / TimeCount[11] * Ms, TimeMax[11] * Ms, TimeCount[11]);
@@ -5961,8 +6089,12 @@ UBOOL FBackend::EndMirrorAsk(ID3D12GraphicsCommandList* Cmd, D3D12_CPU_DESCRIPTO
                                      Rt.GetOwnBody((INT)FrameIndex), RtSparseNow == 2);
     GpuTime(Cmd, RoundPoint(2));
     if (bTraced)
+    {
         NoteFrameSubmit(1);
+        StatsSplit(Cmd, 0, 1);
+    }
     bTraced = bTraced && RayFeed.Handover(Cmd, Allocators[FrameIndex], Queue.Get(), Host.GetLink());
+    StatsSplit(Cmd, 1, bTraced);
     GpuTime(Cmd, RoundPoint(3));
     TimeRound++;
     if (bTraced)
@@ -7049,6 +7181,7 @@ UBOOL FBackend::WriteCardBuffer(ID3D12Resource* Dest, UINT64 At, const void* Dat
             RdxLog(TEXT("card buffer: no staging buffer to write through"));
             return 0;
         }
+        RdxUploadCensus::Note(CardStaging.Get(), (unsigned long long)CARD_STAGING_BYTES, L"card writer");
     }
     if (!CardAllocator && FAILED(Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                                 __uuidof(ID3D12CommandAllocator),
@@ -7156,6 +7289,7 @@ BYTE* FBackend::TreeMeshBuffer(INT Bytes, D3D12_GPU_VIRTUAL_ADDRESS& Address)
         RdxLog(TEXT("trees: no buffer of %i KB for the level's plants - the game's own stay"), Bytes >> 10);
         return nullptr;
     }
+    RdxUploadCensus::Note(TreeMeshStaging, (unsigned long long)Bytes, L"trees");
     const D3D12_RANGE NoRead = { 0, 0 };
     if (FAILED(TreeMeshStaging->Map(0, &NoRead, (void**)&TreeMeshMapped)))
     {
@@ -8236,7 +8370,9 @@ void FBackend::ResolveScene(ID3D12GraphicsCommandList* Cmd)
         }
         bFsr3Reset = 0;
         NoteFrameSubmit(1);
+        StatsSplit(Cmd, 0, 1);
         const UBOOL bHandedOver = Host.Handover(Cmd, Allocators[FrameIndex], Queue.Get(), Frame);
+        StatsSplit(Cmd, 1, bHandedOver);
         // The frame's reset as it went (Handover adds one where the textures are new): its generated picture's too.
         bFgReset = (Frame.Flags & Host64::FrameFlag_Reset) ? 1 : 0;
         if (bHandedOver)
@@ -8728,6 +8864,8 @@ UBOOL FBackend::Init(HWND Window, INT InWidth, INT InHeight)
             bStencilRef = O.PSSpecifiedStencilRefSupported ? 1 : 0;
         RDX_LOGF("antialiasing (MSAA): shader-written stencil (PSSpecifiedStencilRef): %s - without it MSAA and shadows "
                  "cannot run together", bStencilRef ? TEXT("YES") : TEXT("NO"));
+        RDX_LOGF("device: double precision in shaders (DoublePrecisionFloatShaderOps): %s",
+                 O.DoublePrecisionFloatShaderOps ? TEXT("YES") : TEXT("NO"));
     }
     if (MsaaWanted > 1)
     {
@@ -8826,16 +8964,37 @@ UBOOL FBackend::Init(HWND Window, INT InWidth, INT InHeight)
     if (UpscaleMode && !Final.InitUpscale(Device.Get())) return 0;
     RdxStartupMark(TEXT("backend: the post passes, the upscaling passes"));
     if (!Textures.Init(Device.Get())) return 0;
+    // The own lamps' table and maps (OwnLampTableView, OwnLampMapsView): views of nothing as soon as the heap is made -
+    // zero, no lamp. The frame's start writes them so too, and the first own lamp the real ones; a pass before the first
+    // frame reads nothing there, not a slot never written.
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC None;
+        appMemzero(&None, sizeof(None));
+        None.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        None.Format                  = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        None.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        None.Texture2D.MipLevels     = 1;
+        Device->CreateShaderResourceView(nullptr, &None,
+                                         Textures.GetCpuHandle(Textures.GetReservedIndex(OwnLampTableView)));
+        appMemzero(&None, sizeof(None));
+        None.Shader4ComponentMapping  = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        None.Format                   = DXGI_FORMAT_R32_FLOAT;
+        None.ViewDimension            = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        None.Texture2DArray.MipLevels = 1;
+        None.Texture2DArray.ArraySize = 1;
+        Device->CreateShaderResourceView(nullptr, &None,
+                                         Textures.GetCpuHandle(Textures.GetReservedIndex(OwnLampMapsView)));
+    }
     RdxStartupMark(TEXT("backend: the texture cache"));
     Pom.Init(Device.Get());     // the relief's height maps; a set that is not on disk simply has none
     RdxStartupMark(TEXT("backend: the relief's height maps"));
     WarmShaders();
     RdxStartupMark(TEXT("backend: every other shader (WarmShaders)"));
-    // The caption's total against what the start compiled: where the cache's file gave nothing the two are the same,
+    // The caption's total against what the start compiled: where none came from the cache's file the two are the same,
     // unless a shader came or went since START_SHADERS was set.
-    if (RdxShaderCacheRead() == 0 && RdxStartupShaders() != START_SHADERS)
-        RDX_LOGF("shaders: the start compiled %i with nothing from the cache's file, its caption counted on %i "
-                 "(START_SHADERS) - that number is to follow it", RdxStartupShaders(), (INT)START_SHADERS);
+    if (RdxStartupShaders() > 0 && RdxStartupShaders() != START_SHADERS)
+        RDX_LOGF("shaders: the start compiled %i, its caption counted on %i (START_SHADERS) - where none came from the "
+                 "cache, that number is to follow it", RdxStartupShaders(), (INT)START_SHADERS);
     RdxShaderWarmDone();
     Textures.SetCheckParallel(bValidation);
     Textures.SetGpuConvert(bGpuConvert);
@@ -9540,6 +9699,8 @@ void FBackend::LogDred()
     }
     else
         RDX_LOG("DRED: no page fault recorded");
+    // The geometry pass's own breadcrumbs: which of its runs the GPU stopped in.
+    Solid.LogCrumbs();
 }
 
 void FBackend::FlushFrameCapture()
@@ -10156,10 +10317,38 @@ void FBackend::Shutdown()
     Dof.Shutdown();
     DofReady = 0;
     // The passes made on first use hold the device's own objects: with it they go, and are made again when next asked.
+    Smear.Shutdown();
+    BlurReady = 0;
+    Film.Shutdown();
+    FilmReady = 0;
+    Halo.Shutdown();
+    BloomReady = 0;
     Field.Shutdown();
     FieldReady = 0;
     Shell.Shutdown();
     ShellReady = 0;
+    Volume.Shutdown();
+    VolumeReady = 0;
+    FogRoom.Shutdown();
+    FogRoomsReady = 0;
+    Bounce.Shutdown();
+    BounceReady = 0;
+    // The rain's cover over the wet floors, both levels' pairs: made again at the next level's start.
+    for (INT p = 0; p < 2; p++)
+    {
+        WetCoverTex[p].Release();
+        WetCoverUp[p].Release();
+    }
+    for (INT c = 0; c < 4; c++)
+        WetCoverNow[c] = 0.0f;
+    bWetCoverViewSet = 0;
+    // The own lamps' table for the mirror rays: made again at its next use.
+    OwnTable.Release();
+    OwnTableUpload.Release();
+    OwnTableMapped   = nullptr;
+    OwnTableState    = D3D12_RESOURCE_STATE_COPY_DEST;
+    bOwnTableRefused = 0;
+    bOwnTableLit     = 0;
     HoloMisses = 0;
     SceneColor.Release();
     SceneSrvHeap.Release();
@@ -10237,6 +10426,13 @@ void FBackend::Shutdown()
     CausticPortalBuffer.Release();
     CausticPortalMapped = nullptr;
     bCausticsDrawn = 0;
+    CausticCountMapped = nullptr;
+    CausticCountReadback.Release();
+    CausticPredicate.Release();
+    CausticCountHeap.Release();
+    bCausticCountFailed = 0;
+    for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
+        CausticCounted[s] = 0;
     RippleSrvHeap.Release();
     RippleRtvHeap.Release();
     RipplePipeline.Release();
@@ -10298,6 +10494,12 @@ void FBackend::Shutdown()
     TimeMapped = nullptr;
     TimeReadback.Release();
     TimeHeap.Release();
+    if (StatsReadback && StatsMapped)
+        StatsReadback->Unmap(0, nullptr);
+    StatsMapped = nullptr;
+    StatsReadback.Release();
+    StatsHeap.Release();
+    bStatsFailed = 0;
     for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
     {
         TimePlaced[s] = 0;
@@ -10436,18 +10638,27 @@ void FBackend::BeginFrame(const FPlane& ClearColour)
         return;
     // The allocator's last frame is done on the GPU (its reset went through): its times, before this frame's overwrite them.
     ReadGpuTime(FrameIndex);
+    // And its caustics' count (LayCaustics): whether the net was drawn in it, for the log.
+    if (CausticCounted[FrameIndex])
+    {
+        CausticCounted[FrameIndex] = 0;
+        CausticNetKnown++;
+        if (CausticCountMapped && CausticCountMapped[FrameIndex] != 0)
+            CausticNetDrawn++;
+    }
     RayFeed.NoteListTaken((INT)FrameIndex);
     if (FAILED(CommandList->Reset(Allocator, nullptr)))
         return;
     GpuTime(CommandList.Get(), 0);
     // The water's ripples take their step before anything of the scene is bound: all of that is set below. The
-    // caustics' net with them, where the frame before had something to lay it on (CausticsNow, asked before this
-    // frame's view takes its place): a level whose water is all opaque, or a view with no clear water near, draws no
-    // net. The first frame with clear water before it goes without its caustics; the next has the net.
+    // caustics' net's waves are taken with them, where the frame before had something to lay it on (CausticsNow, asked
+    // before this frame's view takes its place): a level whose water is all opaque, or a view with no clear water
+    // near, asks for no net. The first frame with clear water before it lays on the net of the last frame that asked
+    // for one - none where no frame has. The net itself is drawn where it is laid on (LayCaustics).
     const UBOOL bNetWanted = CausticsNow();
     StepRipples(CommandList.Get());
     if (bNetWanted)
-        DrawCausticNet(CommandList.Get());
+        WantCausticNet();
     // This frame's world has not said its view yet (SetCausticView), and its picture has no caustics on it.
     bCausticView  = 0;
     bCausticsLaid = 0;
@@ -11423,6 +11634,17 @@ void FBackend::VideoMemoryMB(DOUBLE& Used, DOUBLE& Budget) const
     Budget = (DOUBLE)Info.Budget       / (1024.0 * 1024.0);
 }
 
+INT FBackend::SystemVideoMemoryMB() const
+{
+    if (!MemoryAdapter)
+        return -1;
+    DXGI_QUERY_VIDEO_MEMORY_INFO Info;
+    appMemzero(&Info, sizeof(Info));
+    if (FAILED(MemoryAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &Info)))
+        return -1;
+    return (INT)(Info.CurrentUsage / (1024 * 1024));
+}
+
 void FBackend::EndFrame(UBOOL Present)
 {
     if (!Device || !bInFrame)
@@ -11764,6 +11986,24 @@ void FBackend::EndFrame(UBOOL Present)
         CommandList->ResolveQueryData(TimeHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, FrameIndex * GPU_TIME_POINTS,
                                       GPU_TIME_POINTS, TimeReadback.Get(), (UINT64)FrameIndex * GPU_TIME_POINTS * sizeof(UINT64));
         bTimeResolved = 1;
+        // The pipeline's counts: a frame that never reached the shadows' point ends them here, and is left out.
+        if (StatsHeap)
+        {
+            const UINT Base = FrameIndex * GPU_STATS_SEGMENTS;
+            if (StatsOpen[FrameIndex])
+            {
+                CommandList->EndQuery(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                                      Base + (UINT)StatsSeg[FrameIndex] - 1);
+                StatsOpen[FrameIndex] = 0;
+            }
+            const UBOOL bUse = (StatsDone[FrameIndex] && !StatsBad[FrameIndex] && StatsSeg[FrameIndex] > 0) ? 1 : 0;
+            if (bUse)
+                CommandList->ResolveQueryData(StatsHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, Base,
+                                              (UINT)StatsSeg[FrameIndex], StatsReadback.Get(),
+                                              (UINT64)Base * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+            StatsLive[FrameIndex] = bUse ? StatsSeg[FrameIndex] : 0;
+            StatsDone[FrameIndex] = 0;
+        }
     }
     const DOUBLE E2 = appSeconds();
     if (bFirstEnd)
@@ -13000,6 +13240,7 @@ void FBackend::SetWetCover(const FLOAT* Cells, INT W, INT H, FLOAT X, FLOAT Y, F
                                                       __uuidof(ID3D12Resource), WetCoverUp[Pair].VoidSlot())) &&
             SUCCEEDED(WetCoverUp[Pair]->Map(0, &NoRead, (void**)&Mapped)) && Mapped)
         {
+            RdxUploadCensus::Note(WetCoverUp[Pair].Get(), UpDesc.Width, L"wet floors' cover");
             for (INT y = 0; y < H; y++)
                 appMemcpy(Mapped + (SIZE_T)Pitch * y, Cells + (SIZE_T)y * W * 4, Row);
             WetCoverUp[Pair]->Unmap(0, nullptr);
@@ -13424,7 +13665,7 @@ UBOOL FBackend::EnsureSplashes()
                                                __uuidof(ID3D12RootSignature), SplashRoot.VoidSlot()),
                    TEXT("CreateRootSignature(splashes)")))
             return 0;
-        D3D_SHADER_MACRO Macros[5];
+        D3D_SHADER_MACRO Macros[6];   // five, and the null pair that ends them
         Macros[0].Name       = "RDX_SPLASH_DROPS";
         Macros[0].Definition = RDX_STRINGIFY(RDX_SPLASH_DROPS_VALUE);
         Macros[1].Name       = "RDX_CURTAIN_STREAMS";
@@ -13553,6 +13794,7 @@ UBOOL FBackend::EnsureSplashes()
             SplashConstMapped = nullptr;
             return 0;
         }
+        RdxUploadCensus::Note(SplashConstBuffer.Get(), Buf.Width, L"splash constants");
     }
 
     // The targets, at the scene's size (CreateSceneTarget lets them go with it). The reactive mask the smoothing writes as
@@ -14041,6 +14283,7 @@ UBOOL FBackend::EnsureWaterLamps()
         WaterLampMapped = nullptr;
         return 0;
     }
+    RdxUploadCensus::Note(WaterLampBuffer.Get(), Buf.Width, L"water lamps");
     appMemzero(WaterLampMapped, WaterLampBytes * BACKEND_FRAME_COUNT);     // no lamps in any slot until they are set
     bWaterLampFailed = 0;
     return 1;
@@ -14074,6 +14317,7 @@ UBOOL FBackend::EnsureReliefLamps()
         ReliefLampMapped = nullptr;
         return 0;
     }
+    RdxUploadCensus::Note(ReliefLampBuffer.Get(), Buf.Width, L"relief lamps");
     appMemzero(ReliefLampMapped, WaterLampBytes * BACKEND_FRAME_COUNT);
     bReliefLampFailed = 0;
     return 1;
@@ -14124,6 +14368,7 @@ UBOOL FBackend::EnsureWetLamps()
         WetLampMapped = nullptr;
         return 0;
     }
+    RdxUploadCensus::Note(WetLampBuffer.Get(), Buf.Width, L"wet lamps");
     appMemzero(WetLampMapped, RdxMath::WetLampBytes * BACKEND_FRAME_COUNT);     // no lamps in any slot until they are set
     bWetLampFailed = 0;
     return 1;
@@ -14200,6 +14445,7 @@ UBOOL FBackend::EnsureWaveField()
             WaveField.Release();
             return 0;
         }
+        RdxUploadCensus::Note(WaveUpload[f].Get(), Buf.Width, L"water waves");
     }
     for (INT Set = 0; Set < 2; Set++)
         Device->CreateShaderResourceView(WaveField.Get(), nullptr, Textures.GetCpuHandle(WaterSlot(Set, WaterViewWaves)));
@@ -14615,15 +14861,29 @@ UBOOL FBackend::EnsureCaustics()
     return 1;
 }
 
-// At the start of the frame, with the ripples' step (BeginFrame): the net as its waves stand now, and its smaller levels
-// from it. Only while the caustics are asked for, and where there is clear water for them to fall into (BeginFrame
-// asks).
-void FBackend::DrawCausticNet(ID3D12GraphicsCommandList* Cmd)
+// At the start of the frame, with the ripples' step (BeginFrame): the net's waves as they stand now - the splat's
+// constants, for the net drawn where the frame lays it on (LayCaustics). Only while the caustics are asked for, and where
+// there is clear water for them to fall into (BeginFrame asks).
+void FBackend::WantCausticNet()
 {
     if (!bWaterWanted || !bCausticsWanted || !EnsureCaustics())
         return;
     if (CausticStart <= 0.0)
         CausticStart = appSeconds();
+    CausticNetConsts[0] = (FLOAT)(appSeconds() - CausticStart);
+    CausticNetConsts[1] = CausticCarry / CausticTile;
+    CausticNetConsts[2] = (FLOAT)(CausticNetSize * CausticNetSize) / (FLOAT)(CausticPoints * CausticPoints);
+    CausticNetConsts[3] = bCausticOldNet ? 1.0f : 0.0f;
+    bCausticsDrawn = 1;
+    CausticNetFrames++;
+}
+
+// The net from those waves (CausticNetConsts), and its smaller levels from it - with its own heap, root signature,
+// targets and viewports bound (LayCaustics binds its own again after it).
+void FBackend::DrawCausticNet(ID3D12GraphicsCommandList* Cmd)
+{
+    if (!CausticNet || !CausticSplat || !CausticHalve)
+        return;
     const UINT RtvStep = Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const UINT SrvStep = Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_RESOURCE_BARRIER B;
@@ -14633,10 +14893,7 @@ void FBackend::DrawCausticNet(ID3D12GraphicsCommandList* Cmd)
     ID3D12DescriptorHeap* Heaps[1] = { CausticSrvHeap.Get() };
     Cmd->SetDescriptorHeaps(1, Heaps);
     Cmd->SetGraphicsRootSignature(CausticRoot.Get());
-    const FLOAT K[4] = { (FLOAT)(appSeconds() - CausticStart), CausticCarry / CausticTile,
-                         (FLOAT)(CausticNetSize * CausticNetSize) / (FLOAT)(CausticPoints * CausticPoints),
-                         bCausticOldNet ? 1.0f : 0.0f };
-    Cmd->SetGraphicsRoot32BitConstants(0, 4, K, 0);
+    Cmd->SetGraphicsRoot32BitConstants(0, 4, CausticNetConsts, 0);
     for (INT Level = 0; Level < CausticNetLevels; Level++)
     {
         const INT Side = CausticNetSize >> Level;
@@ -14672,8 +14929,61 @@ void FBackend::DrawCausticNet(ID3D12GraphicsCommandList* Cmd)
         B.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         Cmd->ResourceBarrier(1, &B);
     }
-    bCausticsDrawn = 1;
-    CausticNetFrames++;
+}
+
+// The laying-on's count of the mask and its predicate (CausticCountHeap): a binary occlusion query a frame slot, the
+// buffer the GPU's predicate is resolved into, and a read-back buffer for the log - made once. Should any of them fail,
+// the net and the laying-on are drawn in every frame that lays the caustics on, as without the count; said once.
+UBOOL FBackend::EnsureCausticCount()
+{
+    if (CausticCountHeap && CausticPredicate && CausticCountReadback && CausticCountMapped)
+        return 1;
+    if (bCausticCountFailed || !Device)
+        return 0;
+    bCausticCountFailed = 1;        // until everything below has been made
+    D3D12_QUERY_HEAP_DESC Q;
+    appMemzero(&Q, sizeof(Q));
+    Q.Type  = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+    Q.Count = BACKEND_FRAME_COUNT;
+    D3D12_HEAP_PROPERTIES Heap;
+    appMemzero(&Heap, sizeof(Heap));
+    Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_HEAP_PROPERTIES Back = Heap;
+    Back.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC R;
+    appMemzero(&R, sizeof(R));
+    R.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    R.Width            = (UINT64)BACKEND_FRAME_COUNT * sizeof(UINT64);
+    R.Height           = 1;
+    R.DepthOrArraySize = 1;
+    R.MipLevels        = 1;
+    R.SampleDesc.Count = 1;
+    R.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (!Check(Device->CreateQueryHeap(&Q, __uuidof(ID3D12QueryHeap), CausticCountHeap.VoidSlot()),
+               TEXT("CreateQueryHeap(caustics count)")) ||
+        // A buffer is made in the common state whatever is asked, and its first resolve takes it to the copy's.
+        !Check(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &R, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               __uuidof(ID3D12Resource), CausticPredicate.VoidSlot()),
+               TEXT("CreateCommittedResource(caustics predicate)")) ||
+        !Check(Device->CreateCommittedResource(&Back, D3D12_HEAP_FLAG_NONE, &R, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               __uuidof(ID3D12Resource), CausticCountReadback.VoidSlot()),
+               TEXT("CreateCommittedResource(caustics count read back)")) ||
+        FAILED(CausticCountReadback->Map(0, nullptr, (void**)&CausticCountMapped)) || !CausticCountMapped)
+    {
+        CausticCountMapped = nullptr;
+        CausticCountReadback.Release();
+        CausticPredicate.Release();
+        CausticCountHeap.Release();
+        RdxLog(TEXT("water: the caustics' count of their mask could not be made - their net is drawn in every frame that ")
+               TEXT("lays them on"));
+        return 0;
+    }
+    for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
+        CausticCounted[s] = 0;
+    bCausticCountFailed = 0;
+    RdxLog(TEXT("water: the caustics' mask counted - their net drawn only where a pixel of the picture lies in a liquid, ")
+           TEXT("or the camera does"));
+    return 1;
 }
 
 // The caustics laid on the picture (LayCaustics), in two steps.
@@ -14975,6 +15285,7 @@ UBOOL FBackend::EnsureCausticBorders()
         RdxLog(TEXT("water: no room for the caustics' borders - no caustics"));
         return 0;
     }
+    RdxUploadCensus::Note(CausticPortalBuffer.Get(), Buf.Width, L"caustics' borders");
     return 1;
 }
 
@@ -15116,7 +15427,8 @@ UBOOL FBackend::LayCaustics(ID3D12GraphicsCommandList* Cmd, UBOOL bMsaa)
     Cmd->RSSetScissorRects(1, &Sc);
     Cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    // The mask: nothing, and then this frame's borders over it.
+    // The mask: nothing, and then this frame's borders over it - counted where the camera is in no liquid: whether any
+    // pixel is seen through a border (EnsureCausticCount).
     D3D12_RESOURCE_BARRIER B;
     appMemzero(&B, sizeof(B));
     B.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -15129,6 +15441,10 @@ UBOOL FBackend::LayCaustics(ID3D12GraphicsCommandList* Cmd, UBOOL bMsaa)
     const FLOAT None[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     Cmd->OMSetRenderTargets(1, &MaskRtv, FALSE, nullptr);
     Cmd->ClearRenderTargetView(MaskRtv, None, 0, nullptr);
+    const UBOOL  bCount   = (CausticCamWet <= 0 && EnsureCausticCount()) ? 1 : 0;
+    const UINT64 CountAt  = (UINT64)FrameIndex * sizeof(UINT64);
+    if (bCount)
+        Cmd->BeginQuery(CausticCountHeap.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, FrameIndex);
     if (CausticCorners > 0 && CausticPortalBuffer)
     {
         const UINT Stride = RdxMath::CausticPortalFloats * sizeof(FLOAT);
@@ -15140,9 +15456,44 @@ UBOOL FBackend::LayCaustics(ID3D12GraphicsCommandList* Cmd, UBOOL bMsaa)
         Cmd->IASetVertexBuffers(0, 1, &View);
         Cmd->DrawInstanced((UINT)CausticCorners, 1, 0, 0);
     }
+    if (bCount)
+        Cmd->EndQuery(CausticCountHeap.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, FrameIndex);
     B.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     B.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     Cmd->ResourceBarrier(1, &B);
+
+    // No pixel seen through a border, and the camera in no liquid: every pixel lies in none, the laying-on would discard
+    // each of them, and nothing else reads the net - so the GPU passes over both, the net and the laying-on, by the
+    // count (a predicate of nought skips what is drawn under it). Where the camera is in a liquid, every pixel with no
+    // border before it lies in that one: both are drawn.
+    if (bCount)
+    {
+        Cmd->ResolveQueryData(CausticCountHeap.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, FrameIndex, 1,
+                              CausticPredicate.Get(), CountAt);
+        Cmd->ResolveQueryData(CausticCountHeap.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, FrameIndex, 1,
+                              CausticCountReadback.Get(), CountAt);
+        B.Transition.pResource   = CausticPredicate.Get();
+        B.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        B.Transition.StateAfter  = D3D12_RESOURCE_STATE_PREDICATION;
+        Cmd->ResourceBarrier(1, &B);
+        Cmd->SetPredication(CausticPredicate.Get(), CountAt, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        CausticCounted[FrameIndex] = 1;
+    }
+    else
+    {
+        CausticNetKnown++;
+        CausticNetDrawn++;
+    }
+    // The net, from the waves of the last frame that asked for it (WantCausticNet) - then the laying-on's own heap, root
+    // signature, constants and view bound again.
+    DrawCausticNet(Cmd);
+    Cmd->SetDescriptorHeaps(1, Heaps);
+    Cmd->SetGraphicsRootSignature(CausticLayRoot.Get());
+    Cmd->SetGraphicsRoot32BitConstants(0, CAUSTIC_LAY_CONSTANTS, K, 0);
+    Cmd->SetGraphicsRootDescriptorTable(1, Textures.GetGpuHandle(WaterSlot(0, WaterViewDepth)));
+    Cmd->RSSetViewports(1, &Vp);
+    Cmd->RSSetScissorRects(1, &Sc);
+    Cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv;
     if (bMsaa)
@@ -15156,6 +15507,13 @@ UBOOL FBackend::LayCaustics(ID3D12GraphicsCommandList* Cmd, UBOOL bMsaa)
     Cmd->SetPipelineState(CausticLays[bMsaa ? 1 : 0].Get());
     Cmd->OMSetRenderTargets(1, &Rtv, FALSE, nullptr);
     Cmd->DrawInstanced(3, 1, 0, 0);
+    if (bCount)
+    {
+        Cmd->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        B.Transition.StateBefore = D3D12_RESOURCE_STATE_PREDICATION;
+        B.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        Cmd->ResourceBarrier(1, &B);
+    }
     CausticLaidFrames++;
     return 1;
 }

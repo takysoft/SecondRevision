@@ -46,7 +46,7 @@ using RdxSphere::TList;
 static const double WeldDist = 0.01;   // units: places this near are one
 static const double OnEdge   = 0.05;   // units: a corner this near another polygon's edge lies on it
 static const double GridCell = 32.0;   // units: the cells the T-junctions are looked for in
-static const float  Sag      = 0.25f;  // units: the most a cut piece of a curve stands off it
+static const float  HighSag  = 0.25f;  // units: the most a cut piece of a curve stands off it at the spherifier's High
 static const int    MostCuts = 16;     // pieces an edge is cut into, at most
 // A triangle turned over that does not show: all of it within TurnInPlane of its polygon's plane, or a sliver of
 // less than TurnSliver square units (tools\LevelRoundCheck counts them so).
@@ -64,6 +64,15 @@ static const int    FaceTermFloats = 4 * RdxMeshRound::EDGE_SLOTS * 4;   // a fa
 
 namespace Detail
 {
+
+// From's block handed to To, From left empty - a list is not copied.
+template <class T>
+inline void HandOver(TList<T>& To, TList<T>& From)
+{
+    // Traded, not released: the block stays a list's, and the lists' count with it.
+    To.Free();
+    To.SwapWith(From);
+}
 
 // A heap of N long longs, the greatest on top, mended down from Root.
 inline void SiftSides(long long* A, int Root, int N)
@@ -198,6 +207,15 @@ struct FCells
     TList<int>       Next;    // and the next entry of its bucket
     int              Mask = 0;
 
+    void Free()
+    {
+        Head.Free();
+        Key.Free();
+        Item.Free();
+        Next.Free();
+        Mask = 0;
+    }
+
     bool Init(int Expected)
     {
         int Size = 64;
@@ -212,6 +230,25 @@ struct FCells
         Item.Clear();
         Next.Clear();
         return true;
+    }
+    // For a table filled once to a count known ahead: the room for exactly Entries entries had first, which its lists'
+    // growing would leave larger, and a bucket an entry - not two, as Init's: such a table is the largest of its kind,
+    // and a bucket holds a chain of one or two. Which entries a cell gives back, and in which order, the bucket count
+    // does not change.
+    bool InitExact(int Entries)
+    {
+        int Size = 64;
+        while (Size < Entries)
+            Size *= 2;
+        if (!Head.Resize(Size))
+            return false;
+        Mask = Size - 1;
+        for (int i = 0; i < Size; i++)
+            Head[i] = -1;
+        Key.Clear();
+        Item.Clear();
+        Next.Clear();
+        return Key.ReserveExact(Entries) && Item.ReserveExact(Entries) && Next.ReserveExact(Entries);
     }
     int Bucket(long long K) const
     {
@@ -297,10 +334,45 @@ struct FCoarse
 };
 
 inline bool Coarsen(const RdxMeshRound::FShape& S, const TList<FV3>& Place, const TList<int>& Corner, int Faces,
-                    FCoarse& Out, const unsigned char* Skip = nullptr)
+                    FCoarse& Out, const unsigned char* Skip = nullptr, double Cube = 0.0)
 {
     using RdxMeshRound::FShape;
     const int NP = Place.Num;
+    // The cube a place lies in, where the pieces are kept within cubes (FResult::PieceCube) - only those of a flat
+    // polygon wider than a cube (Wide: a place of one), a smaller one being kept whole, as a cube's work could take it.
+    auto CubeOf = [&](int v) {
+        return CellKey((long long)floor(Place[v].X / Cube), (long long)floor(Place[v].Y / Cube),
+                       (long long)floor(Place[v].Z / Cube));
+    };
+    TList<unsigned char> Wide;
+    if (Cube > 0.0)
+    {
+        TList<FV3> Lo, Hi;
+        if (!Wide.Resize(NP) || !Lo.Resize(Faces) || !Hi.Resize(Faces))
+            return false;
+        for (int v = 0; v < NP; v++)
+            Wide[v] = 0;
+        for (int f = 0; f < Faces; f++)
+        {
+            Lo[f] = RdxSphere::V3(1e300, 1e300, 1e300);
+            Hi[f] = RdxSphere::V3(-1e300, -1e300, -1e300);
+        }
+        for (int f = 0; f < Faces; f++)
+            for (int k = 0; k < 3; k++)
+            {
+                const FV3& P = Place[S.Weld[Corner[f * 3 + k]]];
+                const int  r = S.Poly[f];
+                Lo[r]        = RdxSphere::V3(MinOf(Lo[r].X, P.X), MinOf(Lo[r].Y, P.Y), MinOf(Lo[r].Z, P.Z));
+                Hi[r]        = RdxSphere::V3(MaxOf(Hi[r].X, P.X), MaxOf(Hi[r].Y, P.Y), MaxOf(Hi[r].Z, P.Z));
+            }
+        for (int f = 0; f < Faces; f++)
+        {
+            const int r = S.Poly[f];
+            if (MaxOf(MaxOf(Hi[r].X - Lo[r].X, Hi[r].Y - Lo[r].Y), Hi[r].Z - Lo[r].Z) > Cube)
+                for (int k = 0; k < 3; k++)
+                    Wide[S.Weld[Corner[f * 3 + k]]] = 1;
+        }
+    }
     Out.Tri.Clear();
     Out.Region.Clear();
     Out.Through = Out.Stuck = 0;
@@ -388,6 +460,8 @@ inline bool Coarsen(const RdxMeshRound::FShape& S, const TList<FV3>& Place, cons
     // each of those keeps its way round with some area.
     auto Collapse = [&](int w, int u) -> bool
     {
+        if (Cube > 0.0 && Wide[w] && CubeOf(w) != CubeOf(u))
+            return false;
         Star.Clear();
         for (int c = Head[w]; c >= 0; c = NextAt[c])
             if (Alive[c / 3] && Tri[c] == w && !Star.Add(c))
@@ -534,6 +608,8 @@ inline bool Coarsen(const RdxMeshRound::FShape& S, const TList<FV3>& Place, cons
         const int d = Tri[t2 * 3 + (k2 + 2) % 3];
         if (Tri[t2 * 3 + k2] != b || Tri[t2 * 3 + (k2 + 1) % 3] != a || c == d)
             continue;
+        if (Cube > 0.0 && (Wide[c] || Wide[d]) && CubeOf(c) != CubeOf(d))
+            continue;
         if (AngleAt(Place[c], Place[a], Place[b]) + AngleAt(Place[d], Place[b], Place[a]) <= RdxSphere::Pi + 1e-9)
             continue;
         // The two new ones must keep the way round: the four corners make a convex quad.
@@ -633,6 +709,9 @@ inline bool QuadUvOf(const FV3* Q, int Drop, const FV3& P, double& U, double& V)
 // the move of any point of the level's surfaces (MoveAt).
 struct FSurface
 {
+    // Its block from the C library, as the shape's (MeshRound.h's FShape): made on the rounding's own thread too.
+    static void* operator new(size_t Size) noexcept { return malloc(Size); }
+    static void  operator delete(void* P) noexcept { free(P); }
     TList<FV3>                      A, E1, E2, Lo, Hi;
     TList<double>                   D00, D01, D11, Inv;
     TList<RdxMeshRound::FEdgeTerms> Terms;   // three a piece, from its corner k to k + 1
@@ -1513,6 +1592,8 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
 {
     using namespace Detail;
     using RdxMeshRound::FV;
+    // How finely the curves are cut: the caller's (the spherifier's level), the High one where it gives none.
+    const float Sag = (Out.Sag > 0.0f) ? Out.Sag : RdxLevelRound::HighSag;
     Out.Orig.Clear();
     Out.Moved.Clear();
     Out.Tri.Clear();
@@ -1522,12 +1603,18 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
     Out.FaceKind.Clear();
     Out.FaceCorner.Clear();
     Out.FaceTerm.Clear();
+    Out.FacePlane.Clear();
+    Out.PolyBox.Clear();
     Out.MoveCap   = Cap;
     Out.PolyGridW = Out.PolyGridH = 0;
     Out.PolyGridFirst.Clear();
     Out.PolyGridCount.Clear();
     Out.PolyGridItems.Clear();
     Out.Left.Clear();
+    Out.Ring.Clear();
+    Out.RingFirst.Clear();
+    Out.RingCount.Clear();
+    Out.RingOwn.Clear();
     Out.PolyEdgeKinds.Clear();
     Out.PolySideFirst.Clear();
     Out.PolySideCount.Clear();
@@ -1608,6 +1695,8 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
         }
     }
     Lap(0);
+    if (RdxSphere::Abandoned())
+        return false;
 
     // 2. Each drawn polygon's ring of places, its T-junctions put in: a place of the level's lying on one of its edges.
     TList<int>           RingFirst, RingCount, Ring;
@@ -1713,6 +1802,8 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
         Out.Walls++;
     }
     Lap(1);
+    if (RdxSphere::Abandoned())
+        return false;
 
     // 3. Each ring cut into triangles over its own corners: the shortest cuts (a polygon's triangulation by its least
     //    total diagonal), no triangle of no area or lying along an edge. A ring with more corners than MostRing, or
@@ -1874,6 +1965,8 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
         return true;
 
     Lap(2);
+    if (RdxSphere::Abandoned())
+        return false;
 
     // 4. The level's triangles as one model, and its shape by the models' rule.
     TList<FV> At;
@@ -1938,7 +2031,7 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
             AlongPoly[S.Poly[S.SheetAlong[t]]] = 1;
         for (int f = 0; f < Faces; f++)
             Skip[f] = AlongPoly[S.Poly[f]];
-        if (!Coarsen(S, Place, Corner, Faces, Coarse, Skip.Data))
+        if (!Coarsen(S, Place, Corner, Faces, Coarse, Skip.Data, Out.PieceCube))
         {
             delete Shape;
             return false;
@@ -2031,6 +2124,11 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
     }
     FSurface& Surf = *SurfHold.Made;
     Lap(5);
+    if (RdxSphere::Abandoned())
+    {
+        delete Shape;
+        return false;
+    }
 
     // 6. Every point moved with the surface: the level's own places - a corner of the shape stays where it is -, each
     //    edge's pieces, as many as its curve needs to stand off them by no more than Sag and made once for both of its
@@ -2707,6 +2805,8 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
     if (!HoldBehind(Points, Polys, NumPolys, TriPoly, TriAt, Cap, Out))
         return false;
     Lap(6);
+    if (RdxSphere::Abandoned())
+        return false;
 
     // 7. Each polygon's triangles together, for a polygon any point of which moved; the surface's turn round the
     //    upright at each corner, for the relief's axes.
@@ -2869,6 +2969,37 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
                 return false;
         }
     }
+    // Each face's plane, with the very steps FaceSharesAt takes for it, and each moved polygon's box (FResult's FacePlane,
+    // PolyBox) - made once here rather than at every point looked up on it. A polygon with no faces has an empty box.
+    if (!Out.FacePlane.Resize(Out.FaceKind.Num * 4) || !Out.PolyBox.Resize(NumPolys * 6))
+        return false;
+    for (int f = 0; f < Out.FaceKind.Num; f++)
+    {
+        const FV3* const Q  = &Out.FaceCorner[f * 4];
+        const FV3        N  = (Out.FaceKind[f] == 0) ? RdxSphere::Cross(Q[1] - Q[0], Q[2] - Q[0])
+                                                     : RdxSphere::Cross(Q[1] - Q[0], Q[3] - Q[0]);
+        const double     NL = RdxSphere::Length(N);
+        Out.FacePlane[f * 4]     = N.X;
+        Out.FacePlane[f * 4 + 1] = N.Y;
+        Out.FacePlane[f * 4 + 2] = N.Z;
+        Out.FacePlane[f * 4 + 3] = NL;
+    }
+    for (int p = 0; p < NumPolys; p++)
+    {
+        double* const B = &Out.PolyBox[p * 6];
+        B[0] = B[1] = B[2] = 1e300;
+        B[3] = B[4] = B[5] = -1e300;
+        for (int i = Out.PolyFaceFirst[p] * 4; i < (Out.PolyFaceFirst[p] + Out.PolyFaceCount[p]) * 4; i++)
+        {
+            const FV3& C = Out.FaceCorner[i];
+            B[0] = MinOf(B[0], C.X);
+            B[1] = MinOf(B[1], C.Y);
+            B[2] = MinOf(B[2], C.Z);
+            B[3] = MaxOf(B[3], C.X);
+            B[4] = MaxOf(B[4], C.Y);
+            B[5] = MaxOf(B[5], C.Z);
+        }
+    }
     {
         double X0 = 1e300, Y0 = 1e300, X1 = -1e300, Y1 = -1e300;
         for (int i = 0; i < Out.FaceCorner.Num; i++)
@@ -2950,10 +3081,17 @@ inline bool RoundOnce(const FV3* Points, int NumPoints, const FPolyIn* Polys, in
     Out.FaceKind.Shrink();
     Out.FaceCorner.Shrink();
     Out.FaceTerm.Shrink();
+    Out.FacePlane.Shrink();
+    Out.PolyBox.Shrink();
     Out.PolyGridItems.Shrink();
     Out.LightSides.Shrink();
     Out.LightParts.Shrink();
     Out.Left.Shrink();
+    // The rings, for the bevel (LevelBevel.h).
+    HandOver(Out.Ring, Ring);
+    HandOver(Out.RingFirst, RingFirst);
+    HandOver(Out.RingCount, RingCount);
+    HandOver(Out.RingOwn, RingOwn);
     Lap(7);
     return true;
 }
@@ -3208,6 +3346,9 @@ inline bool ChordsOf(const FV3* Points, int NumPoints, const FPolyIn* Polys, int
 inline bool Round(const FV3* Points, int NumPoints, const FPolyIn* Polys, int NumPolys, double Cap, double Angle,
                   FResult& Out)
 {
+    Out.KeptOrig.Free();
+    Out.KeptMoved.Free();
+    Out.BevelNormal.Free();
     Out.PolyChordFirst.Clear();
     Out.ChordFirst.Clear();
     Out.ChordCount.Clear();
@@ -3215,7 +3356,7 @@ inline bool Round(const FV3* Points, int NumPoints, const FPolyIn* Polys, int Nu
     Out.ChordT.Clear();
     Out.ChordMove.Clear();
     Out.ChordPolys = Out.ChordMissed = 0;
-    if (!RoundOnce(Points, NumPoints, Polys, NumPolys, Cap, Angle, Out))
+    if (!RoundOnce(Points, NumPoints, Polys, NumPolys, Cap, Angle, Out) || RdxSphere::Abandoned())
         return false;
     const double T0      = Out.Seconds ? Out.Seconds() : 0.0;
     const bool   bChords = ChordsOf(Points, NumPoints, Polys, NumPolys, Out);
@@ -3231,15 +3372,16 @@ inline bool Round(const FV3* Points, int NumPoints, const FPolyIn* Polys, int Nu
 // where P lies further than Near off its plane, or off it.
 // Where P lies on a face (FaceMoveAt's first half): a triangle's corners' shares (S[0..2]), a quad's U and V (S[0], S[1]),
 // each held within the face; and (Off, Nf, where asked) how far off the face's plane it lies and the plane's normal, of
-// length one. False where it lies off the face's plane by more than Near, or outside the face.
+// length one. False where it lies off the face's plane by more than Near, or outside the face. Plane, where given: the
+// face's plane as made with the faces (FResult's FacePlane), the same numbers as made here.
 inline bool FaceSharesAt(int Kind, const FV3* Q, const FV3& P, double Near, float* S, double* Off = nullptr,
-                         FV3* Nf = nullptr)
+                         FV3* Nf = nullptr, const double* Plane = nullptr)
 {
     if (Kind == 0)
     {
         const FV3    E1 = Q[1] - Q[0], E2 = Q[2] - Q[0], D = P - Q[0];
-        const FV3    N  = RdxSphere::Cross(E1, E2);
-        const double NL = RdxSphere::Length(N);
+        const FV3    N  = Plane ? RdxSphere::V3(Plane[0], Plane[1], Plane[2]) : RdxSphere::Cross(E1, E2);
+        const double NL = Plane ? Plane[3] : RdxSphere::Length(N);
         if (!(NL > 1e-12) || fabs(RdxSphere::Dot(D, N)) / NL > Near)
             return false;
         if (Off)
@@ -3259,8 +3401,8 @@ inline bool FaceSharesAt(int Kind, const FV3* Q, const FV3& P, double Near, floa
         S[2] = (float)MaxOf(B2, 0.0);
         return true;
     }
-    const FV3    N  = RdxSphere::Cross(Q[1] - Q[0], Q[3] - Q[0]);
-    const double NL = RdxSphere::Length(N);
+    const FV3    N  = Plane ? RdxSphere::V3(Plane[0], Plane[1], Plane[2]) : RdxSphere::Cross(Q[1] - Q[0], Q[3] - Q[0]);
+    const double NL = Plane ? Plane[3] : RdxSphere::Length(N);
     double       U = 0.0, V = 0.0;
     if (!(NL > 1e-12) || fabs(RdxSphere::Dot(P - Q[0], N)) / NL > Near || !Detail::QuadUvOf(Q, Kind - 1, P, U, V) ||
         U < -1e-3 || U > 1.0 + 1e-3 || V < -1e-3 || V > 1.0 + 1e-3)
@@ -3313,11 +3455,25 @@ inline bool MoveOnPolygon(const FResult& R, int Poly, const FV3& P, double Near,
 {
     if (Poly < 0 || Poly >= R.PolyFaceCount.Num || R.PolyFaceCount[Poly] <= 0)
         return false;
+    // Further outside the polygon's box than any face of it can take a point: on no face of it. A face takes one within
+    // Near of its plane - along an axis up to about two and a half times that, where its quad's place is read across
+    // the plane's own axes (QuadUvOf) - and a thousandth of its size past its edges; three times Near and a hundredth
+    // of the box's size reach past all of that.
+    const bool bMade = R.FacePlane.Num == R.FaceKind.Num * 4 && R.PolyBox.Num == R.PolyFaceCount.Num * 6;
+    if (bMade)
+    {
+        const double* const B     = &R.PolyBox[Poly * 6];
+        const double        Reach = 3.0 * Near + 0.01 * ((B[3] - B[0]) + (B[4] - B[1]) + (B[5] - B[2])) + 0.01;
+        if (P.X < B[0] - Reach || P.Y < B[1] - Reach || P.Z < B[2] - Reach || P.X > B[3] + Reach ||
+            P.Y > B[4] + Reach || P.Z > B[5] + Reach)
+            return false;
+    }
     for (int f = R.PolyFaceFirst[Poly]; f < R.PolyFaceFirst[Poly] + R.PolyFaceCount[Poly]; f++)
     {
         // The terms only for the face the point lies on: most faces looked at are not it.
         float S[3] = { 0.0f, 0.0f, 0.0f };
-        if (!FaceSharesAt(R.FaceKind[f], &R.FaceCorner[f * 4], P, Near, S))
+        if (!FaceSharesAt(R.FaceKind[f], &R.FaceCorner[f * 4], P, Near, S, nullptr, nullptr,
+                          bMade ? &R.FacePlane[f * 4] : nullptr))
             continue;
         RdxMeshRound::FEdgeTerms T[4];
         FaceTermsOf(&R.FaceTerm[f * FaceTermFloats], T);
@@ -3338,7 +3494,7 @@ inline void HoldOnPolygon(const FResult& R, int Poly, const FV3& P, FV3& Move)
     for (int t = R.PolyFirst[Poly]; t < R.PolyFirst[Poly] + R.PolyTris[Poly]; t++)
     {
         const int    a = R.Tri[t * 3], b = R.Tri[t * 3 + 1], c = R.Tri[t * 3 + 2];
-        const FV3    E1 = R.Orig[b] - R.Orig[a], E2 = R.Orig[c] - R.Orig[a], D = P - R.Orig[a];
+        const FV3    E1 = R.OrigAt(b) - R.OrigAt(a), E2 = R.OrigAt(c) - R.OrigAt(a), D = P - R.OrigAt(a);
         const double D00 = RdxSphere::Dot(E1, E1), D01 = RdxSphere::Dot(E1, E2), D11 = RdxSphere::Dot(E2, E2);
         const double D20 = RdxSphere::Dot(D, E1), D21 = RdxSphere::Dot(D, E2), Den = D00 * D11 - D01 * D01;
         if (!(fabs(Den) > 1e-12))
@@ -3347,7 +3503,7 @@ inline void HoldOnPolygon(const FResult& R, int Poly, const FV3& P, FV3& Move)
         if (B0 < -1e-3 || B1 < -1e-3 || B2 < -1e-3)
             continue;
         if (R.PlaceHeld[a] || R.PlaceHeld[b] || R.PlaceHeld[c])
-            Move = (R.Moved[a] - R.Orig[a]) * B0 + (R.Moved[b] - R.Orig[b]) * B1 + (R.Moved[c] - R.Orig[c]) * B2;
+            Move = (R.MovedAt(a) - R.OrigAt(a)) * B0 + (R.MovedAt(b) - R.OrigAt(b)) * B1 + (R.MovedAt(c) - R.OrigAt(c)) * B2;
         return;
     }
 }
@@ -3404,7 +3560,7 @@ inline void PieceCellsOf(const FResult& R, int t, int Drop, double X0, double Y0
     for (int k = 0; k < 3; k++)
     {
         double A, B;
-        PiecePlanOf(R.Orig[R.Tri[t * 3 + k]], Drop, A, B);
+        PiecePlanOf(R.OrigAt(R.Tri[t * 3 + k]), Drop, A, B);
         Lo[0] = MinOf(Lo[0], A);
         Hi[0] = MaxOf(Hi[0], A);
         Lo[1] = MinOf(Lo[1], B);
@@ -3464,8 +3620,8 @@ inline FV3 PlaceNormalOf(const FResult& R, int p, int v, const TList<int>& Place
         const int u = PlaceTris[i], q = TriPoly[u];
         if (RdxSphere::Dot(PolyN[q], PolyN[p]) < RoundBendCos)
             continue;
-        const FV3& A = R.Moved[R.Tri[u * 3]];
-        Sum          = Sum + RdxSphere::Cross(R.Moved[R.Tri[u * 3 + 1]] - A, R.Moved[R.Tri[u * 3 + 2]] - A) * (double)Sign[q];
+        const FV3  A = R.MovedAt(R.Tri[u * 3]);
+        Sum          = Sum + RdxSphere::Cross(R.MovedAt(R.Tri[u * 3 + 1]) - A, R.MovedAt(R.Tri[u * 3 + 2]) - A) * (double)Sign[q];
     }
     const double L = RdxSphere::Length(Sum);
     if (!(L > 1e-12) || RdxSphere::Dot(Sum, PolyN[p]) <= 0.0)
@@ -3490,17 +3646,18 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
     };
     TList<FPieceGrid> Grid;
     TList<int>        Local, Touched;
-    if (!Grid.Resize(Polys) || !Local.Resize(R.Orig.Num))
+    if (!Grid.Resize(Polys) || !Local.Resize(R.Places()))
         return false;
-    for (int v = 0; v < R.Orig.Num; v++)
+    for (int v = 0; v < R.Places(); v++)
         Local[v] = -1;
     int PieceWords = 0;
     for (int p = 0; p < Polys; p++)
     {
         FPieceGrid& G = Grid[p];
         G.Gx          = 0;
-        if (p >= R.PolyRelief.Num || !R.PolyRelief[p] || p >= R.PolyTris.Num || R.PolyTris[p] <= 0 ||
-            R.PolyFaceCount[p] <= 0)
+        // A moved wall the relief may be drawn on: by the rounding, or cut by the fine bevel (LevelBevel.h), which
+        // makes no faces of a curve for it - its patches then lie on its triangles alone.
+        if (p >= R.PolyRelief.Num || !R.PolyRelief[p] || p >= R.PolyTris.Num || R.PolyTris[p] <= 0)
             continue;
         // The plane: the polygon's own as it came in; where that is not had, its triangles' normals where they were,
         // added up.
@@ -3514,15 +3671,15 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
         else
             for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p]; t++)
             {
-                const FV3& A = R.Orig[R.Tri[t * 3]];
-                N            = N + RdxSphere::Cross(R.Orig[R.Tri[t * 3 + 1]] - A, R.Orig[R.Tri[t * 3 + 2]] - A);
+                const FV3  A = R.OrigAt(R.Tri[t * 3]);
+                N            = N + RdxSphere::Cross(R.OrigAt(R.Tri[t * 3 + 1]) - A, R.OrigAt(R.Tri[t * 3 + 2]) - A);
             }
         const double L = RdxSphere::Length(N);
         if (!(L > 1e-12))
             continue;
         const FV3 Nu = N * (1.0 / L);
         if (R.PolyPlane.Num < 4 * Polys)
-            Plane = RdxSphere::Dot(Nu, R.Orig[R.Tri[R.PolyFirst[p] * 3]]);
+            Plane = RdxSphere::Dot(Nu, R.OrigAt(R.Tri[R.PolyFirst[p] * 3]));
         else
             Plane /= L;
         const int Drop = PieceDropOf(Nu);
@@ -3531,7 +3688,7 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
             for (int k = 0; k < 3; k++)
             {
                 double A, B;
-                PiecePlanOf(R.Orig[R.Tri[t * 3 + k]], Drop, A, B);
+                PiecePlanOf(R.OrigAt(R.Tri[t * 3 + k]), Drop, A, B);
                 Lo[0] = MinOf(Lo[0], A);
                 Hi[0] = MaxOf(Hi[0], A);
                 Lo[1] = MinOf(Lo[1], B);
@@ -3593,7 +3750,7 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
         for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p]; t++)
             for (int k = 0; k < 3; k++)
             {
-                const FV3& V = R.Orig[R.Tri[t * 3 + k]];
+                const FV3  V = R.OrigAt(R.Tri[t * 3 + k]);
                 B[0]         = MinOf(B[0], V.X - 2.0);
                 B[1]         = MinOf(B[1], V.Y - 2.0);
                 B[2]         = MaxOf(B[2], V.X + 2.0);
@@ -3651,12 +3808,12 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
         TList<int> TriPoly, PlaceFirst, PlaceTris, Sign;
         TList<FV3> PolyN;
         if (!PlaceNormal.ReserveExact(2 * RecordPlaces) || !TriPoly.ReserveExact(NumTris) || !TriPoly.Resize(NumTris) ||
-            !PlaceFirst.ReserveExact(R.Orig.Num + 1) || !PlaceFirst.Resize(R.Orig.Num + 1) || !Sign.Resize(Polys) ||
+            !PlaceFirst.ReserveExact(R.Places() + 1) || !PlaceFirst.Resize(R.Places() + 1) || !Sign.Resize(Polys) ||
             !PolyN.Resize(Polys))
             return false;
         for (int t = 0; t < NumTris; t++)
             TriPoly[t] = -1;
-        for (int v = 0; v <= R.Orig.Num; v++)
+        for (int v = 0; v <= R.Places(); v++)
             PlaceFirst[v] = 0;
         for (int p = 0; p < Polys; p++)
         {
@@ -3667,8 +3824,8 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
             FV3 Way = RdxSphere::V3(0.0, 0.0, 0.0);
             for (int t = R.PolyFirst[p]; t < R.PolyFirst[p] + R.PolyTris[p]; t++)
             {
-                const FV3& A = R.Orig[R.Tri[t * 3]];
-                Way          = Way + RdxSphere::Cross(R.Orig[R.Tri[t * 3 + 1]] - A, R.Orig[R.Tri[t * 3 + 2]] - A);
+                const FV3  A = R.OrigAt(R.Tri[t * 3]);
+                Way          = Way + RdxSphere::Cross(R.OrigAt(R.Tri[t * 3 + 1]) - A, R.OrigAt(R.Tri[t * 3 + 2]) - A);
             }
             const FV3 N = (R.PolyPlane.Num >= 4 * Polys)
                               ? RdxSphere::V3(R.PolyPlane[4 * p], R.PolyPlane[4 * p + 1], R.PolyPlane[4 * p + 2])
@@ -3685,16 +3842,16 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
                     PlaceFirst[R.Tri[t * 3 + k] + 1]++;
             }
         }
-        for (int v = 0; v < R.Orig.Num; v++)
+        for (int v = 0; v < R.Places(); v++)
             PlaceFirst[v + 1] += PlaceFirst[v];
-        if (!PlaceTris.ReserveExact(PlaceFirst[R.Orig.Num]) || !PlaceTris.Resize(PlaceFirst[R.Orig.Num]))
+        if (!PlaceTris.ReserveExact(PlaceFirst[R.Places()]) || !PlaceTris.Resize(PlaceFirst[R.Places()]))
             return false;
         // Each place's triangles in their order, its first moved along as they are put in, and put back after.
         for (int t = 0; t < NumTris; t++)
             if (TriPoly[t] >= 0)
                 for (int k = 0; k < 3; k++)
                     PlaceTris[PlaceFirst[R.Tri[t * 3 + k]]++] = t;
-        for (int v = R.Orig.Num; v > 0; v--)
+        for (int v = R.Places(); v > 0; v--)
             PlaceFirst[v] = PlaceFirst[v - 1];
         PlaceFirst[0] = 0;
         for (int p = 0; p < Polys; p++)
@@ -3711,8 +3868,8 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
                     if (!Touched.Add(v))
                         return false;
                     const FV3 N = PlaceNormalOf(R, p, v, PlaceFirst, PlaceTris, TriPoly, PolyN, Sign);
-                    PlaceNormal.Add(HalfOf(N.X) << 16);
-                    PlaceNormal.Add(HalfOf(N.Y) | (HalfOf(N.Z) << 16));
+                    if (!PlaceNormal.Add(HalfOf(N.X) << 16) || !PlaceNormal.Add(HalfOf(N.Y) | (HalfOf(N.Z) << 16)))
+                        return false;
                 }
             for (int i = 0; i < Touched.Num; i++)
                 Local[Touched[i]] = -1;
@@ -3841,8 +3998,8 @@ inline bool PackRound(const FResult& R, TList<unsigned int>& Out)
                     if (!Touched.Add(v))
                         return false;
                     double A, B;
-                    PiecePlanOf(R.Orig[v], G.Drop, A, B);
-                    const FV3           M = R.Moved[v] - R.Orig[v];
+                    PiecePlanOf(R.OrigAt(v), G.Drop, A, B);
+                    const FV3           M = R.MovedAt(v) - R.OrigAt(v);
                     unsigned int* const P = &Out[At + PlacesOff + RoundPlaceWords * Places];
                     P[0]                  = Bits(A);
                     P[1]                  = Bits(B);

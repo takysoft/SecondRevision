@@ -1,5 +1,5 @@
 SecondRevision - An unofficial DirectX 12 renderer for Deus Ex
-Version 0.2.0 - experimental.
+Version 0.3.0 - experimental.
 
 Experimental version!
 Please keep in mind, that it was mainly developed on an AMD RX 9070 XT.

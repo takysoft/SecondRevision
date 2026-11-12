@@ -349,6 +349,7 @@ private:
     TComRef<ID3D12Resource> ActorUvwVb[BACKEND_FRAME_COUNT];      // beside ActorVb: u, v and the mask's slot a vertex
     FLOAT*                  ActorUvwMapped[BACKEND_FRAME_COUNT];
     INT                     ActorRoom[BACKEND_FRAME_COUNT];       // the vertices each slot's two have room for
+    UBOOL                   ActorShrink[BACKEND_FRAME_COUNT] = {}; // a level's change: made again to the next's (BeginFrame)
     INT                     ActorAsked;     // the vertices this frame's casters asked for, placed or not
     INT                     ActorWanted;    // the most a frame has asked for: what the slots are made to hold
     // The arena (ArenaAlloc): positions and texture places, mapped for good; ArenaUsed vertices given out since the level.

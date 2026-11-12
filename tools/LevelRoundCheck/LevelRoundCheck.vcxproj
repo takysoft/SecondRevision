@@ -12,6 +12,10 @@
       <Configuration>Release</Configuration>
       <Platform>Win32</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
 
   <PropertyGroup Label="Globals">
@@ -32,8 +36,10 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
   <PropertyGroup>
-    <OutDir>$(MSBuildThisFileDirectory)..\..\build\levelroundcheck\</OutDir>
-    <IntDir>$(MSBuildThisFileDirectory)..\..\build\obj\levelroundcheck\</IntDir>
+    <OutDir Condition="'$(Platform)'=='Win32'">$(MSBuildThisFileDirectory)..\..\build\levelroundcheck\</OutDir>
+    <IntDir Condition="'$(Platform)'=='Win32'">$(MSBuildThisFileDirectory)..\..\build\obj\levelroundcheck\</IntDir>
+    <OutDir Condition="'$(Platform)'=='x64'">$(MSBuildThisFileDirectory)..\..\build\levelroundcheck64\</OutDir>
+    <IntDir Condition="'$(Platform)'=='x64'">$(MSBuildThisFileDirectory)..\..\build\obj\levelroundcheck64\</IntDir>
     <TargetName>LevelRoundCheck</TargetName>
   </PropertyGroup>
 
@@ -49,6 +55,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
+      <LargeAddressAware>true</LargeAddressAware>
     </Link>
   </ItemDefinitionGroup>
 

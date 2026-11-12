@@ -51,6 +51,13 @@ static UBOOL NodeBorder(UModel* Model, INT iNode, INT& Wet, INT& Dry)
     return 1;
 }
 
+UBOOL RdxWaterBorderNode(UModel* Model, INT iNode)
+{
+    // As RdxWaterSheet takes it: zone 0 on the dry side is solid - a pool's wall, not its surface.
+    INT Wet = 0, Dry = 0;
+    return (Model && NodeBorder(Model, iNode, Wet, Dry) && Dry != 0) ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Text for the log
 // ---------------------------------------------------------------------------
@@ -804,6 +811,11 @@ static const FFountainChute* ChuteOfSurf(INT iSurf)
         if (GChutes[c].iSurf == iSurf)
             return GChutes[c].bTaken ? &GChutes[c] : NULL;
     return NULL;
+}
+
+UBOOL RdxWaterFountainSurf(INT iSurf)
+{
+    return (PoolOfSurf(iSurf) || ChuteOfSurf(iSurf)) ? 1 : 0;
 }
 
 // A piece into a chute, if its water runs towards the place given - the slot, or the piece below: the way it drops,

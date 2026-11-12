@@ -36,6 +36,9 @@ FFramePacer::FFramePacer()
         SlotDone[s] = 0;
     appMemzero(Ring, sizeof(Ring));
     appMemzero(Costs, sizeof(Costs));
+    appMemzero(HeldPicture, sizeof(HeldPicture));
+    appMemzero(HeldFence, sizeof(HeldFence));
+    appMemzero(HeldUntil, sizeof(HeldUntil));
 }
 
 FFramePacer::~FFramePacer()
@@ -145,6 +148,7 @@ UBOOL FFramePacer::Init(ID3D12Device* Dev)
 
 void FFramePacer::Shutdown()
 {
+    UBOOL bStopped = 1;
     if (Thread)
     {
         // What was handed over goes out first; then the thread stops.
@@ -153,7 +157,10 @@ void FFramePacer::Shutdown()
         ::SetEvent(Hurry);
         ::SetEvent(Wake);
         if (::WaitForSingleObject(Thread, 2000) != WAIT_OBJECT_0)
+        {
             RdxLog(TEXT("frame generation: the presenting thread did not stop in time"));
+            bStopped = 0;
+        }
         ::CloseHandle(Thread);
         Thread = nullptr;
     }
@@ -163,6 +170,31 @@ void FFramePacer::Shutdown()
     if (Queue && Fence && FenceValue && FlushEvent && Fence->GetCompletedValue() < FenceValue &&
         SUCCEEDED(Fence->SetEventOnCompletion(FenceValue, FlushEvent)))
         ::WaitForSingleObject(FlushEvent, 5000);
+    // The host's pictures and fences still held - the jobs the thread never took, and those it held after theirs. A
+    // thread that did not stop may still be in a job: then they stay rather than go from under it.
+    if (bStopped)
+    {
+        for (LONG k = Tail; k != Head; k++)
+        {
+            FJob& J = Ring[k % Jobs];
+            if (J.Generated)
+                J.Generated->Release();
+            if (J.GenFence)
+                J.GenFence->Release();
+            J.Generated = nullptr;
+            J.GenFence  = nullptr;
+        }
+        for (INT h = 0; h < Jobs; h++)
+        {
+            if (HeldPicture[h])
+                HeldPicture[h]->Release();
+            if (HeldFence[h])
+                HeldFence[h]->Release();
+            HeldPicture[h] = nullptr;
+            HeldFence[h]   = nullptr;
+            HeldUntil[h]   = 0;
+        }
+    }
     for (INT s = 0; s < Slots; s++)
     {
         Lists[s].Release();
@@ -274,6 +306,11 @@ HRESULT FFramePacer::Submit(IDXGISwapChain3* Chain, ID3D12Resource* const* BackB
         ::WaitForSingleObject(Drained, 1);
     }
     AddCost(Cost_Submit, PacerSeconds() - T0);
+    // The host's picture and fence are the host link's: held here too, until this queue is past the job (Run).
+    if (Generated)
+        Generated->AddRef();
+    if (GenFence)
+        GenFence->AddRef();
     FJob& J       = Ring[Head % Jobs];
     J.Chain       = Chain;
     J.BackBuffers = BackBuffers;
@@ -438,6 +475,38 @@ void FFramePacer::PresentFrame(const FJob& J)
         AddCost(Cost_GapGenReal, LastRealAt - GenThroughAt);
 }
 
+void FFramePacer::HoldHostPicture(FJob& J)
+{
+    if (!J.Generated && !J.GenFence)
+        return;
+    const INT H = (INT)(J.Frame % Jobs);
+    LetGoHeld(H);
+    // A signal of its own after the job's last command: the wait for the host's fence was queued even where no copy
+    // followed it.
+    HeldPicture[H] = J.Generated;
+    HeldFence[H]   = J.GenFence;
+    HeldUntil[H]   = Signal();
+    J.Generated    = nullptr;
+    J.GenFence     = nullptr;
+}
+
+void FFramePacer::LetGoHeld(INT H)
+{
+    if (!HeldPicture[H] && !HeldFence[H])
+        return;
+    // The job Jobs frames before this one: its commands are long done, unless the queue is stuck - then a second's
+    // wait, and let go as Shutdown lets go of everything after its own wait.
+    for (INT Try = 0; Try < 2 && Fence && Fence->GetCompletedValue() < HeldUntil[H]; Try++)
+        WaitThrough(HeldUntil[H]);
+    if (HeldPicture[H])
+        HeldPicture[H]->Release();
+    if (HeldFence[H])
+        HeldFence[H]->Release();
+    HeldPicture[H] = nullptr;
+    HeldFence[H]   = nullptr;
+    HeldUntil[H]   = 0;
+}
+
 DWORD WINAPI FFramePacer::ThreadMain(void* Self)
 {
     ((FFramePacer*)Self)->Run();
@@ -453,7 +522,9 @@ void FFramePacer::Run()
         ::WaitForSingleObject(Wake, 100);
         while (Tail != Head)
         {
-            PresentFrame(Ring[Tail % Jobs]);
+            FJob& J = Ring[Tail % Jobs];
+            PresentFrame(J);
+            HoldHostPicture(J);
             ::InterlockedIncrement(&Tail);
             ::SetEvent(Drained);
         }

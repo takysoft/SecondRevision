@@ -410,16 +410,21 @@ struct FModel
         return -1;
     }
 
-    // Vertex v's normal over every face at it, each as long as twice its area, in pose P - as the engine makes the
-    // normals it lights a model by. Zero where its faces have no area.
+    // Vertex v's normal over every face at it, each face's unit normal alike, in pose P - as the engine makes the normals
+    // it lights a model by, which the checks of a guess hold against it: weighed by the faces' areas instead, it leans
+    // towards the larger faces, and at a corner between a wide face and narrow ones (a flat box's) it stands off the
+    // engine's by more than the checks allow. Zero where its faces have no area.
     FV PlainNormal(const FPose& P, int v) const
     {
         FV Sum = V(0.0f, 0.0f, 0.0f);
         for (int i = VertStart[v]; i < VertStart[v + 1]; i++)
         {
-            const int f = VertFaces[i];
-            const FV  A = P.At(Corner[f * 3]);
-            Sum         = Sum + Cross(P.At(Corner[f * 3 + 1]) - A, P.At(Corner[f * 3 + 2]) - A);
+            const int   f    = VertFaces[i];
+            const FV    A    = P.At(Corner[f * 3]);
+            const FV    Face = Cross(P.At(Corner[f * 3 + 1]) - A, P.At(Corner[f * 3 + 2]) - A);
+            const float Area = Length(Face);
+            if (Area > 1e-12f)
+                Sum = Sum + Face * (1.0f / Area);
         }
         const float L = Length(Sum);
         return (L > 1e-12f) ? Sum * (1.0f / L) : V(0.0f, 0.0f, 0.0f);
@@ -430,6 +435,12 @@ struct FModel
 // the fans' normals and the edges' terms from the pose of each draw (Pose, EdgeTerms).
 struct FShape
 {
+    // Its block from the C library, not from the global operator new: the level's rounding makes its shapes on a thread
+    // of its own beside the game too (RenderDevice.cpp's SphereJobMain), and in the game the global one is the engine's
+    // allocator, which is not thread-safe. Null where there is no memory, and the caller says so.
+    static void* operator new(size_t Size) noexcept { return malloc(Size); }
+    static void  operator delete(void* P) noexcept { free(P); }
+
     // The kinds of edge.
     enum
     {
@@ -500,6 +511,10 @@ struct FShape
     // The draw's fit (Fit): its pose is the rest's turned, scaled (Turn, by rows) and moved.
     bool  bFit = false;
     float Turn[9];
+    // A face a face laid on it would be met by, bowed (HoldUnder): its true edges stay fixed.
+    TList<unsigned char> Under;
+    // How near a place lies to a face's plane to lie in it (Make's FlatHair, or a two-thousandth of the model's reach).
+    float PlaneHair = 0.0f;
 
     // Round: a face is drawn (null: all are); Pose: the vertices' places the shape is made from; MostTurn: the most two
     // faces of one smooth surface turn by at their edge, in degrees; MostMove: the most anything moves, in the pose's
@@ -515,9 +530,27 @@ struct FShape
     // it, where the edge's other polygon lies behind that one - a table's rim over the leg under it - rather than being
     // held by how deep the polygon reaches there (EdgeCapOf): the two cannot meet, and the polygon between them only
     // folds along its own plane, as the level draws it (the level's; a model's edges stay held).
+    // A model's shape (FlatHair below zero) is made again while a face laid on another would be met by the surface under
+    // it (HoldUnder), with the flat polygons under it held; what is laid on the level's walls is drawn as decals.
     bool Make(const FModel& Model, const unsigned char* Round, const FPose& Pose, float MostTurn, float MostMove,
               float WeldHair = -1.0f, bool bOpenFree = true, float FlatHair = -1.0f,
               const unsigned char* Sheet = nullptr, bool bRingPass = false)
+    {
+        if (!Under.Resize(Model.Faces > 0 ? Model.Faces : 1))
+            return false;
+        for (int f = 0; f < Model.Faces; f++)
+            Under[f] = 0;
+        for (;;)
+        {
+            if (!MakeOnce(Model, Round, Pose, MostTurn, MostMove, WeldHair, bOpenFree, FlatHair, Sheet, bRingPass))
+                return false;
+            if (FlatHair >= 0.0f || !HoldUnder(Round))
+                return true;
+        }
+    }
+
+    bool MakeOnce(const FModel& Model, const unsigned char* Round, const FPose& Pose, float MostTurn, float MostMove,
+                  float WeldHair, bool bOpenFree, float FlatHair, const unsigned char* Sheet, bool bRingPass)
     {
         M          = &Model;
         Fans       = 0;
@@ -549,6 +582,7 @@ struct FShape
         }
         const float Reach    = Length(Hi - Lo);
         const float FlatNear = (FlatHair >= 0.0f) ? FlatHair : Reach / 2048.0f;
+        PlaneHair            = FlatNear;
 
         // The places welded: within a hair of the model's size, by a grid of cells that size.
         {
@@ -709,6 +743,9 @@ struct FShape
                 bFlat       = fabsf(Dot(D1, FaceN[F0])) <= FlatNear && fabsf(Dot(D0, FaceN[F1])) <= FlatNear;
                 ByHair[E]   = bFlat ? 1 : 0;
             }
+            // A true edge of a face something lies on (Under) does not bow.
+            if (!bFlat && (Under[F0] || Under[F1]))
+                continue;
             EdgeKind[E] = (unsigned char)(bFlat ? Edge_Inner : (C >= SoftCosine) ? Edge_Soft : Edge_Crease);
         }
 #ifdef LEVELROUND_TRACE
@@ -1090,6 +1127,126 @@ struct FShape
         const int* const C = M->Corner.Data + Face * 3;
         const FV         A = P.At(Weld[C[0]]);
         return Unit(Cross(P.At(Weld[C[1]]) - A, P.At(Weld[C[2]]) - A));
+    }
+
+    // Where the point at its corners' shares B0, B1, B2 of face Face lies in the draw's pose once moved, as the domain
+    // shader moves it (SolidPass.hlsl's DSMesh): by its patch - along the plane of a flat polygon of several faces by the
+    // polygon's one move (PolyPlaneMoveAt) -, held to the cap.
+    FV MovedAt(int Face, float B0, float B1, float B2)
+    {
+        const int* const C    = M->Corner.Data + Face * 3;
+        const FV         Flat = P.At(C[0]) * B0 + P.At(C[1]) * B1 + P.At(C[2]) * B2;
+        const FEdgeTerms E[3] = { EdgeTerms(Face, 0), EdgeTerms(Face, 1), EdgeTerms(Face, 2) };
+        FV               Move = PatchMoveAt(E, B0, B1, B2);
+        int              Outline[POLY_EDGES_MOST];
+        const int        OutNum = PolyOutline(Face, Outline, POLY_EDGES_MOST);
+        if (OutNum > 0)
+        {
+            FEdgeTerms OutTerms[POLY_EDGES_MOST];
+            FV         OutEnds[POLY_EDGES_MOST * 2];
+            for (int g = 0; g < OutNum; g++)
+            {
+                EdgeData(Outline[g], OutTerms[g]);
+                OutEnds[g * 2]     = P.At(EdgeA[Outline[g]]);
+                OutEnds[g * 2 + 1] = P.At(EdgeB[Outline[g]]);
+            }
+            const FV Plane = PlaneOfFace(Poly[Face]);
+            Move           = PolyPlaneMoveAt(OutTerms, OutEnds, OutNum, Plane, Flat) + Plane * Dot(Move, Plane);
+        }
+        const float L = Length(Move);
+        return Flat + ((L > Cap) ? Move * (Cap / L) : Move);
+    }
+
+    // A face laid on another of a model - a datacube's screen on its top, a label on a box: one with an open edge, turned
+    // the same way as the other, its middle over it, further from its plane than PlaneHair and no further than anything
+    // moves (Cap). Where the surface under it, as this shape bows it, comes out to the laid face - past it, or to within
+    // PlaneHair of it, into one plane with it - at any of the ten points that fix a cubic triangle over the laid face (its
+    // corners, its edges' thirds, its middle), the flat polygon under that point is held (Under): held flat, it stays
+    // under what lies on it. Worked out in the shape's own pose, left after as Make leaves it. Whether a polygon was newly
+    // held - the shape is then made again.
+    bool HoldUnder(const unsigned char* Round)
+    {
+        const int        FaceCount = M->Faces;
+        const int* const Corner    = M->Corner.Data;
+        TList<FV>        N;
+        if (FaceCount <= 0 || !N.Resize(FaceCount))
+            return false;
+        for (int f = 0; f < FaceCount; f++)
+            N[f] = PlaneOfFace(f);
+        auto Drawn = [&](int f) { return !Round || Round[f]; };
+        auto At    = [&](int f, int k) { return P.At(Weld[Corner[f * 3 + k]]); };
+        // Point Q, from a face's first corner, over the face of edges E0 and E1 from there, seen along its normal: its
+        // shares S and T of the two.
+        auto Over = [](const FV& Q, const FV& E0, const FV& E1, float& S, float& T)
+        {
+            const FV    Nn = Cross(E0, E1);
+            const float W  = Dot(Nn, Nn);
+            if (!(W > 0.0f))
+                return false;
+            S = Dot(Cross(Q, E1), Nn) / W;
+            T = Dot(Cross(E0, Q), Nn) / W;
+            return S >= 0.0f && T >= 0.0f && S + T <= 1.0f;
+        };
+        Stamp      = -1;   // no draw's
+        bool bMore = false;
+        for (int f = 0; f < FaceCount; f++)
+        {
+            if (!Drawn(f) || Dot(N[f], N[f]) == 0.0f)
+                continue;
+            bool bOpen = false;
+            for (int k = 0; k < 3 && !bOpen; k++)
+                bOpen = EdgeCount[EdgeOf[f * 3 + k]] == 1;
+            if (!bOpen)
+                continue;
+            const FV Mid = (At(f, 0) + At(f, 1) + At(f, 2)) * (1.0f / 3.0f);
+            for (int g = 0; g < FaceCount; g++)
+            {
+                if (g == f || !Drawn(g) || Dot(N[f], N[g]) < FlatCos)
+                    continue;
+                const FV    Ga   = At(g, 0);
+                const float Side = Dot(Mid - Ga, N[g]), Gap = fabsf(Side);
+                float       S, T;
+                if (!(Gap > PlaneHair && Gap <= Cap) || !Over(Mid - Ga, At(g, 1) - Ga, At(g, 2) - Ga, S, T))
+                    continue;
+                const FV Way = N[g] * ((Side > 0.0f) ? 1.0f : -1.0f);   // from the face under to the laid one
+                for (int i = 0; i <= 3; i++)
+                    for (int j = 0; j <= 3 - i; j++)
+                    {
+                        const float B1 = (float)i / 3.0f, B2 = (float)j / 3.0f, B0 = 1.0f - B1 - B2;
+                        const FV    Laid = MovedAt(f, B0, B1, B2);
+                        const FV    Flat = P.At(Corner[f * 3]) * B0 + P.At(Corner[f * 3 + 1]) * B1 +
+                                        P.At(Corner[f * 3 + 2]) * B2;
+                        for (int h = 0; h < FaceCount; h++)
+                        {
+                            if (Under[h] || !Drawn(h) || Dot(N[h], N[g]) < FlatCos ||
+                                fabsf(Dot(At(h, 0) - Ga, N[g])) > 0.5f * Gap)
+                                continue;
+                            const FV Ha = At(h, 0);
+                            float    Sh, Th;
+                            if (!Over(Flat - Ha, At(h, 1) - Ha, At(h, 2) - Ha, Sh, Th) ||
+                                Dot(MovedAt(h, 1.0f - Sh - Th, Sh, Th) - Laid, Way) <= -PlaneHair)
+                                continue;
+                            const int Held = Poly[h];
+                            for (int x = 0; x < FaceCount; x++)
+                                if (Poly[x] == Held)
+                                    Under[x] = 1;
+                            bMore = true;
+                        }
+                    }
+            }
+        }
+        // As Make leaves it: nothing worked out in a pose.
+        Stamp = 0;
+        for (int i = 0; i < Fans; i++)
+            FanStampOf[i] = 0;
+        for (int f = 0; f < FaceCount; f++)
+            FaceStampOf[f] = 0;
+        for (int E = 0; E < Edges; E++)
+        {
+            TermStampOf[E] = 0;
+            EdgeCap[E]     = -1.0f;
+        }
+        return bMore;
     }
 
     // A draw's pose, until the next: NewStamp, a number no earlier pose of this shape had.

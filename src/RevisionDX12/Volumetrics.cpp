@@ -1423,6 +1423,13 @@ void FVolumetrics::Shutdown()
     ReleaseTargets();
     Walk.Release();
     Root.Release();
+    // The laying-on's and the heat haze's passes too: the device's own objects, made again at their next use.
+    Lay.Release();
+    LayRoot.Release();
+    LayFormat = DXGI_FORMAT_UNKNOWN;
+    HazePipe.Release();
+    HazeRoot.Release();
+    HazeReady = 0;
 }
 
 void FVolumetrics::NameResources()
@@ -1516,6 +1523,7 @@ UBOOL FVolumetrics::MakeSlot(ID3D12Device* Device, FViewSlot& S)
             FreeSlot(S);
             return 0;
         }
+        RdxUploadCensus::Note(Wants[b].Buffer->Get(), Bd.Width, L"volumetrics lists");
     }
     S.Room         = FIRST_PUFFS;
     S.TileRoom     = FirstTiles;
@@ -1717,6 +1725,7 @@ UBOOL FVolumetrics::GrowList(ID3D12Device* Device, TComRef<ID3D12Resource>& Buff
         RdxLog(TEXT("volumetrics: %s could not be made for %i (it holds %i)"), What, Larger, Room);
         return 0;
     }
+    RdxUploadCensus::Note(Made, Bd.Width, L"volumetrics lists");
     Buffer->Unmap(0, nullptr);
     *Buffer.Slot() = Made;                  // the smaller one is let go, the larger one is the slot's from here
     At = MadeAt;

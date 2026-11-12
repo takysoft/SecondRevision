@@ -359,7 +359,7 @@ Puddles=On
 ;   Con: A bit pricey on the system. Also there are objects that are not
 ;        supposed to be round, yet this makes them rounder.
 ;   Generally I'd say it improves the look of the game.
-Spherifier=On
+Spherifier=Medium
 
 ; SoftParticles (default On)
 ;   Smoke, steam and fire are flat pictures (sprites) standing in the air.
@@ -474,3 +474,17 @@ SafeMode=Off
 ;   SecondRevision-frames.csv and any SecondRevision-crash-*.dmp. Read at the
 ;   start only; the log stops itself at 1024 MB.
 LogLevel=Info
+
+;---------------------------------------------------------
+; ADDED BY THE RENDERER - the text above is left as it was
+;---------------------------------------------------------
+; Geometry   -   Off | POM | DisplacementMappingLow | DisplacementMappingMedium
+;                | DisplacementMappingHigh   (DisplacementMapping alone is High)
+;   The displacement mapping at three densities: High cuts the relief as
+;   finely as it was made, Medium and Low coarser - fewer triangles and a
+;   faster frame, the stones' outlines a little softer near the eye.
+
+; Spherifier (default Medium)   -   Off | Low | Medium | High   (On is Medium)
+;   How finely the round shapes' curves are cut: High as finely as it was
+;   made, Medium and Low coarser - fewer pieces and a faster frame, the
+;   curves a little more angular near the eye.

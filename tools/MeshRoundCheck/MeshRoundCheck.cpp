@@ -1,7 +1,8 @@
 // MeshRoundCheck: the renderer's model rounding (src\RevisionDX12\MeshRound.h) run on a model the game drew, as the
-// renderer wrote it down (the marker SecondRevision-mesh-dump.txt: SecondRevision-mesh-round.bin, each model as it was
-// first known - its faces, which are drawn, its vertices' places in the view and the engine's normals there). No game and
-// no graphics card: what the shape makes of the model is said, and its rounded surface written out to be looked at.
+// renderer wrote it down (the marker SecondRevision-mesh-dump.txt: SecondRevision-mesh-round.bin in the temp folder,
+// each model as it was first known - its faces, which are drawn, its vertices' places in the view and the engine's
+// normals there). No game and no graphics card: what the shape makes of the model is said, and its rounded surface
+// written out to be looked at.
 //
 //    MeshRoundCheck <dump.bin> <model name> <out.obj> [angle, degrees] [cap, units] [cuts]
 //

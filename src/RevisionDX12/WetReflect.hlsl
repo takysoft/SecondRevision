@@ -29,7 +29,8 @@ cbuffer WetPass : register(b0)
 // The lamps whose streaks the floors give back this frame (FBackend::SetWetLamps; the lamps' bodies of
 // SecondRevisionLampSurfaces.txt, each of its glass's colour): how many in WetLampCount.x - every lamp due a streak;
 // WET_LAMP_MAX (RdxMath::WetLampMax) is only the room a constant buffer has - and two rows a lamp: its place in the
-// view's space and its glass's radius, its glass's colour by its brightness.
+// view's space and its glass's radius, its glass's colour by its brightness and its kind (RdxMath::WetLampKind: a
+// fire, a ball, or a rod along one of the level's axes - WetLampAxis).
 #define WET_LAMP_MAX 2047
 cbuffer WetLamps : register(b1)
 {
@@ -356,36 +357,69 @@ float4 WetTrace(float3 P, float3 R, float Spread, int Steps)
     return float4(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
+// A lamp's rod's axis's half in the view's space, out of its kind (its colour's row's fourth number, RdxMath::
+// WetLampKind): -(4096 K + H + 1) a rod along the level's axis K (0 X, 1 Y, 2 Z) of half H - that axis in the view's
+// space by the view's axes in the level (WetView) -, nothing for a ball or a fire.
+float3 WetLampAxis(float Kind)
+{
+    if (Kind > -0.5f)
+        return float3(0.0f, 0.0f, 0.0f);
+    const float  V = -Kind - 1.0f;
+    const float  K = floor(V / 4096.0f);
+    const float  H = V - 4096.0f * K;
+    const float3 W = (K < 0.5f) ? float3(1.0f, 0.0f, 0.0f) : (K < 1.5f) ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f);
+    return H * float3(dot(W, WetView[1].xyz), dot(W, WetView[2].xyz), dot(W, WetView[3].xyz));
+}
+
 // A lamp's streak (docs/terv-nedves-feluletek.md 8.7): its glass's light off the floor as a rough mirror gives it back -
 // the GGX lobe about the half-way direction, Smith's masking in its height-correlated form, the water's Fresnel. The
 // lobe's shape follows the lamp, the eye and the floor: seen at a low angle it stretches along the view, towards the eye
 // - that is the streak, not a stretch laid on the screen - and the stone's relief turns each of its slopes into the
-// streak or out of it. The glass is a ball of the lamp's radius (Karis, "Real Shading in Unreal Engine 4", 2013): the
-// light comes from its point nearest the mirrored ray, and the lobe is widened by the ball's size with its peak lowered
-// as much - a lamp near the floor gives back a patch as large as it is, not a burning point. Its light is a ball of glass
-// of that brightness's, falling with the square of the distance: a lamp far off still draws its streak. Lamp: its place
-// and radius; Colour: its glass's colour by its brightness.
-float3 WetStreak(float3 P, float3 E, float3 N, float Alpha, float4 Lamp, float3 Colour)
+// streak or out of it. The glass is as the lamp is seen - a rod along its box's longest side as thick as the lamp shows
+// (RdxMath::LampShapeOf), or a ball (Karis, "Real Shading in Unreal Engine 4", 2013, its sphere and tube lights): the
+// point of the rod's axis
+// nearest the mirrored ray stands for the glass there, a ball of the rod's radius, whose point nearest the ray the
+// light comes from; and the lobe is widened by the glass's size with its peak lowered as much - across the rod by its
+// radius, along it by its length too, the ball's widening split between the two. A lamp near the floor gives back a
+// patch as large as it shows, not a burning point, and a rod seen end on a streak as narrow as it is. Its light is the
+// glass's area seen from the floor's point - the rod's band across the line of sight and its round ends' disc - of
+// that brightness, falling with the square of the distance: a lamp far off still draws its streak. Lamp: its place and
+// its glass's radius - a rod's, a ball's -; Axis: the rod's axis's half in the view's space, none for a ball; Colour:
+// its glass's colour by its brightness.
+float3 WetStreak(float3 P, float3 E, float3 N, float Alpha, float4 Lamp, float3 Axis, float3 Colour)
 {
-    const float3 ToC  = Lamp.xyz - P;
-    const float  Dist = max(length(ToC), Lamp.w + 1.0f);
     const float3 Mir  = reflect(E, N);
+    // The axis's point nearest the mirrored ray: where the line through its ends and the ray come nearest, kept
+    // within the ends.
+    const float3 A0   = Lamp.xyz - Axis - P;
+    const float3 Ld   = 2.0f * Axis;
+    const float  LdLd = dot(Ld, Ld);
+    const float  RLd  = dot(Mir, Ld);
+    const float  T    = (LdLd > 1e-6f) ? saturate((dot(Mir, A0) * RLd - dot(A0, Ld)) / max(LdLd - RLd * RLd, 1e-6f))
+                                       : 0.5f;
+    const float3 ToC  = A0 + Ld * T;
+    const float  R    = Lamp.w;
+    const float  Dist = max(length(ToC), R + 1.0f);
     const float3 Off  = dot(ToC, Mir) * Mir - ToC;
-    const float3 L    = normalize(ToC + Off * saturate(Lamp.w / max(length(Off), 1e-3f)));
+    const float3 L    = normalize(ToC + Off * saturate(R / max(length(Off), 1e-3f)));
     const float3 V    = -E;
     const float  NL   = dot(N, L);
     const float  NV   = dot(N, V);
     if (NL <= 0.0f || NV <= 0.0f)
         return float3(0.0f, 0.0f, 0.0f);
-    const float3 H    = normalize(L + V);
-    const float  NH   = saturate(dot(N, H));
-    const float  A2   = Alpha * Alpha;
-    const float  K    = NH * NH * (A2 - 1.0f) + 1.0f;
-    const float  Wide = Alpha / saturate(Alpha + Lamp.w / (2.0f * Dist));
-    const float  D    = A2 / (3.14159265f * K * K) * (Wide * Wide);
-    const float  Vis  = 0.5f / (NL * sqrt(NV * NV * (1.0f - A2) + A2) + NV * sqrt(NL * NL * (1.0f - A2) + A2));
-    const float  F    = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);
-    const float  Fall = 3.14159265f * Lamp.w * Lamp.w / (Dist * Dist);
+    const float3 H     = normalize(L + V);
+    const float  NH    = saturate(dot(N, H));
+    const float  A2    = Alpha * Alpha;
+    const float  K     = NH * NH * (A2 - 1.0f) + 1.0f;
+    const float  Half  = 0.5f * sqrt(LdLd);
+    const float  Cross = Alpha / saturate(Alpha + R / (2.0f * Dist));
+    const float  Along = Alpha / saturate(Alpha + (R + Half) / (2.0f * Dist));
+    const float  D     = A2 / (3.14159265f * K * K) * (Cross * Along);
+    const float  Vis   = 0.5f / (NL * sqrt(NV * NV * (1.0f - A2) + A2) + NV * sqrt(NL * NL * (1.0f - A2) + A2));
+    const float  F     = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);
+    // How much of the rod's length shows across the line of sight from the floor's point.
+    const float  Side  = (Half > 0.0f) ? length(cross(Ld / (2.0f * Half), ToC / max(length(ToC), 1e-3f))) : 0.0f;
+    const float  Fall  = (3.14159265f * R * R + 4.0f * R * Half * Side) / (Dist * Dist);
     return Colour * (D * Vis * F * NL * Fall * Film.z);
 }
 
@@ -398,8 +432,9 @@ float3 WetStreaks(float3 P, float3 E, float3 N, float Alpha)
     [loop] for (int i = 0; i < Count; i++)
     {
         const float4 Lamp = WetLamp[i * 2];
-        if (Lamp.w > 0.0f && WetLamp[i * 2 + 1].a < 0.5f)
-            Sum += WetStreak(P, E, N, Alpha, Lamp, WetLamp[i * 2 + 1].rgb);
+        const float4 Glow = WetLamp[i * 2 + 1];
+        if (Lamp.w > 0.0f && Glow.a < 0.5f)
+            Sum += WetStreak(P, E, N, Alpha, Lamp, WetLampAxis(Glow.a), Glow.rgb);
     }
     return Sum;
 }
@@ -418,7 +453,7 @@ float3 WetSpotStreaks(float3 P, float3 E, float3 N, float Alpha)
         const float  Spill = smoothstep(0.0f, 1.0f, (Cos - SpotRims.z) * SpotRims.w);
         const float  Cone  = Hot + (1.0f - Hot) * SpotHead.y * Spill;
         if (Cone > 0.0f)
-            Sum += WetStreak(P, E, N, Alpha, Lens, Spot[i * 3 + 1].rgb * Cone);
+            Sum += WetStreak(P, E, N, Alpha, Lens, float3(0.0f, 0.0f, 0.0f), Spot[i * 3 + 1].rgb * Cone);
     }
     return Sum;
 }

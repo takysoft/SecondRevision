@@ -5,6 +5,7 @@
 
 #include <d3dcompiler.h>
 #include "ShaderCache.h"
+#include "Spherify.h"
 
 // The thread pool's work of the spots' collection (CollectSpotTriangles) and its helpers; -1: not asked yet.
 static PTP_WORK GSpotPool    = nullptr;
@@ -82,8 +83,12 @@ static UBOOL CreateUploadBuffer(ID3D12Device* Device, UINT64 Bytes, TComRef<ID3D
     Desc.MipLevels        = 1;
     Desc.SampleDesc.Count = 1;
     Desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    return ShadowCheck(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                       nullptr, __uuidof(ID3D12Resource), Out.VoidSlot()), What);
+    const UBOOL bMade = ShadowCheck(Device->CreateCommittedResource(&Heap, D3D12_HEAP_FLAG_NONE, &Desc,
+                                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                                    __uuidof(ID3D12Resource), Out.VoidSlot()), What);
+    if (bMade)
+        RdxUploadCensus::Note(Out.Get(), Bytes, L"shadow lists");
+    return bMade;
 }
 
 static void SetSquareViewport(ID3D12GraphicsCommandList* Cmd, INT Size)
@@ -553,6 +558,11 @@ void FShadowMaps::ForgetWorld()
     WorldVb.Release();
     FreeRetiredWorlds();
     WorldVertexCount = 0;
+    // The casters' most a frame asked for is the level's that went: each slot's two buffers are made again to the next
+    // level's at the slot's next frame start (BeginFrame) - a larger level's room would stay in the upload heap.
+    ActorWanted = 0;
+    for (INT s = 0; s < BACKEND_FRAME_COUNT; s++)
+        ActorShrink[s] = 1;
     FreeWorldGrid();
 }
 
@@ -790,31 +800,52 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
     appMemzero(Stamp, Triangles * sizeof(INT));
     WorldTriangles = Triangles;
 
-    FLOAT BoxMin[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
-    FLOAT BoxMax[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
-    for (INT t = 0; t < Triangles; t++)
-    {
-        const FLOAT* const V = Xyz + t * 9;
-        const FLOAT C[3] = { (V[0] + V[3] + V[6]) / 3.0f, (V[1] + V[4] + V[7]) / 3.0f, (V[2] + V[5] + V[8]) / 3.0f };
-        FLOAT R2 = 0.0f;
-        for (INT k = 0; k < 3; k++)
-        {
-            const FLOAT DX = V[k * 3] - C[0], DY = V[k * 3 + 1] - C[1], DZ = V[k * 3 + 2] - C[2];
-            const FLOAT D2 = DX * DX + DY * DY + DZ * DZ;
-            if (D2 > R2)
-                R2 = D2;
-        }
-        FLOAT* const S = WorldSpheres + t * 4;
-        S[0] = C[0];
-        S[1] = C[1];
-        S[2] = C[2];
-        S[3] = appSqrt(R2) + 0.5f;
+    // Over the threads, in Chunks runs of triangles one after another, each run with lists of its own - the cells'
+    // counts and where its references go -, so that the references come out in the triangles' order, as one thread
+    // would lay them: the spheres and each run's box; then each run's count in each cell; then each run's references
+    // from where the runs before it end in the cell.
+    const INT Chunks = Max(1, Min(RdxSphere::WorkersAvailable(), (Triangles + 4095) / 4096));
+    auto      First  = [&](INT i) { return (INT)((SQWORD)Triangles * i / Chunks); };
+    FLOAT     ChunkBox[RdxSphere::WorkersMost][6];
+    RdxSphere::OnThreads(Chunks, 1, Chunks, [&](int i, int) {
+        FLOAT* const Box = ChunkBox[i];
         for (INT a = 0; a < 3; a++)
         {
-            if (C[a] - S[3] < BoxMin[a]) BoxMin[a] = C[a] - S[3];
-            if (C[a] + S[3] > BoxMax[a]) BoxMax[a] = C[a] + S[3];
+            Box[a]     = 1.0e30f;
+            Box[a + 3] = -1.0e30f;
         }
-    }
+        for (INT t = First(i); t < First(i + 1); t++)
+        {
+            const FLOAT* const V = Xyz + t * 9;
+            const FLOAT C[3] = { (V[0] + V[3] + V[6]) / 3.0f, (V[1] + V[4] + V[7]) / 3.0f, (V[2] + V[5] + V[8]) / 3.0f };
+            FLOAT R2 = 0.0f;
+            for (INT k = 0; k < 3; k++)
+            {
+                const FLOAT DX = V[k * 3] - C[0], DY = V[k * 3 + 1] - C[1], DZ = V[k * 3 + 2] - C[2];
+                const FLOAT D2 = DX * DX + DY * DY + DZ * DZ;
+                if (D2 > R2)
+                    R2 = D2;
+            }
+            FLOAT* const S = WorldSpheres + t * 4;
+            S[0] = C[0];
+            S[1] = C[1];
+            S[2] = C[2];
+            S[3] = appSqrt(R2) + 0.5f;
+            for (INT a = 0; a < 3; a++)
+            {
+                if (C[a] - S[3] < Box[a]) Box[a] = C[a] - S[3];
+                if (C[a] + S[3] > Box[a + 3]) Box[a + 3] = C[a] + S[3];
+            }
+        }
+    });
+    FLOAT BoxMin[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
+    FLOAT BoxMax[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+    for (INT i = 0; i < Chunks; i++)
+        for (INT a = 0; a < 3; a++)
+        {
+            BoxMin[a] = Min(BoxMin[a], ChunkBox[i][a]);
+            BoxMax[a] = Max(BoxMax[a], ChunkBox[i][a + 3]);
+        }
 
     CellSize = 512.0f;
     for (;;)
@@ -832,7 +863,8 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
     GridMin[2] = BoxMin[2];
 
     CellStart = (INT*)appMalloc((GridCells + 1) * sizeof(INT), TEXT("RdxShadowCells"));
-    INT* const Fill = (INT*)appMalloc(GridCells * sizeof(INT), TEXT("RdxShadowFill"));
+    // Each run's count in each cell, then where its next reference in the cell goes.
+    INT* const Fill = (INT*)appMalloc((SIZE_T)Chunks * GridCells * sizeof(INT), TEXT("RdxShadowFill"));
     if (!CellStart || !Fill)
     {
         if (Fill)
@@ -841,26 +873,51 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
         return 0;
     }
     appMemzero(CellStart, (GridCells + 1) * sizeof(INT));
-    for (INT t = 0; t < Triangles; t++)
-    {
-        const FLOAT* const S = WorldSpheres + t * 4;
-        INT X0, X1, Y0, Y1, Z0, Z1;
-        CellRange(S[0], S[3], GridMin[0], CellSize, GridX, X0, X1);
-        CellRange(S[1], S[3], GridMin[1], CellSize, GridY, Y0, Y1);
-        CellRange(S[2], S[3], GridMin[2], CellSize, GridZ, Z0, Z1);
-        if ((X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1) > 64)
+    appMemzero(Fill, (SIZE_T)Chunks * GridCells * sizeof(INT));
+    INT ChunkBig[RdxSphere::WorkersMost];
+    RdxSphere::OnThreads(Chunks, 1, Chunks, [&](int i, int) {
+        INT* const Own = Fill + (SIZE_T)i * GridCells;
+        ChunkBig[i]    = 0;
+        for (INT t = First(i); t < First(i + 1); t++)
         {
-            BigCount++;
-            continue;
+            const FLOAT* const S = WorldSpheres + t * 4;
+            INT X0, X1, Y0, Y1, Z0, Z1;
+            CellRange(S[0], S[3], GridMin[0], CellSize, GridX, X0, X1);
+            CellRange(S[1], S[3], GridMin[1], CellSize, GridY, Y0, Y1);
+            CellRange(S[2], S[3], GridMin[2], CellSize, GridZ, Z0, Z1);
+            if ((X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1) > 64)
+            {
+                ChunkBig[i]++;
+                continue;
+            }
+            for (INT z = Z0; z <= Z1; z++)
+                for (INT y = Y0; y <= Y1; y++)
+                    for (INT x = X0; x <= X1; x++)
+                        Own[(z * GridY + y) * GridX + x]++;
         }
-        for (INT z = Z0; z <= Z1; z++)
-            for (INT y = Y0; y <= Y1; y++)
-                for (INT x = X0; x <= X1; x++)
-                    CellStart[(z * GridY + y) * GridX + x + 1]++;
+    });
+    BigCount = 0;
+    INT BigFirst[RdxSphere::WorkersMost];
+    for (INT i = 0; i < Chunks; i++)
+    {
+        BigFirst[i] = BigCount;
+        BigCount += ChunkBig[i];
     }
+    // The cells' starts, and each run's first place in each cell after the runs before it.
+    INT At = 0;
     for (INT c = 0; c < GridCells; c++)
-        CellStart[c + 1] += CellStart[c];
-    const INT Refs = CellStart[GridCells];
+    {
+        CellStart[c] = At;
+        for (INT i = 0; i < Chunks; i++)
+        {
+            INT& Own = Fill[(SIZE_T)i * GridCells + c];
+            const INT Count = Own;
+            Own = At;
+            At += Count;
+        }
+    }
+    CellStart[GridCells] = At;
+    const INT Refs = At;
     CellTris = (INT*)RdxAllocLarge((SIZE_T)Max(Refs, 1) * sizeof(INT));
     BigTris  = (INT*)appMalloc(Max(BigCount, 1) * sizeof(INT), TEXT("RdxShadowBigTris"));
     if (!CellTris || !BigTris)
@@ -869,28 +926,27 @@ UBOOL FShadowMaps::BuildWorldGrid(const FLOAT* Xyz, INT Triangles)
         FreeWorldGrid();
         return 0;
     }
-    appMemcpy(Fill, CellStart, GridCells * sizeof(INT));
-    INT Big = 0;
-    for (INT t = 0; t < Triangles; t++)
-    {
-        const FLOAT* const S = WorldSpheres + t * 4;
-        INT X0, X1, Y0, Y1, Z0, Z1;
-        CellRange(S[0], S[3], GridMin[0], CellSize, GridX, X0, X1);
-        CellRange(S[1], S[3], GridMin[1], CellSize, GridY, Y0, Y1);
-        CellRange(S[2], S[3], GridMin[2], CellSize, GridZ, Z0, Z1);
-        if ((X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1) > 64)
+    RdxSphere::OnThreads(Chunks, 1, Chunks, [&](int i, int) {
+        INT* const Own = Fill + (SIZE_T)i * GridCells;
+        INT        Big = BigFirst[i];
+        for (INT t = First(i); t < First(i + 1); t++)
         {
-            BigTris[Big++] = t;
-            continue;
+            const FLOAT* const S = WorldSpheres + t * 4;
+            INT X0, X1, Y0, Y1, Z0, Z1;
+            CellRange(S[0], S[3], GridMin[0], CellSize, GridX, X0, X1);
+            CellRange(S[1], S[3], GridMin[1], CellSize, GridY, Y0, Y1);
+            CellRange(S[2], S[3], GridMin[2], CellSize, GridZ, Z0, Z1);
+            if ((X1 - X0 + 1) * (Y1 - Y0 + 1) * (Z1 - Z0 + 1) > 64)
+            {
+                BigTris[Big++] = t;
+                continue;
+            }
+            for (INT z = Z0; z <= Z1; z++)
+                for (INT y = Y0; y <= Y1; y++)
+                    for (INT x = X0; x <= X1; x++)
+                        CellTris[Own[(z * GridY + y) * GridX + x]++] = t;
         }
-        for (INT z = Z0; z <= Z1; z++)
-            for (INT y = Y0; y <= Y1; y++)
-                for (INT x = X0; x <= X1; x++)
-                {
-                    const INT c = (z * GridY + y) * GridX + x;
-                    CellTris[Fill[c]++] = t;
-                }
-    }
+    });
     appFree(Fill);
     RdxLog(TEXT("shadow maps: the level grid is %ix%ix%i, cell %.0f units, %i references, %i large triangles (%.1f MB)"),
            GridX, GridY, GridZ, CellSize, Refs, BigCount,
@@ -1447,6 +1503,17 @@ void FShadowMaps::BeginFrame(INT FrameIndex)
             RefuseLists(TEXT("the frame's vertex buffers"), ActorWanted);
             ActorWanted = ActorRoom[FrameSlot];
         }
+    }
+    // After a level's change, the slot's two back to what this level asks for (and no less than they begin with), the
+    // same way and at the same time they grow.
+    if (bReady && ActorShrink[FrameSlot])
+    {
+        ActorShrink[FrameSlot] = 0;
+        const INT Want = Max(ActorWanted + ActorWanted / 2, (INT)FIRST_ACTOR_VERTICES);
+        const INT Was  = ActorRoom[FrameSlot];
+        if (Was > Want && MakeActorBuffers(FrameSlot, Want))
+            RdxLog(TEXT("shadow maps: frame slot %i's casters' buffers back from %i to %i vertices at a new level"),
+                   FrameSlot, Was, ActorRoom[FrameSlot]);
     }
     // BACKEND_FRAME_COUNT frames are in flight at most: a frame after that an old level's buffer is nobody's.
     for (INT k = 0; k < RETIRED_WORLD_MOST; k++)

@@ -26,9 +26,6 @@ void RdxShaderCacheDisable();
 // The start's warm-up is over (FBackend::WarmShaders): every shader compiled from here on is named in the log, as one
 // the warm-up should have made.
 void RdxShaderWarmDone();
-// How many shaders the start read from the cache's file: none where there was no file (a first start, the file
-// deleted, the cache off) - then the start compiles every shader the renderer has.
-INT  RdxShaderCacheRead();
 
 // Somebody to tell before every shader that goes through the compiler - not one read from the file - on the thread
 // that asked for it: the start's caption, which says that shaders are being compiled (FBackend::PresentCompiling).

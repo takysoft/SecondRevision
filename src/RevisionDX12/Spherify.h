@@ -11,7 +11,22 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <process.h>
 #include <xmmintrin.h>
+// The helpers' threads are waited for and let go by their handles (OnThreads). Where nothing has brought Windows' header
+// in yet (the unit tests), the lean part of it, without its min and max and without the drawing part's names.
+#ifndef _WINDOWS_
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#include <windows.h>
+#endif
 // The engine's headers (UnFile.h) make macros of clock, check and verify - the C library's clock among them, whose
 // declaration the threads' header reads: put by meanwhile, and back after.
 #pragma push_macro("clock")
@@ -50,6 +65,12 @@ inline FV3 operator*(FV3 A, double S) { return V3(A.X * S, A.Y * S, A.Z * S); }
 inline double Dot(FV3 A, FV3 B) { return A.X * B.X + A.Y * B.Y + A.Z * B.Z; }
 inline FV3 Cross(FV3 A, FV3 B) { return V3(A.Y * B.Z - A.Z * B.Y, A.Z * B.X - A.X * B.Z, A.X * B.Y - A.Y * B.X); }
 inline double Length(FV3 A) { return sqrt(Dot(A, A)); }
+
+// A place in single precision: as the renderer draws it, and as a made level's places are kept (FResult::Compact).
+struct FV3f
+{
+    float X, Y, Z;
+};
 
 // An angle brought into -pi .. pi.
 inline double Wrap(double A) { return A - 2.0 * Pi * floor((A + Pi) / (2.0 * Pi)); }
@@ -99,8 +120,30 @@ inline float  MaxOf(float X, float Y) { return GreaterOf(X, Y); }
 // threads is free - the caller's own (Worker 0) among them -, Worker a thread's number, for scratch room of its own. One
 // item's work must not write what another's reads, nor depend on which went first: then what comes out is the same, to
 // the bit, on any number of threads. A helper takes the caller's floating-point state (the SSE control word, the x87
-// one) before it starts, so it rounds as the caller does; one that will not start leaves its share to the others.
+// one) before it starts, so it rounds as the caller does, and runs at the caller's priority - a job beside the game
+// below the game's threads keeps its helpers there too; one that will not start leaves its share to the others.
+// The helpers are the C library's threads, started with their numbers in the caller's frame, which outlives them: no
+// std::thread, which takes its callable from the global operator new and frees it on the thread it ran - in the game
+// the engine's allocator, which is not thread-safe: helpers ending together would corrupt its lists.
 static const int WorkersMost = 8;
+template <typename W> struct FWorkerStart
+{
+    const W*     Work   = nullptr;
+    int          Worker = 0;
+    unsigned int Csr    = 0;
+    unsigned int X87    = 0;
+    static unsigned int __stdcall Main(void* Arg)
+    {
+        const FWorkerStart& S = *(const FWorkerStart*)Arg;
+        _mm_setcsr(S.Csr);
+#if defined(_M_IX86)
+        unsigned int Was = 0;
+        __control87_2(S.X87, _MCW_EM | _MCW_IC | _MCW_RC | _MCW_PC, &Was, nullptr);
+#endif
+        (*S.Work)(S.Worker);
+        return 0;
+    }
+};
 template <typename F> inline void OnThreads(int Count, int Run, int Workers, const F& Do)
 {
     if (Workers > WorkersMost)
@@ -114,10 +157,12 @@ template <typename F> inline void OnThreads(int Count, int Run, int Workers, con
         return;
     }
     const unsigned int Csr = _mm_getcsr();
+    unsigned int       X87 = 0;
 #if defined(_M_IX86)
-    unsigned int X87 = 0, Sse = 0;
+    unsigned int Sse = 0;
     __control87_2(0, 0, &X87, &Sse);
 #endif
+    const int        Priority = ::GetThreadPriority(::GetCurrentThread());
     std::atomic<int> Next(0);
     auto Work = [&](int Worker)
     {
@@ -131,31 +176,29 @@ template <typename F> inline void OnThreads(int Count, int Run, int Workers, con
                 Do(i, Worker);
         }
     };
-    std::thread Helper[WorkersMost];
-    int         Started = 0;
+    typedef FWorkerStart<decltype(Work)> FStart;
+    FStart Start[WorkersMost];
+    HANDLE Helper[WorkersMost];
+    int    Started = 0;
     for (int w = 1; w < Workers; w++)
     {
-        try
-        {
-            Helper[Started] = std::thread([&, w]()
-            {
-                _mm_setcsr(Csr);
-#if defined(_M_IX86)
-                unsigned int Was = 0;
-                __control87_2(X87, _MCW_EM | _MCW_IC | _MCW_RC | _MCW_PC, &Was, nullptr);
-#endif
-                Work(w);
-            });
-            Started++;
-        }
-        catch (...)
-        {
+        FStart& S = Start[Started];
+        S.Work    = &Work;
+        S.Worker  = w;
+        S.Csr     = Csr;
+        S.X87     = X87;
+        const uintptr_t H = _beginthreadex(nullptr, 0, &FStart::Main, &S, CREATE_SUSPENDED, nullptr);
+        if (!H)
             break;
-        }
+        ::SetThreadPriority((HANDLE)H, Priority);
+        ::ResumeThread((HANDLE)H);
+        Helper[Started++] = (HANDLE)H;
     }
     Work(0);
+    if (Started > 0)
+        ::WaitForMultipleObjects((DWORD)Started, Helper, TRUE, INFINITE);
     for (int k = 0; k < Started; k++)
-        Helper[k].join();
+        ::CloseHandle(Helper[k]);
 }
 
 // How many threads the work of one rounding may take where it may take them all: the processor's, less one left for the
@@ -164,6 +207,36 @@ inline int WorkersAvailable()
 {
     const unsigned int N = std::thread::hardware_concurrency();
     return (N <= 2) ? 1 : (N - 1 > (unsigned int)WorkersMost) ? WorkersMost : (int)(N - 1);
+}
+
+// Whether a list may take a block of Bytes, asked by its growing (TList) for a block of RoomAskFrom bytes or more: the
+// lists that grow with a level are the ones that come to be that large, and the question is a call into the system.
+// None (the measurements', the tests'): a block is the system's to give or not. The game's (RenderDevice.cpp's
+// SphereRoomFor) says no where the block would leave the process too little of its address space - the list's growing
+// then fails as it does where the system has no room left.
+typedef bool (*FRoomFor)(size_t Bytes);
+inline FRoomFor& RoomFor()
+{
+    static FRoomFor Asked = nullptr;
+    return Asked;
+}
+static const size_t RoomAskFrom = (size_t)1 << 20;
+
+// The bytes every list holds at once, for the log's memory line at each level's load: what stays of them from level to
+// level is the lists' own.
+inline std::atomic<long long>& ListBytesHeld()
+{
+    static std::atomic<long long> Held(0);
+    return Held;
+}
+
+// A rounding no longer wanted while it is made (the level it was for gone, its job waited for to be thrown away): its
+// makers look at this between their parts - never within one, where helpers may be at work - and give up there as they
+// do with no memory. Set by whoever waits for such a job, put back as soon as it has ended.
+inline std::atomic<bool>& Abandoned()
+{
+    static std::atomic<bool> Flag(false);
+    return Flag;
 }
 
 // A growing list of plain data.
@@ -175,23 +248,27 @@ struct TList
     int Room = 0;
 
     TList() {}
-    ~TList() { free(Data); }
+    ~TList()
+    {
+        ListBytesHeld() -= (long long)Room * (long long)sizeof(T);
+        free(Data);
+    }
     TList(const TList&)            = delete;
     TList& operator=(const TList&) = delete;
 
+    // Grown by half again each time, not twice: a list filled as it goes holds at the most half its length spare, where
+    // doubling would hold as much as its length - the largest lists are made so, and held at once.
     bool Reserve(int Want)
     {
         if (Want <= Room)
             return true;
-        int More = Room ? Room : 64;
+        long long More = Room ? Room : 64;
+        // Half again - and one, where half of it is none: a list of room for one would stay one, the loop endless.
         while (More < Want)
-            More *= 2;
-        T* const Grown = (T*)realloc(Data, (size_t)More * sizeof(T));
-        if (!Grown)
-            return false;
-        Data = Grown;
-        Room = More;
-        return true;
+            More += (More > 1) ? More / 2 : 1;
+        if (More > 0x7FFFFFFF)
+            More = Want;
+        return RoomOf(More);
     }
     // The room made Want exactly - a list filled once to a length known ahead, which doubling its way there would leave
     // with up to twice that.
@@ -199,20 +276,45 @@ struct TList
     {
         if (Want <= Room)
             return true;
-        T* const Grown = (T*)realloc(Data, (size_t)Want * sizeof(T));
+        return RoomOf(Want);
+    }
+    // The block made Count long: none where its bytes are more than a size_t counts - a 32-bit build's, a list of
+    // millions of large items - or than RoomFor allows.
+    bool RoomOf(long long Count)
+    {
+        if ((unsigned long long)Count > (unsigned long long)((size_t)-1 / sizeof(T)))
+            return false;
+        const size_t Bytes = (size_t)Count * sizeof(T);
+        if (Bytes >= RoomAskFrom && RoomFor() && !RoomFor()(Bytes))
+            return false;
+        T* const Grown = (T*)realloc(Data, Bytes);
         if (!Grown)
             return false;
+        ListBytesHeld() += (long long)Bytes - (long long)Room * (long long)sizeof(T);
         Data = Grown;
-        Room = Want;
+        Room = (int)Count;
         return true;
     }
     // The list's block handed over and the list left empty: whoever takes it frees it (free).
     T* Release()
     {
+        ListBytesHeld() -= (long long)Room * (long long)sizeof(T);   // no list's any more
         T* const Held = Data;
         Data          = nullptr;
         Num = Room = 0;
         return Held;
+    }
+    // The two lists' blocks traded - a list made aside taking the place of the one in use, in one step.
+    void SwapWith(TList& Other)
+    {
+        T* const  D = Data;
+        const int N = Num, R = Room;
+        Data        = Other.Data;
+        Num         = Other.Num;
+        Room        = Other.Room;
+        Other.Data  = D;
+        Other.Num   = N;
+        Other.Room  = R;
     }
     bool Add(const T& V)
     {
@@ -221,9 +323,11 @@ struct TList
         Data[Num++] = V;
         return true;
     }
+    // A list sized for the first time gets its room exactly: most are sized once to a length known ahead, and a
+    // doubling's spare part would be held as long as they are.
     bool Resize(int N)
     {
-        if (!Reserve(N))
+        if (!(Room == 0 ? ReserveExact(N) : Reserve(N)))
             return false;
         Num = N;
         return true;
@@ -242,12 +346,14 @@ struct TList
         T* const Cut = (T*)realloc(Data, (size_t)Num * sizeof(T));
         if (Cut)
         {
+            ListBytesHeld() -= (long long)(Room - Num) * (long long)sizeof(T);
             Data = Cut;
             Room = Num;
         }
     }
     void Free()
     {
+        ListBytesHeld() -= (long long)Room * (long long)sizeof(T);
         free(Data);
         Data = nullptr;
         Num = Room = 0;
@@ -313,8 +419,26 @@ struct FLightPart
 
 struct FResult
 {
-    // Every place, welded: where it was, and where it is now.
-    TList<FV3> Orig, Moved;
+    // Every place, welded: where it was, and where it is now - in double precision while the level is made, and once it
+    // is made in single (KeptOrig, KeptMoved; Compact), as the renderer draws them, for half the room through the level's
+    // stay. Read by OrigAt and MovedAt, which take either, and counted by Places.
+    TList<FV3>  Orig, Moved;
+    TList<FV3f> KeptOrig, KeptMoved;
+    int         Places() const { return (KeptOrig.Num > 0) ? KeptOrig.Num : Orig.Num; }
+    FV3         OrigAt(int i) const
+    {
+        if (KeptOrig.Num == 0)
+            return Orig.Data[i];
+        const FV3f& P = KeptOrig.Data[i];
+        return V3(P.X, P.Y, P.Z);
+    }
+    FV3 MovedAt(int i) const
+    {
+        if (KeptMoved.Num == 0)
+            return Moved.Data[i];
+        const FV3f& P = KeptMoved.Data[i];
+        return V3(P.X, P.Y, P.Z);
+    }
     // Per input polygon: its first triangle and how many (none: it is drawn as it was).
     TList<int> PolyFirst, PolyTris;
     // Three places a triangle, in the order round it the polygon has; and for each triangle how far the surface has
@@ -337,6 +461,11 @@ struct FResult
     TList<unsigned char> FaceKind;
     TList<FV3>           FaceCorner;
     TList<float> FaceTerm;
+    // And for that lookup, made with the faces: each face's plane as FaceSharesAt makes it - the cross product of the
+    // edges from its first corner to its second and to its last (a triangle's third, a quad's fourth), and that one's
+    // length, four numbers a face - and each moved polygon's faces' corners' box, the lowest X, Y and Z and then the
+    // highest, six numbers a polygon: a point that far outside it lies on none of its faces (MoveOnPolygon).
+    TList<double> FacePlane, PolyBox;
     double       MoveCap    = 0.0;
     double       PolyGridX0 = 0.0, PolyGridY0 = 0.0;
     int          PolyGridW = 0, PolyGridH = 0;
@@ -350,6 +479,11 @@ struct FResult
     TList<int>        PolySideFirst, PolySideCount;
     TList<FLightSide> LightSides;
     TList<FLightPart> LightParts;
+    // Per input polygon its ring of places, the T-junctions put in (LevelRound.h's step 2): from RingFirst, RingCount of
+    // them, in order round it; RingOwn 1 where the place is one of the polygon's own corners. Kept for the bevel
+    // (LevelBevel.h), which cuts the still polygons along their hard edges, and let go after it.
+    TList<int>           Ring, RingFirst, RingCount;
+    TList<unsigned char> RingOwn;
     // The outlines of the moved walls the relief may be drawn on, as their triangles draw them (LevelRound.h's ChordsOf):
     // per input polygon the record of the edge from its first corner, -1 none - the edge from corner k to k + 1 is that
     // record plus k; per record its first point and how many, and the edge's two ends (two a record); per point its place
@@ -377,6 +511,10 @@ struct FResult
     // on such a polygon goes as its drawn triangles go there (LevelRound.h's HoldOnPolygon).
     int                  HeldStopped = 0, HeldEased = 0;
     TList<unsigned char> PlaceHeld, PolyHeld;
+    // Per place the fine bevel moved (LevelBevel.h), its round's outward normal there, a word - each of its numbers in
+    // ten bits, as the card takes a normal (RenderDevice.cpp's PackNormal) -, and 0 for every other place: a place on
+    // the round is shaded by the round's own normal, one beside it by its face's. Empty where no bevel was made.
+    TList<unsigned int> BevelNormal;
     // How long each part took, milliseconds (LevelRound.h's steps): the welding (1), the T-junctions (2), the polygons
     // cut into triangles (3), the shape of them joined into one (4), the flat polygons as one piece each and the
     // surface of their shape (5), all of that made once more where a sheet is held (5 again), the moves - the edges'
@@ -388,24 +526,42 @@ struct FResult
     // How many threads the rounding may take (OnThreads): one, the caller's alone - beside a game that is being played -,
     // or more where it is waited for; what it makes is the same either way.
     int Workers = 1;
+    // How far a cut piece of a curve may stand off it at its middle, in the level's units (LevelRound.h's HighSag at the
+    // spherifier's High): the spherifier's level (RenderMath.h's SpherifierSagOf).
+    float Sag = 0.25f;
+    // A measurement's alone (LevelRoundCheck's): units, the flat polygons' pieces each kept within one cube of this size
+    // - a place taken out onto a neighbour in its own cube only, and no edge turned to join two cubes' places -, for how
+    // the rounding would look made a cube at a time. None (0): each flat polygon one piece, as the renderer draws it.
+    double PieceCube = 0.0;
 
     // The memory its lists take, their room included; and all of it let go (a level left: the renderer's
     // SphereLevelsForget).
     template <class T> static size_t BytesOf(const TList<T>& L) { return (size_t)L.Room * sizeof(T); }
     size_t Bytes() const
     {
-        return BytesOf(Orig) + BytesOf(Moved) + BytesOf(PolyFirst) + BytesOf(PolyTris) + BytesOf(Tri) +
+        return BytesOf(Orig) + BytesOf(Moved) + BytesOf(KeptOrig) + BytesOf(KeptMoved) + BytesOf(PolyFirst) +
+               BytesOf(PolyTris) + BytesOf(Tri) + BytesOf(PolyRelief) + BytesOf(PolyPlane) + BytesOf(Ring) +
+               BytesOf(RingFirst) + BytesOf(RingCount) + BytesOf(RingOwn) +
                BytesOf(TriTurn) + BytesOf(PolyFaceFirst) + BytesOf(PolyFaceCount) + BytesOf(FaceKind) +
-               BytesOf(FaceCorner) + BytesOf(FaceTerm) + BytesOf(PolyGridFirst) + BytesOf(PolyGridCount) +
+               BytesOf(FaceCorner) + BytesOf(FaceTerm) + BytesOf(FacePlane) + BytesOf(PolyBox) +
+               BytesOf(PolyGridFirst) + BytesOf(PolyGridCount) +
                BytesOf(PolyGridItems) + BytesOf(Left) + BytesOf(PolyEdgeKinds) + BytesOf(PolySideFirst) +
                BytesOf(PolySideCount) + BytesOf(LightSides) + BytesOf(LightParts) + BytesOf(PolyChordFirst) +
                BytesOf(ChordFirst) + BytesOf(ChordCount) + BytesOf(ChordEnds) + BytesOf(ChordT) + BytesOf(ChordMove) +
-               BytesOf(PlaceHeld) + BytesOf(PolyHeld);
+               BytesOf(PlaceHeld) + BytesOf(PolyHeld) + BytesOf(BevelNormal);
     }
     void Free()
     {
         Orig.Free();
         Moved.Free();
+        KeptOrig.Free();
+        KeptMoved.Free();
+        PolyRelief.Free();
+        PolyPlane.Free();
+        Ring.Free();
+        RingFirst.Free();
+        RingCount.Free();
+        RingOwn.Free();
         PolyFirst.Free();
         PolyTris.Free();
         Tri.Free();
@@ -415,6 +571,8 @@ struct FResult
         FaceKind.Free();
         FaceCorner.Free();
         FaceTerm.Free();
+        FacePlane.Free();
+        PolyBox.Free();
         PolyGridFirst.Free();
         PolyGridCount.Free();
         PolyGridItems.Free();
@@ -433,6 +591,32 @@ struct FResult
         ChordMove.Free();
         PlaceHeld.Free();
         PolyHeld.Free();
+        BevelNormal.Free();
+    }
+    // The places in single precision, the double ones let go, once nothing is made of them any more: what is drawn of
+    // them is the same, the renderer taking them as FLOATs. False where there was no memory for it - the double ones are
+    // kept then.
+    bool Compact()
+    {
+        if (KeptOrig.Num > 0 || Orig.Num == 0 || Moved.Num != Orig.Num)
+            return true;
+        if (!KeptOrig.ReserveExact(Orig.Num) || !KeptMoved.ReserveExact(Moved.Num))
+        {
+            KeptOrig.Free();
+            KeptMoved.Free();
+            return false;
+        }
+        for (int i = 0; i < Orig.Num; i++)
+        {
+            const FV3 A = Orig.Data[i], B = Moved.Data[i];
+            const FV3f Af = { (float)A.X, (float)A.Y, (float)A.Z }, Bf = { (float)B.X, (float)B.Y, (float)B.Z };
+            KeptOrig.Data[i]  = Af;
+            KeptMoved.Data[i] = Bf;
+        }
+        KeptOrig.Num = KeptMoved.Num = Orig.Num;
+        Orig.Free();
+        Moved.Free();
+        return true;
     }
 };
 

@@ -1190,6 +1190,21 @@ inline bool AddressSpaceLow(int FreeMB)
     return FreeMB >= 0 && FreeMB < AddressSpaceLowMB;
 }
 
+// Whether the renderer may take a block of Bytes of the address space (its spherifier's lists, its large blocks): what is
+// free in all keeps AddressSpaceLowMB after it, and the longest free stretch keeps LongestKeepMB after it. The engine and
+// the driver ask their blocks whole - a texture's upload, a level's sounds -, and a space free only in pieces fails them
+// however much of it is free in all; the stretch kept is several times the largest such block a level's load asks for.
+// The block may be cut out of the longest stretch itself, so it is counted off it. Longest nought: not known - the rule
+// on all that is free alone.
+enum { LongestKeepMB = 128 };
+inline bool AddressRoomFor(unsigned long long Free, unsigned long long Longest, unsigned long long Bytes)
+{
+    const unsigned long long MB = 1ull << 20;
+    if (Free < Bytes + (unsigned long long)AddressSpaceLowMB * MB)
+        return false;
+    return Longest == 0 || Longest >= Bytes + (unsigned long long)LongestKeepMB * MB;
+}
+
 // Where the caption stands: in the top right-hand corner, clear of the game's own column of augmentation icons down the
 // right edge. The game scales its interface with the screen's height; the column was measured at 3840x2160, 178 pixels
 // from the right edge - a little over 8% of the height - so 9% of it leaves a gap. From the top, the caption's own
@@ -1810,17 +1825,18 @@ inline float* SplitTriangle(const float* A, const float* B, const float* C, floa
 // The longest edge the split may leave: the shortest of these that keeps the whole level within Budget triangles - the
 // finer the better for the rays, and the cost is the structure's memory and the one build at the level's load. 0 when
 // even the coarsest would pass the budget: the level goes in as it is.
+// The edges the split may leave, the finest first.
+static const float LevelSplitEdges[6] = { 128.0f, 256.0f, 512.0f, 1024.0f, 2048.0f, 4096.0f };
 inline float LevelSplitEdge(const float* Xyz, int Triangles, int Budget)
 {
-    static const float Edges[6] = { 128.0f, 256.0f, 512.0f, 1024.0f, 2048.0f, 4096.0f };
     for (int e = 0; e < 6; e++)
     {
-        const float Max2 = Edges[e] * Edges[e];
+        const float Max2 = LevelSplitEdges[e] * LevelSplitEdges[e];
         long long Total = 0;
         for (int t = 0; t < Triangles && Total <= Budget; t++)
             Total += SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Max2, LevelSplitDepth);
         if (Total <= Budget)
-            return Edges[e];
+            return LevelSplitEdges[e];
     }
     return 0.0f;
 }
@@ -3560,6 +3576,16 @@ inline bool BspBlocksLightSeeThrough(unsigned int PolyFlags)
     return (PolyFlags & NoOcclude) == 0 || (PolyFlags & RDX_PF_Occlude) != 0;
 }
 
+// The flags the rays' scene takes a level surface by: the ones it is drawn with (its own and its texture's) and, where
+// it bears the editor's sky marker (the texture Marker_sky), the sky's - such a wall, drawn black and solid at a
+// level's edge, stands where the sky is: between Liberty Island's water and the city. Not where the marker is on an
+// invisible surface: that is a blocker or a zone's portal in open space - in a room, in front of a window - which the
+// eye looks through, and so do the rays.
+inline unsigned int RtSurfaceFlags(unsigned int Drawn, bool bSkyMarker)
+{
+    return Drawn | ((bSkyMarker && (Drawn & RDX_PF_Invisible) == 0) ? (unsigned int)RDX_PF_FakeBackdrop : 0u);
+}
+
 // A light's world map at the start of a frame (FShadowMaps::Render). Fresh: drawn from where the light is, within a unit.
 // Stale: the light moved a little since, or its reach shrank - the map serves as it is until its turn comes. Unusable:
 // moved further, or its reach grew past what the map holds - the light waits out of the lookup until the map is drawn
@@ -3988,29 +4014,46 @@ inline EReadout ReadoutStep(EReadout R, int Step)
 
 // How the relief is drawn (Geometry): not at all; as the POM's illusion inside the flat wall; or as real geometry the
 // GPU raises out of the wall from the same height maps (displacement mapping: the wall is tessellated and its points
-// are moved). Both read the same maps, the same list and the same depth number, and their strength is meant to
-// match: the POM carves the relief's depth into the wall, the displacement raises it out by the same depth.
+// are moved), at three densities (GeometryEdgeParts). Both read the same maps, the same list and the same depth
+// number, and their strength is meant to match: the POM carves the relief's depth into the wall, the displacement
+// raises it out by the same depth.
 enum EGeometry
 {
     Geometry_Off = 0,
     Geometry_Pom,
-    Geometry_Tess,
+    Geometry_TessLow,
+    Geometry_TessMedium,
+    Geometry_TessHigh,
     Geometry_Count
 };
 
+// Whether the relief is raised as geometry: displacement mapping, at one of its densities.
+inline bool GeometryRaises(EGeometry G)
+{
+    return G == Geometry_TessLow || G == Geometry_TessMedium || G == Geometry_TessHigh;
+}
+// How long a cut edge of the raised relief may be, as the share of the view's width it is the 1/N of: High's is the
+// density the relief was made at, Medium and Low cut it coarser, its stones' outlines softer near the eye.
+inline int GeometryEdgeParts(EGeometry G)
+{
+    return (G == Geometry_TessLow) ? 480 : (G == Geometry_TessMedium) ? 640 : 960;
+}
+
 // The longest of these with its closing zero: what a buffer for a name has to hold.
-enum { GeometryNameChars = 24 };
+enum { GeometryNameChars = 32 };
 
 inline const char* const* GeometryNames()
 {
-    static const char* const Names[Geometry_Count] = { "Off", "POM", "DisplacementMapping" };
+    static const char* const Names[Geometry_Count] = { "Off", "POM", "DisplacementMappingLow",
+                                                       "DisplacementMappingMedium", "DisplacementMappingHigh" };
     return Names;
 }
 
 // The same as the menu writes them.
 inline const char* GeometryMenuText(EGeometry G)
 {
-    static const char* const Texts[Geometry_Count] = { "OFF", "POM", "DISPLACEMENT MAPPING" };
+    static const char* const Texts[Geometry_Count] = { "OFF", "POM", "DISP. MAP LOW", "DISP. MAP MEDIUM",
+                                                       "DISP. MAP HIGH" };
     return Texts[(G >= 0 && G < Geometry_Count) ? (int)G : 0];
 }
 
@@ -4053,6 +4096,18 @@ inline EGeometry ParseGeometry(const TChar* Text, bool& bKnown)
             bKnown = true;
             return (EGeometry)i;
         }
+    }
+    // The settings file's own text names the displacement mapping by itself (its Geometry part, in Laci's words): that
+    // is High, the density it was made at.
+    static const char* const Plain = "displacementmapping";
+    int k = 0;
+    while (Plain[k] && Text[B + k] &&
+           ((Text[B + k] >= 'A' && Text[B + k] <= 'Z') ? (TChar)(Text[B + k] + 32) : Text[B + k]) == (TChar)Plain[k])
+        k++;
+    if (!Plain[k] && (!Text[B + k] || Text[B + k] == ' ' || Text[B + k] == '\t' || Text[B + k] == '\r'))
+    {
+        bKnown = true;
+        return Geometry_TessHigh;
     }
     return Geometry_Off;
 }
@@ -5487,7 +5542,25 @@ enum EPomFlagBits
     // own axes is worked out in the pixel shader, from how the place and the texture run across the screen.
     PomFlag_Rates      = 512,
     // With Rates: the height read as fine as the screen asks - a bullet hole's own map, with no displacement to match.
-    PomFlag_Fine       = 1024
+    PomFlag_Fine       = 1024,
+    // Measurements only (the marker SecondRevision-relief-measure.txt, the renderer's ReliefMeasure): a part of
+    // Geometry=Tessellation's work left out, to see what it costs - the pixels' relief shading, the covers' walk, every
+    // patch cut once, the held edges, the pixel shader past the texture, the spherifier's move of the patches' points,
+    // all of their lift, and in that move the drawn triangles' lookup or the curve's faces'.
+    PomFlag_NoShade    = 2048,
+    PomFlag_NoClear    = 4096,
+    PomFlag_CutOnce    = 8192,
+    PomFlag_NoHeld     = 16384,
+    PomFlag_TextureOnly = 32768,
+    PomFlag_NoSphere   = 65536,
+    PomFlag_Flat       = 131072,
+    PomFlag_NoPieces   = 262144,
+    PomFlag_NoFaces    = 524288,
+    // A check, the same marker's: the held edges walked with the patch's mask and with every edge, side by side - the
+    // relief drawn black, magenta wherever the two differ in a single bit.
+    PomFlag_CheckHeld  = 1048576,
+    // With it, the control: every edge on both sides, by two ways the compiler cannot tell are the same.
+    PomFlag_CheckSame  = 2097152
 };
 
 // LampShadows: the most of the shadows' lights the relief is lit by in a frame - the shader's rows (RDX_RELIEF_LAMP_MAX).
@@ -7314,7 +7387,9 @@ inline EWetKind WetKindOf(const FWetSurface* List, int Count, const TChar* Packa
 
 // The lamps' bodies' list (SecondRevisionLampSurfaces.txt; docs/terv-nedves-feluletek.md 8.7): a level texture that is
 // a lamp's glass or lens, or an actor class whose model is one - where the puddles' streaks stand. Read as the wet
-// floors' list is: a name and its kind, texture or class, a line each; what follows a ';' is a remark.
+// floors' list is: a name and its kind, texture or class, a line each; what follows a ';' is a remark. A third word,
+// a number, is the lamp's strength: its streak's colour times it - a lamp the list knows to look dimmer than its
+// glass's colour says (its texture dark, its glass low by the floor) given less; 1 where none is written.
 enum ELampKind
 {
     Lamp_None = 0,
@@ -7325,7 +7400,40 @@ struct FLampSurface
 {
     char      Name[WetNameChars];
     ELampKind Kind;
+    float     Strength;
 };
+// The most a lamp's strength may be: past it the line is not read.
+static const float LampStrengthMost = 16.0f;
+
+// Text[From, To) as a number with no sign - digits, at most one point among them - into Out; false where it is not one.
+inline bool LampNumberOf(const char* Text, int From, int To, float& Out)
+{
+    double Whole = 0.0, Part = 0.0, Scale = 1.0;
+    bool   bPoint = false, bDigit = false;
+    for (int k = From; k < To; k++)
+    {
+        const char C = Text[k];
+        if (C == '.' && !bPoint)
+            bPoint = true;
+        else if (C >= '0' && C <= '9')
+        {
+            bDigit = true;
+            if (bPoint)
+            {
+                Scale *= 0.1;
+                Part += (C - '0') * Scale;
+            }
+            else
+                Whole = Whole * 10.0 + (C - '0');
+        }
+        else
+            return false;
+    }
+    if (!bDigit)
+        return false;
+    Out = (float)(Whole + Part);
+    return true;
+}
 
 // Whether Text[From, To) is Word, the case of its letters aside.
 inline bool WetWordIs(const char* Text, int From, int To, const char* Word)
@@ -7338,7 +7446,8 @@ inline bool WetWordIs(const char* Text, int From, int To, const char* Word)
 }
 
 // The list's text (Length bytes; it need not end in a zero) into Out, at most Most of them: how many were read. Bad:
-// the lines that say something and were not read - a kind that is neither, a third word, a name too long, or no room.
+// the lines that say something and were not read - a kind that is neither, a third word that is no strength (a number
+// up to LampStrengthMost), a fourth word, a name too long, or no room.
 inline int ParseLampSurfaces(const char* Text, int Length, FLampSurface* Out, int Most, int& Bad)
 {
     Bad = 0;
@@ -7366,12 +7475,20 @@ inline int ParseLampSurfaces(const char* Text, int Length, FLampSurface* Out, in
         int e = d;
         while (e < Stop && (Text[e] == ' ' || Text[e] == '\t'))
             e++;
+        int f = e;
+        while (f < Stop && Text[f] != ' ' && Text[f] != '\t')
+            f++;
+        int g = f;
+        while (g < Stop && (Text[g] == ' ' || Text[g] == '\t'))
+            g++;
         if (a < Stop)
         {
             const ELampKind Kind = WetWordIs(Text, c, d, "texture") ? Lamp_Texture
                                  : WetWordIs(Text, c, d, "class")   ? Lamp_Class
                                                                     : Lamp_None;
-            if (Kind == Lamp_None || b - a >= WetNameChars || e < Stop || N >= Most)
+            float      Strength  = 1.0f;
+            const bool bStrength = e >= f || (LampNumberOf(Text, e, f, Strength) && Strength <= LampStrengthMost);
+            if (Kind == Lamp_None || b - a >= WetNameChars || !bStrength || g < Stop || N >= Most)
                 Bad++;
             else
             {
@@ -7379,6 +7496,7 @@ inline int ParseLampSurfaces(const char* Text, int Length, FLampSurface* Out, in
                     Out[N].Name[k] = Text[a + k];
                 Out[N].Name[b - a] = 0;
                 Out[N].Kind        = Kind;
+                Out[N].Strength    = Strength;
                 N++;
             }
         }
@@ -7387,13 +7505,13 @@ inline int ParseLampSurfaces(const char* Text, int Length, FLampSurface* Out, in
     return N;
 }
 
-// Whether the list names Name (a texture's package and own name, the readout's form, or a class's name) as a Kind,
-// the case of its letters aside.
+// The list's line that names Name (a texture's package and own name, the readout's form, or a class's name) as a
+// Kind, the case of its letters aside - the first such; -1 none.
 template <typename TChar>
-inline bool LampListed(const FLampSurface* List, int Count, const TChar* Name, ELampKind Kind)
+inline int LampEntryOf(const FLampSurface* List, int Count, const TChar* Name, ELampKind Kind)
 {
     if (!List || !Name)
-        return false;
+        return -1;
     for (int i = 0; i < Count; i++)
     {
         if (List[i].Kind != Kind)
@@ -7402,15 +7520,22 @@ inline bool LampListed(const FLampSurface* List, int Count, const TChar* Name, E
         while (List[i].Name[k] && Name[k] && WetLower((unsigned char)List[i].Name[k]) == WetLower((unsigned)Name[k]))
             k++;
         if (!List[i].Name[k] && !Name[k])
-            return true;
+            return i;
     }
-    return false;
+    return -1;
+}
+
+// Whether the list names Name as a Kind (LampEntryOf).
+template <typename TChar>
+inline bool LampListed(const FLampSurface* List, int Count, const TChar* Name, ELampKind Kind)
+{
+    return LampEntryOf(List, Count, Name, Kind) >= 0;
 }
 
 // A lamp's body for the puddles' streaks: its middle in the world and how far it reaches about it - its glass taken as a
 // ball of that radius, whose size its streak's strength is by -, and the colour its glass shines with, by its
 // brightness; Flicker 1 for a fire's, whose glow wavers (LampFlicker), 0 for a lamp's; and the body's own colour (TR,
-// TG, TB, its strongest 1; all 0: none), the colour its streak takes.
+// TG, TB, its strongest 1 times the list's strength; all 0: none), the colour its streak takes.
 struct FLampBody
 {
     float X, Y, Z;
@@ -7418,7 +7543,48 @@ struct FLampBody
     float R, G, B;
     float Flicker;
     float TR, TG, TB;
+    // Its glass's box in the world, and the glass as it is seen (LampShapeOf): a tube about its axis - the axis's half
+    // along the box's longest side, none for a ball - of radius Tube. Extent stays the ball about the whole body, the
+    // one its place and its sight are asked by.
+    float LoX, LoY, LoZ, HiX, HiY, HiZ;
+    float AxisX, AxisY, AxisZ, Tube;
 };
+
+// A body's box about its middle, Reach each way - an actor's lamp, a fire: a ball's.
+inline void LampBoxAbout(FLampBody& L, float Reach)
+{
+    L.LoX = L.X - Reach;
+    L.LoY = L.Y - Reach;
+    L.LoZ = L.Z - Reach;
+    L.HiX = L.X + Reach;
+    L.HiY = L.Y + Reach;
+    L.HiZ = L.Z + Reach;
+}
+
+// A body's glass as it is seen (FLampBody's AxisX..Tube), out of its box: a tube along the box's longest side, the
+// ball about the body (Extent) narrowed by how much thinner the box is than long - its thickness the larger of its
+// other two sides -, its radius at least Least; its axis's half what the longest side reaches past the tube's round
+// ends. A body no longer than thick - a ball, a cube, a square pane - stays the ball it was; a rod lying along a wall
+// gives back a streak as narrow as it is seen.
+inline void LampShapeOf(FLampBody& L, float Least)
+{
+    const float S[3] = { L.HiX - L.LoX, L.HiY - L.LoY, L.HiZ - L.LoZ };
+    int         Long = 0;
+    for (int k = 1; k < 3; k++)
+        if (S[k] > S[Long])
+            Long = k;
+    float Thick = 0.0f;
+    for (int k = 0; k < 3; k++)
+        if (k != Long && S[k] > Thick)
+            Thick = S[k];
+    const float Narrow = (S[Long] > 0.0f) ? L.Extent * (Thick / S[Long]) : L.Extent;
+    const float Radius = (Narrow > Least) ? Narrow : Least;
+    const float Half   = (0.5f * S[Long] > Radius) ? 0.5f * S[Long] - Radius : 0.0f;
+    L.AxisX = (Long == 0) ? Half : 0.0f;
+    L.AxisY = (Long == 1) ? Half : 0.0f;
+    L.AxisZ = (Long == 2) ? Half : 0.0f;
+    L.Tube  = Radius;
+}
 
 // A fire's glow at Seconds (the level's time), as a share of its light: a sum of three slow waves of its own phase,
 // within LampFlickerDepth either way of the whole.
@@ -7431,8 +7597,9 @@ inline float LampFlicker(float Seconds, float Phase)
 }
 
 // Bodies that stand within Gap of each other, their extents aside, are one lamp - a lantern's several panes: kept as
-// the first of them, at the middle of the two and reaching over both - as long as that reaches no further than Most, a
-// lamp's size: a row of windows side by side stays a row of windows, not one ball over the house. How many are left, the first that many of B.
+// the first of them, at the middle of the two and reaching over both, its box over both boxes - as long as that reaches
+// no further than Most, a lamp's size: a row of windows side by side stays a row of windows, not one ball over the
+// house. How many are left, the first that many of B.
 inline int MergeLampBodies(FLampBody* B, int Count, float Gap, float Most)
 {
     for (int i = 0; i < Count; i++)
@@ -7469,6 +7636,12 @@ inline int MergeLampBodies(FLampBody* B, int Count, float Gap, float Most)
             B[i].Y += DY * T;
             B[i].Z += DZ * T;
             B[i].Extent = Ext;
+            B[i].LoX    = (B[j].LoX < B[i].LoX) ? B[j].LoX : B[i].LoX;
+            B[i].LoY    = (B[j].LoY < B[i].LoY) ? B[j].LoY : B[i].LoY;
+            B[i].LoZ    = (B[j].LoZ < B[i].LoZ) ? B[j].LoZ : B[i].LoZ;
+            B[i].HiX    = (B[j].HiX > B[i].HiX) ? B[j].HiX : B[i].HiX;
+            B[i].HiY    = (B[j].HiY > B[i].HiY) ? B[j].HiY : B[i].HiY;
+            B[i].HiZ    = (B[j].HiZ > B[i].HiZ) ? B[j].HiZ : B[i].HiZ;
             B[j]        = B[--Count];
             j           = i + 1;
         }
@@ -7493,11 +7666,29 @@ inline void LampsByDistance(const float* Dist, int Count, int* Order)
 
 // The room for the lamps whose streaks the puddles take a frame (WetReflect.hlsl's WetLamp; FBackend::SetWetLamps):
 // every lamp due a streak, none left out by a count - this is the most a constant buffer can hold, 4096 rows of four,
-// the count's row and two rows a lamp (its place in the view's space and its glass's radius, its glass's colour), far
-// more than a level's lamps. WetLampBytes: a frame's slot of them - the constant buffer's whole 64 KB, which keeps the
-// next frame's slot on a constant buffer's 256-byte alignment.
+// the count's row and two rows a lamp (its place in the view's space and its glass's radius, its glass's colour and
+// its kind - a fire, or a rod's axis: WetLampKind), far more than a level's lamps. WetLampBytes: a frame's slot of them
+// - the constant buffer's whole 64 KB, which keeps the next frame's slot on a constant buffer's 256-byte alignment.
 enum { WetLampMax = 2047, WetLampBytes = 65536 };
 static_assert(16 * (1 + 2 * WetLampMax) <= WetLampBytes, "a frame's wet lamps fit their slot");
+
+// A lamp's kind as its colour's row carries it to the puddles' streaks (WetReflect.hlsl's WetLampAxis): 1 a fire, 0 a
+// ball of glass, and a rod - a glass as it is seen along one of the level's axes (LampShapeOf) - -(WetLampAxisStep * K
+// + H + 1), its axis the level's K (0 X, 1 Y, 2 Z), its half H; a rod's half is less than the step, as a lamp's ball
+// is less than LampMostRadius.
+static const float WetLampAxisStep = 4096.0f;
+inline float WetLampKind(const FLampBody& L)
+{
+    if (L.Flicker > 0.0f)
+        return 1.0f;
+    const float AX = (L.AxisX < 0.0f) ? -L.AxisX : L.AxisX, AY = (L.AxisY < 0.0f) ? -L.AxisY : L.AxisY;
+    const float AZ = (L.AxisZ < 0.0f) ? -L.AxisZ : L.AxisZ;
+    const float Half = (AX > AY) ? ((AX > AZ) ? AX : AZ) : ((AY > AZ) ? AY : AZ);
+    if (!(Half > 0.0f))
+        return 0.0f;
+    const float K = (AX == Half) ? 0.0f : (AY == Half) ? 1.0f : 2.0f;
+    return -(WetLampAxisStep * K + Half + 1.0f);
+}
 
 // The rain's cover over the wet floors (docs/terv-nedves-feluletek.md 8.4): a grid over the level's X and Y, a cell
 // WetCoverCell units across, each 255 where the floor there sees the sky and 0 where something overhead keeps the rain
@@ -7936,7 +8127,7 @@ inline unsigned int RtLightAverage(const unsigned char* Texels, int Count, float
 //  - In u's and v's fractions of a 4096th: the normal, as two steps of 0..RtNormalSteps-1 on an octahedron
 //    unfolded to a square. A mesh's u and v are bytes over 256, so the fraction is free; it moves a mask's lookup
 //    by a sixteenth of a texel at the most.
-enum { RtCasterKeys = 15, RtNormalSteps = RDX_RT_NORMAL_STEPS };
+enum { RtCasterKeys = RDX_RT_GEO_KEYS, RtNormalSteps = RDX_RT_NORMAL_STEPS };
 inline float PackCasterSlot(int Slot, int Key, bool bOwnLight)
 {
     const int K = (Key >= 0 && Key < RtCasterKeys) ? Key + 1 : 0;
@@ -8055,11 +8246,11 @@ inline float RtLampFalloff(float Share)
 }
 // A caster's row of the mirror rays' table, in numbers (RDX_RT_GEO_BYTES), and where its parts are: its first vertex,
 // its colour (PackRtAlbedo), how much of a texture a unit of the level holds on it (a float's bits), then its light
-// along the six ways (PackRtLight each), and from RtGeoTextures on its textures' places in the texture heap plus
-// one, by key - 0 where the heap does not hold one.
+// along the six ways (PackRtLight each), how many vertices it has, and from RtGeoTextures on its textures' places in
+// the texture heap plus one, by key - 0 where the heap does not hold one.
 enum { RtGeoUints = RDX_RT_GEO_BYTES / 4, RtGeoFirst = 0, RtGeoColour = 1, RtGeoDensity = RDX_RT_GEO_DENSITY / 4,
        RtGeoAmbient = RDX_RT_GEO_AMBIENT / 4, RtGeoScale = RDX_RT_GEO_SCALE / 4, RtGeoCube = RDX_RT_GEO_CUBE / 4,
-       RtGeoTextures = RDX_RT_GEO_TEXTURES / 4 };
+       RtGeoVertices = RDX_RT_GEO_VERTICES / 4, RtGeoTextures = RDX_RT_GEO_TEXTURES / 4 };
 
 // The ripples things make in water (Water=Low and up): a height field over a square of the world around the camera,
 // stepped on the GPU by the wave equation, and pushed wherever something moves through a water surface. RippleTexels
@@ -9777,21 +9968,42 @@ inline void GrassPairOfKey(unsigned long long Key, int& Band, int& X, int& Y, in
 // again for each pass to write into, and a byte they all share is passed over. Where they end up: A or B.
 inline unsigned long long* SortByBytes(unsigned long long* A, unsigned long long* B, int Count)
 {
-    for (int Shift = 0; Shift < 64 && Count > 1; Shift += 8)
+    if (Count < 2)
+        return A;
+    // Each number's byte read where it lies, the lowest first as the machine keeps them: a 64-bit shift by a count not
+    // known when it is compiled is a call of its own in a 32-bit build (_aullshr), for every byte of every number. The
+    // eight bytes counted in one walk over the numbers: a pass puts them in another order, but how many of them have
+    // each value of a byte is the same in any order.
+    int Place[8][256] = {};
     {
-        int Place[256] = {};
+        const unsigned char* const In = (const unsigned char*)A;
         for (int i = 0; i < Count; i++)
-            Place[(A[i] >> Shift) & 255u]++;
-        if (Place[(A[0] >> Shift) & 255u] == Count)
+        {
+            const unsigned char* const N = In + i * 8;
+            Place[0][N[0]]++;
+            Place[1][N[1]]++;
+            Place[2][N[2]]++;
+            Place[3][N[3]]++;
+            Place[4][N[4]]++;
+            Place[5][N[5]]++;
+            Place[6][N[6]]++;
+            Place[7][N[7]]++;
+        }
+    }
+    for (int Byte = 0; Byte < 8; Byte++)
+    {
+        int* const                 P  = Place[Byte];
+        const unsigned char* const In = (const unsigned char*)A + Byte;
+        if (P[In[0]] == Count)
             continue;
         for (int d = 0, Sum = 0; d < 256; d++)
         {
-            const int c = Place[d];
-            Place[d]    = Sum;
+            const int c = P[d];
+            P[d]        = Sum;
             Sum += c;
         }
         for (int i = 0; i < Count; i++)
-            B[Place[(A[i] >> Shift) & 255u]++] = A[i];
+            B[P[In[i * 8]]++] = A[i];
         unsigned long long* const T = A;
         A = B;
         B = T;
@@ -10022,6 +10234,35 @@ inline void TreesName(int L, TChar* Out, int Max)
     Out[k] = (TChar)0;
 }
 
+// The spherifier (Spherifier): the level's and the models' round shapes rounded, or not - at three levels of how finely
+// their curves are cut. A level's curve is cut into pieces standing off it by no more than SpherifierSagOf units at
+// their middles (LevelRound.h), a model's by no more than as many quarters of a pixel (RenderDevice.cpp's MeshSag): High
+// as the spherifier was made, Medium and Low coarser - fewer pieces, rounder near the eye at High.
+enum { Spherifier_Off = 0, Spherifier_Low = 1, Spherifier_Medium = 2, Spherifier_High = 3, Spherifier_Count = 4 };
+inline float SpherifierSagOf(int L)
+{
+    return (L == Spherifier_Low) ? 1.0f : (L == Spherifier_Medium) ? 0.5f : 0.25f;
+}
+// The Spherifier key's word: Off, Low, Medium, High - and On, the settings file's own word for it (Laci's text), which
+// is Medium, the level Recommended takes; -1 for any other.
+inline int ParseSpherifier(const char* V)
+{
+    static const char* const Names[Spherifier_Count + 1] = { "off", "low", "medium", "high", "on" };
+    const int W = WordOf(V, Names, Spherifier_Count + 1);
+    return (W == Spherifier_Count) ? (int)Spherifier_Medium : W;
+}
+// The Spherifier key's word as the settings file and the log have it.
+template <typename TChar>
+inline void SpherifierName(int L, TChar* Out, int Max)
+{
+    static const char* const Names[Spherifier_Count] = { "Off", "Low", "Medium", "High" };
+    const char* const N = Names[(L >= 0 && L < Spherifier_Count) ? L : 0];
+    int k = 0;
+    for (; N[k] && k < Max - 1; k++)
+        Out[k] = (TChar)N[k];
+    Out[k] = (TChar)0;
+}
+
 // Original (the game's own) or Fixed (the renderer's) - the Fog and Flashlight keys: 1 Fixed, 0 Original, -1 neither.
 inline int OriginalOrFixed(const char* V)
 {
@@ -10063,7 +10304,7 @@ struct FPresetPicture
     bool              bWind;
     bool              bPuddles;         // the floors outdoors wet in the rain (Puddles=On|Off)
     bool              bAntiLag;
-    bool              bSpherifier;      // the level's and the models' round shapes rounded (Spherifier=On|Off)
+    int               Spherifier;       // the level's and the models' round shapes rounded (Spherifier_Off..High)
 };
 
 // The spherifier's distance (SpherifierDistance=<units>, the settings file's alone - no preset and no menu line holds
@@ -10118,7 +10359,7 @@ inline FPresetPicture PresetPicture(EPreset P)
     S.FpsLimit        = bVanilla ? (int)FpsLimit_Off : (int)FpsLimit_Auto;
     S.bVsync          = false;
     S.bFrameGen       = false;
-    S.Geometry        = bVanilla ? Geometry_Off : (bRays ? Geometry_Tess : Geometry_Pom);
+    S.Geometry        = bVanilla ? Geometry_Off : (bRays ? Geometry_TessHigh : Geometry_Pom);
     S.bSoft           = !bVanilla;
     S.bVolumetric     = !bVanilla;
     S.bBlur           = false;
@@ -10139,7 +10380,7 @@ inline FPresetPicture PresetPicture(EPreset P)
     S.bWind           = !bVanilla;
     S.bPuddles        = !bVanilla;
     S.bAntiLag        = false;
-    S.bSpherifier     = !bVanilla;
+    S.Spherifier      = bVanilla ? (int)Spherifier_Off : (bRays ? (int)Spherifier_High : (int)Spherifier_Medium);
     return S;
 }
 

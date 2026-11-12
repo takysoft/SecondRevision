@@ -29,6 +29,11 @@ void  RdxWaterNoteTile(const FSceneNode* Frame, FLOAT X, FLOAT Y, FLOAT XL, FLOA
 // too, a liquid's border or not (the census finds them, RdxMath::FountainFootInPool): its run carries the fountain's
 // foot where the texture's own waves' numbers go - the constants' 24 below zero says so (RdxMath::FountainPoolSheet).
 UBOOL RdxWaterSheet(const FSceneNode* Frame, const FSurfaceInfo& Surface, const FSurfaceFacet& Facet, FLOAT* Consts);
+// Whether node iNode of Model is where a liquid meets the air - a liquid zone on exactly one of its sides, a real zone on
+// the other - and whether surface iSurf is a fountain's pool or chute (the level's census): the surfaces the water's own
+// run draws (RdxWaterSheet), which the spherifier leaves as the level has them.
+UBOOL RdxWaterBorderNode(UModel* Model, INT iNode);
+UBOOL RdxWaterFountainSurf(INT iSurf);
 // The level's surface whose texture mapping a piece of a water's surface is drawn with, or -1 for its own: where one
 // water's surface is made of several of the level's surfaces wearing the same texture laid on differently - a pool's
 // side piece turned against the rest - each piece is drawn as the largest lays the texture on (the census at the level's

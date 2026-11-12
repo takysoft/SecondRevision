@@ -191,6 +191,7 @@ UBOOL FHoloShell::HoldCorners(ID3D12Device* Device, INT Slot, INT Wanted)
     Upload[Slot].Release();
     *Upload[Slot].Slot() = Made.Get();
     Made->AddRef();
+    RdxUploadCensus::Note(Made.Get(), Bd.Width, L"holograms' shells");
     Mapped[Slot] = MadeAt;
     Room[Slot]   = Larger;
     return 1;

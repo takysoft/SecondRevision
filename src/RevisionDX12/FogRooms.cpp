@@ -190,6 +190,7 @@ UBOOL FFogRooms::Init(ID3D12Device* Device)
                                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                           __uuidof(ID3D12Resource), LightUpload[i].VoidSlot())) &&
                 SUCCEEDED(LightUpload[i]->Map(0, &None, &LightMapped[i])) && LightMapped[i];
+        RdxUploadCensus::Note(LightUpload[i].Get(), Bd.Width, L"fog rooms' lights");
         LightRoom[i] = bMade ? (INT)FIRST_LIGHTS : 0;
     }
     if (!bMade)
@@ -237,6 +238,7 @@ UBOOL FFogRooms::HoldLights(ID3D12Device* Device, INT Slot, INT Wanted)
     // The shorter one is let go: the slot's last frame is done on the card by the time a frame records into it.
     LightUpload[Slot]->Unmap(0, nullptr);
     *LightUpload[Slot].Slot() = Made;
+    RdxUploadCensus::Note(Made, Bd.Width, L"fog rooms' lights");
     LightMapped[Slot] = MadeAt;
     RdxLog(TEXT("fog rooms: the lights' list now holds %i (it held %i)"), Larger, LightRoom[Slot]);
     LightRoom[Slot] = Larger;
@@ -373,6 +375,7 @@ UBOOL FFogRooms::SetNodes(ID3D12Device* Device, const FFogNode* List, INT Count)
         NodesUpload.Release();
         return 0;
     }
+    RdxUploadCensus::Note(NodesUpload.Get(), Bd.Width, L"fog rooms' nodes");
     appMemcpy(Mapped, List, (SIZE_T)Count * sizeof(FFogNode));
     NodesUpload->Unmap(0, nullptr);
 

@@ -74,7 +74,12 @@
 #define RDX_RT_GEO_SCALE    16
 // And the engine's own light on it along the world's six ways, where the engine has shown it.
 #define RDX_RT_GEO_CUBE     20
+// And how many vertices it has from its first on: a triangle the host's answer names past them is no triangle of its
+// (an answer traced against another frame's bodies), and its texture places are not read.
+#define RDX_RT_GEO_VERTICES 44
 #define RDX_RT_GEO_TEXTURES 64
+// Its textures' places by key, from RDX_RT_GEO_TEXTURES on: keys 1 to this many (RdxMath::RtCasterKeys).
+#define RDX_RT_GEO_KEYS     15
 // The table's head, before the rows: the camera, the level's numbers, and where the level's lamps are in it
 // (FRtPass::SetLamps) - each lamp RDX_RT_LAMP_BYTES, found by place through RDX_RT_LAMP_BUCKETS lists.
 #define RDX_RT_TABLE_HEAD   64

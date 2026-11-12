@@ -489,7 +489,7 @@ void FPomLibrary::ReadPack(INT Index, const WCHAR* Path)
         BYTE* const Tail = (BYTE*)appMalloc(TailBytes, TEXT("RdxPomZipTail"));
         bOk = Tail && ReadAt(F, (UINT)(FileBytes - TailBytes), Tail, TailBytes) &&
               RdxArchive::ZipEnd(Tail, TailBytes, Items, DirOffset, DirBytes) &&
-              (INT)(DirOffset + DirBytes) <= FileBytes && Items > 0;
+              DirBytes <= (unsigned)FileBytes && DirOffset <= (unsigned)FileBytes - DirBytes && Items > 0;
         if (Tail)
             appFree(Tail);
     }
@@ -1005,6 +1005,7 @@ UBOOL FPomLibrary::Upload(FEntry& E, INT Index, const BYTE* Data, INT Bytes, ID3
                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                __uuidof(ID3D12Resource), (void**)&Upl)))
         return 0;
+    RdxUploadCensus::Note(Upl, BufDesc.Width, L"relief maps");
 
     BYTE* Mapped = nullptr;
     D3D12_RANGE NoRead;

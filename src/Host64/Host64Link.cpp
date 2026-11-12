@@ -85,6 +85,12 @@ bool FHost64Link::Start(ID3D12Device* Dev, const wchar_t* HostExe, uint32_t Want
         Down("no device, or no host to start");
         return false;
     }
+    // The start-up's own copies below are MAX_PATH long, and a copy that does not fit ends the process.
+    if (wcslen(HostExe) >= MAX_PATH)
+    {
+        Down("the host's path is longer than Windows' paths may be");
+        return false;
+    }
     if (::GetFileAttributesW(HostExe) == INVALID_FILE_ATTRIBUTES)
     {
         Down("SecondRevisionHost64.exe is not where the renderer looks for it");

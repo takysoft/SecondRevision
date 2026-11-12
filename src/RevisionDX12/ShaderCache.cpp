@@ -50,7 +50,6 @@ static UBOOL    GTouched     = 0;      // a kept shader's day moved on: written 
 static UBOOL    GWriteFailed = 0;      // said once; not tried again every frame
 static INT      GNewSince    = 0;      // how many of them are new, for the save's line
 static UBOOL    GWarmDone    = 0;      // RdxShaderWarmDone
-static INT      GRead        = 0;      // RdxShaderCacheRead
 static DOUBLE   GLastCompile = 0.0;    // appSeconds of the last compile
 static UINT64   GNow         = 0;      // the system's time when the cache started
 static UINT32   GDllStamp    = 0;
@@ -359,7 +358,8 @@ static INT ReadFrom(const WCHAR* Path, const TCHAR* Where)
         const UINT64      When = ReadU64(H + 16 + EntryChars + TargetChars);
         const UINT32      Len  = ReadU32(H + 16 + EntryChars + TargetChars + 8);
         const UINT32      Sum  = ReadU32(H + 16 + EntryChars + TargetChars + 12);
-        if (At + ShaderHead + Len > (SIZE_T)Got || CheckSum(H + ShaderHead, Len) != Sum)
+        // Held against what is left rather than summed: a damaged length near 4 GB would wrap a 32-bit sum around.
+        if (Len > (SIZE_T)Got - At - ShaderHead || CheckSum(H + ShaderHead, Len) != Sum)
             break;
         FKey K;
         K.A = ReadU64(H);
@@ -374,7 +374,6 @@ static INT ReadFrom(const WCHAR* Path, const TCHAR* Where)
             break;
         At += ShaderHead + Len;
     }
-    GRead = (INT)Taken;
     if (Taken < Count)
     {
         RdxLog(TEXT("shader cache: the file %s is damaged after %u of its %u shaders - the rest are compiled, and the file "
@@ -492,11 +491,6 @@ HRESULT RdxCompile(LPCVOID Source, SIZE_T Length, LPCSTR SourceName, const D3D_S
         RdxLog(TEXT("shaders: %S (%S, %S) compiled after the start - the warm-up (FBackend::WarmShaders) does not make it"),
                SourceName ? SourceName : "?", Entry ? Entry : "?", Target ? Target : "?");
     return Result;
-}
-
-INT RdxShaderCacheRead()
-{
-    return GRead;
 }
 
 void RdxShaderWarmDone()

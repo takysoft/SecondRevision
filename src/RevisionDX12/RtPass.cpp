@@ -4,6 +4,7 @@
 
 #include <d3dcompiler.h>
 #include "ShaderCache.h"
+#include "Spherify.h"
 
 // The far probe's update (FRtPass::UpdateFar), compiled at load time like the other passes that need no shader model 6: a
 // thread a texel of the cube. Its direction, per Direct3D's own cube faces, goes back onto the picture through the world
@@ -129,6 +130,7 @@ UBOOL FRtPass::MakeExclusion(ID3D12Device5* InDevice)
         ExclusionMapped = nullptr;
         return 0;
     }
+    RdxUploadCensus::Note(ExclusionCb.Get(), Cb.Width, L"ray shadows' exclusion");
     appMemzero(ExclusionMapped, (SIZE_T)EXCLUSION_STRIDE * BACKEND_FRAME_COUNT);
     return 1;
 }
@@ -304,6 +306,7 @@ UBOOL FRtPass::HoldTable(FTable& Table, UINT64 Bytes, const TCHAR* What)
     }
     appMemzero(Table.Mapped, (SIZE_T)Want);
     Table.Bytes = Want;
+    RdxUploadCensus::Note(Table.Res.Get(), Want, L"ray tables");
     return 1;
 }
 
@@ -651,6 +654,7 @@ ID3D12Resource* FRtPass::MakeVertexBuffer(const FLOAT* Src, INT Floats, const TC
     }
     appMemcpy(Out, Src, (SIZE_T)Floats * sizeof(FLOAT));
     Res->Unmap(0, nullptr);
+    RdxUploadCensus::Note(Res, (unsigned long long)Floats * sizeof(FLOAT), L"ray vertices");
     return Res;
 }
 
@@ -705,17 +709,53 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
         Longest2 = Max(Longest2, E);
         Over1024 += (E > 1024.0f * 1024.0f) ? 1 : 0;
     }
-    const INT   Budget = Max(Triangles * 4, (INT)RT_LEVEL_TRIANGLES);
-    const FLOAT Edge   = RdxMath::LevelSplitEdge(Xyz, Triangles, Budget);
-    const FLOAT Edge2  = Edge * Edge;
-    INT Pieces = Triangles;
-    if (Edge > 0.0f)
+    const INT Budget = Max(Triangles * 4, (INT)RT_LEVEL_TRIANGLES);
+    // Each triangle's pieces at the split's edge, counted once over the threads and kept (Counts): the budget's
+    // question (RdxMath::LevelSplitEdge's), the card's buffer and the colours' list read them - a large rounded level is
+    // millions of triangles, and the level's load waits for this. No room for them: each counted where it is asked for.
+    const INT   Workers = RdxSphere::WorkersAvailable();
+    WORD* const Counts  = (WORD*)RdxAllocLarge((SIZE_T)Triangles * sizeof(WORD));
+    FLOAT       Edge    = 0.0f;
+    INT         Pieces  = Triangles;
+    if (Counts)
     {
-        Pieces = 0;
-        for (INT t = 0; t < Triangles; t++)
-            Pieces += RdxMath::SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
-                                                  RdxMath::LevelSplitDepth);
+        for (INT e = 0; e < ARRAY_COUNT(RdxMath::LevelSplitEdges) && Edge <= 0.0f; e++)
+        {
+            const FLOAT Try2 = RdxMath::LevelSplitEdges[e] * RdxMath::LevelSplitEdges[e];
+            long long   Part[RdxSphere::WorkersMost];
+            for (INT w = 0; w < RdxSphere::WorkersMost; w++)
+                Part[w] = 0;
+            RdxSphere::OnThreads(Triangles, 4096, Workers, [&](int t, int w) {
+                const INT N = RdxMath::SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Try2,
+                                                          RdxMath::LevelSplitDepth);
+                Counts[t] = (WORD)N;
+                Part[w] += N;
+            });
+            long long Total = 0;
+            for (INT w = 0; w < RdxSphere::WorkersMost; w++)
+                Total += Part[w];
+            if (Total <= Budget)
+            {
+                Edge   = RdxMath::LevelSplitEdges[e];
+                Pieces = (INT)Total;
+            }
+        }
+        if (Edge <= 0.0f)
+            for (INT t = 0; t < Triangles; t++)
+                Counts[t] = 1;
     }
+    else
+    {
+        Edge = RdxMath::LevelSplitEdge(Xyz, Triangles, Budget);
+        if (Edge > 0.0f)
+        {
+            Pieces = 0;
+            for (INT t = 0; t < Triangles; t++)
+                Pieces += RdxMath::SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge * Edge,
+                                                      RdxMath::LevelSplitDepth);
+        }
+    }
+    const FLOAT Edge2 = Edge * Edge;
 
     // On the card's own memory where Card can put them there: the pieces through a batch of the CPU's memory, as many
     // triangles' at a time as it holds - a triangle makes 2^LevelSplitDepth of them at the most.
@@ -730,27 +770,58 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
         {
             const INT    BatchFloats = 1 << 20;
             const INT    MostFloats  = (1 << RdxMath::LevelSplitDepth) * 9;
+            // One triangle's pieces always fit in a batch: the batches below would stand still at one that did not.
+            static_assert(MostFloats <= BatchFloats, "a triangle's pieces fit in one batch");
             FLOAT* const Batch       = (FLOAT*)RdxAllocLarge((SIZE_T)BatchFloats * sizeof(FLOAT));
             FLOAT*       End         = Batch;
             UINT64       Sent        = 0;
             bWritten = Batch ? 1 : 0;
-            for (INT t = 0; t < Triangles && bWritten; t++)
+            // With the pieces counted: a batch the triangles whose pieces fit in it, each split over the threads at its
+            // own place there (At, from the batch's start).
+            INT* const At = (Counts && Batch) ? (INT*)RdxAllocLarge((SIZE_T)(BatchFloats / 9 + 1) * sizeof(INT)) : nullptr;
+            if (At)
             {
-                if ((INT)(End - Batch) + MostFloats > BatchFloats)
+                for (INT t0 = 0; t0 < Triangles && bWritten;)
+                {
+                    INT t1 = t0, Floats = 0;
+                    while (t1 < Triangles && Floats + (INT)Counts[t1] * 9 <= BatchFloats)
+                    {
+                        At[t1 - t0] = Floats;
+                        Floats += (INT)Counts[t1] * 9;
+                        t1++;
+                    }
+                    RdxSphere::OnThreads(t1 - t0, 1024, Workers, [&](int i, int) {
+                        const INT t = t0 + i;
+                        RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
+                                               RdxMath::LevelSplitDepth, Batch + At[i]);
+                    });
+                    const UINT64 Used = (UINT64)Floats * sizeof(FLOAT);
+                    bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
+                    Sent    += Used;
+                    t0       = t1;
+                }
+                RdxFreeLarge(At);
+            }
+            else
+            {
+                for (INT t = 0; t < Triangles && bWritten; t++)
+                {
+                    if ((INT)(End - Batch) + MostFloats > BatchFloats)
+                    {
+                        const UINT64 Used = (UINT64)(End - Batch) * sizeof(FLOAT);
+                        bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
+                        Sent    += Used;
+                        End      = Batch;
+                    }
+                    End = RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
+                                                 RdxMath::LevelSplitDepth, End);
+                }
+                if (bWritten && End > Batch)
                 {
                     const UINT64 Used = (UINT64)(End - Batch) * sizeof(FLOAT);
                     bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
                     Sent    += Used;
-                    End      = Batch;
                 }
-                End = RdxMath::SplitTriangle(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
-                                             RdxMath::LevelSplitDepth, End);
-            }
-            if (bWritten && End > Batch)
-            {
-                const UINT64 Used = (UINT64)(End - Batch) * sizeof(FLOAT);
-                bWritten = Card->WriteCardBuffer(OnCard, Sent, Batch, Used);
-                Sent    += Used;
             }
             bWritten = bWritten && Sent == VbBytes;
             RdxFreeLarge(Batch);
@@ -784,8 +855,11 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
             LevelVb.Release();
             RdxLog(TEXT("ray tracing: the level's triangles could not be put on the card (%i) - the rays see no level"),
                    Pieces);
+            if (Counts)
+                RdxFreeLarge(Counts);
             return;
         }
+        RdxUploadCensus::Note(LevelVb.Get(), Desc.Width, L"ray level vertices");
         if (Edge > 0.0f)
         {
             FLOAT* At = Out;
@@ -814,9 +888,10 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
             INT At = 0;
             for (INT t = 0; t < Triangles && At < Pieces; t++)
             {
-                const INT N = (Edge > 0.0f) ? RdxMath::SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6, Edge2,
-                                                                          RdxMath::LevelSplitDepth)
-                                            : 1;
+                const INT N = Counts           ? (INT)Counts[t]
+                              : (Edge > 0.0f) ? RdxMath::SplitTriangleCount(Xyz + t * 9, Xyz + t * 9 + 3, Xyz + t * 9 + 6,
+                                                                             Edge2, RdxMath::LevelSplitDepth)
+                                              : 1;
                 for (INT k = 0; k < N && At < Pieces; k++)
                     MaterialCpu[At++] = Surf[t];
             }
@@ -843,6 +918,8 @@ void FRtPass::SetLevel(const FLOAT* Xyz, INT VertexCount, const DWORD* Surf, con
             RdxLog(TEXT("ray tracing: no memory for the level's colours - the RT water sees the level without them"));
         }
     }
+    if (Counts)
+        RdxFreeLarge(Counts);
     RdxLog(TEXT("ray tracing: the level for the scene - %i triangles (longest edge %.0f units, %i with an edge over 1024), ")
            TEXT("split at %.0f units into %i, in %.1f ms"),
            Triangles, appSqrt(Longest2), Over1024, Edge, Pieces, (appSeconds() - Start) * 1000.0);
@@ -992,9 +1069,18 @@ D3D12_GPU_VIRTUAL_ADDRESS FRtPass::GetLevelMaterial() const
 
 void FRtPass::UploadMaterial(ID3D12GraphicsCommandList* Cmd, INT FrameIndex)
 {
+    const UINT64 Whole   = ((UINT64)PieceCount + (UINT64)RdxMath::RtRecordUints * (UINT64)SurfCount) * sizeof(DWORD);
+    // This frame slot's upload buffer larger than the level needs - a larger level's, or none needed now - let go: the
+    // GPU is done with the slot's frame before (as below), and the upload heap holds it in the address space for as long
+    // as it lives. Made again at the level's own size when the slot next has something to carry.
+    if (FrameIndex >= 0 && FrameIndex < BACKEND_FRAME_COUNT && MaterialUploadBytes[FrameIndex] > Whole)
+    {
+        MaterialUpload[FrameIndex].Release();
+        MaterialUploadMapped[FrameIndex] = nullptr;
+        MaterialUploadBytes[FrameIndex]  = 0;
+    }
     if (!MaterialCpu || (!bMaterialDirty && !bRecordsDirty))
         return;
-    const UINT64 Whole   = ((UINT64)PieceCount + (UINT64)RdxMath::RtRecordUints * (UINT64)SurfCount) * sizeof(DWORD);
     // All of it after SetLevel; otherwise the records that changed, from the first of them to the last.
     const UBOOL  bSome   = (!bMaterialDirty && DirtyLast >= DirtyFirst && DirtyFirst >= 0 && DirtyLast < SurfCount)
                            ? 1 : 0;
@@ -1060,6 +1146,7 @@ void FRtPass::UploadMaterial(ID3D12GraphicsCommandList* Cmd, INT FrameIndex)
             RdxLog(TEXT("ray tracing: the level's colours' upload buffer could not be made"));
             return;
         }
+        RdxUploadCensus::Note(MaterialUpload[FrameIndex].Get(), Whole, L"ray colours");
         MaterialUploadBytes[FrameIndex] = Whole;
     }
     appMemcpy(MaterialUploadMapped[FrameIndex] + From, (const BYTE*)MaterialCpu + From, (SIZE_T)Bytes);
@@ -1135,6 +1222,7 @@ D3D12_GPU_VIRTUAL_ADDRESS FRtPass::PrepareWater(ID3D12GraphicsCommandList* Cmd, 
         appMemzero(Row, RDX_RT_GEO_BYTES);
         Row[RdxMath::RtGeoFirst] = Shadow.GetCasterGeometry(c, Vb, First, Vertices)
             ? (((DWORD)First & 0x7FFFFFFFu) | (Shadow.IsCasterInArena(c) ? 0x80000000u : 0u)) : 0u;
+        Row[RdxMath::RtGeoVertices] = (Vertices > 0) ? (DWORD)Vertices : 0u;
         const FShadowMaps::FCasterRt* const Rt = Shadow.GetCasterRt(c);
         if (!Rt)
         {

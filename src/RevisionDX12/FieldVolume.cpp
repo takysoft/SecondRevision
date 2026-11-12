@@ -461,6 +461,7 @@ UBOOL FFieldVolume::Init(ID3D12Device* Device)
             SUCCEEDED(Device->CreateCommittedResource(&Up, D3D12_HEAP_FLAG_NONE, &Bd, D3D12_RESOURCE_STATE_GENERIC_READ,
                                                       nullptr, __uuidof(ID3D12Resource), NoiseUpload.VoidSlot())) &&
             SUCCEEDED(NoiseUpload->Map(0, &None, &At)) && At;
+    RdxUploadCensus::Note(NoiseUpload.Get(), Bd.Width, L"force fields' noise");
     if (bMade)
     {
         for (INT z = 0; z < NOISE_SIDE; z++)
@@ -534,6 +535,7 @@ UBOOL FFieldVolume::HoldPolygons(ID3D12Device* Device, INT Slot, INT Wanted)
     PolyUpload[Slot].Release();
     *PolyUpload[Slot].Slot() = Made.Get();
     Made->AddRef();
+    RdxUploadCensus::Note(Made.Get(), Bd.Width, L"force fields' polygons");
     PolyMapped[Slot] = MadeAt;
     PolyRoom[Slot]   = Larger;
     return 1;

@@ -39,6 +39,7 @@ using RdxSphere::V3;
 
 static const double OnFace   = 0.01;   // units: a point this near a face's plane lies on it
 static const int    MostPlanes = 8;    // the planes that may bound the worn solid round one point
+static const double MostWear   = 3.0;  // radii: the most a point goes, a wedge just short of a knife's (LevelBevel.h)
 
 struct FEdge
 {
@@ -134,29 +135,104 @@ inline bool OnPlanes(FV3 P, const FV3* Normal, const double* Level, const int* P
     return true;
 }
 
+// The nearest place to P of the solid that the faces of edges Pick (Picks of them, P in each one's band) bound, worn
+// down by Radius: Best its distance and Inner the place - Best 1e300 where they bound none -; how many planes bound it.
+inline int WornNear(const FEdge* Edges, const int* Pick, int Picks, FV3 P, double Radius, double& Best, FV3& Inner);
+
+// Whether edge F's line near P lies behind both of edge E's faces, within OnFace: the two are edges of one convex piece
+// of the solid there - a box's are -, not of two pieces meeting at P, a notch's two sides or two solids touching at a
+// corner, whose planes together bound no solid near it. Near: as far along F as twice the wider band, or the radius.
+inline bool OnePiece(const FEdge& E, const FEdge& F, FV3 P, double Radius)
+{
+    const double Bands = 2.0 * fmax(Radius, fmax(Radius * tan(0.5 * E.Turn), Radius * tan(0.5 * F.Turn)));
+    const double T0    = fmax(0.0, fmin(F.Length, Dot(P - F.From, F.Way)));
+    const double Ts[2] = { fmax(0.0, T0 - Bands), fmin(F.Length, T0 + Bands) };
+    for (int k = 0; k < 2; k++)
+    {
+        const FV3 Q = F.From + F.Way * Ts[k];
+        if (Dot(E.NormalA, Q - E.From) > OnFace || Dot(E.NormalB, Q - E.From) > OnFace)
+            return false;
+    }
+    return true;
+}
+
 } // namespace Detail
 
 // Where the edges' rounds of Radius take P: the moved place and its normal there. How many planes bound the worn solid
 // round P - 0 where no edge's band holds P (Moved is P, Normal untouched); -1 where the solid is too thin there to wear
-// down by the radius (Moved is P).
+// down by the radius (Moved is P). The edges whose bands hold P are taken a piece of the solid at a time - each with
+// those that lie behind its faces and it behind theirs (Detail::OnePiece) -, and the nearest worn place of them all
+// counts: where two pieces meet at P, the solid there is both, and is worn as each is.
 inline int Round(const FEdge* Edges, int Count, FV3 P, double Radius, FV3& Moved, FV3& Normal)
 {
     Moved = P;
+    // The edges whose bands hold P: the bevel hands over at most LevelBevel.h's MostAtPoint.
+    static const int MostHeld = 32;
+    int              Held[MostHeld], Piece[MostHeld];
+    int              H = 0;
+    for (int i = 0; i < Count && H < MostHeld; i++)
+        if (InBand(Edges[i], P, Radius))
+            Held[H++] = i;
+    if (H == 0)
+        return 0;
+    double Best   = 1e300;
+    FV3    Inner  = P;
+    int    Planes = -1;
+    for (int s = 0; s < H; s++)
+    {
+        int G = 0;
+        for (int j = 0; j < H; j++)
+            if (j == s || (Detail::OnePiece(Edges[Held[s]], Edges[Held[j]], P, Radius) &&
+                           Detail::OnePiece(Edges[Held[j]], Edges[Held[s]], P, Radius)))
+                Piece[G++] = Held[j];
+        double    Near = 1e300;
+        FV3       At   = P;
+        const int N    = Detail::WornNear(Edges, Piece, G, P, Radius, Near, At);
+        if (Near < Best)
+        {
+            Best   = Near;
+            Inner  = At;
+            Planes = N;
+        }
+    }
+    if (Best >= 1e300)
+        return -1;
+    if (Best <= Radius * (1.0 + 1e-9))
+        return Planes;
+    Normal = (P - Inner) * (1.0 / Best);
+    Moved  = Inner + Normal * Radius;
+    // A needle's tip - faces meeting at a point as sharply as a knife's two - wears back further than any edge the bevel
+    // rounds: held to MostWear radii along the way, as a wedge just short of a knife's wears.
+    if (Best - Radius > MostWear * Radius)
+        Moved = P + (Moved - P) * (MostWear * Radius / (Best - Radius));
+    return Planes;
+}
+
+namespace Detail
+{
+
+inline int WornNear(const FEdge* Edges, const int* Pick, int Picks, FV3 P, double Radius, double& Best, FV3& Inner)
+{
     FV3    Planes[MostPlanes];
     double Levels[MostPlanes];
     int    N = 0;
-    for (int i = 0; i < Count; i++)
+    for (int j = 0; j < Picks; j++)
     {
-        if (!InBand(Edges[i], P, Radius))
-            continue;
+        const int i = Pick[j];
         const FV3 Faces[2] = { Edges[i].NormalA, Edges[i].NormalB };
         for (int f = 0; f < 2; f++)
         {
+            // One plane where two edges' faces are the same up to the level's own noise - a hair's turn, a twentieth of
+            // a unit - the further in kept: two such planes would meet a third far out along the edge, and the corner
+            // that is truly the solid's would lie outside the other by that hair.
             const double Level = Dot(Faces[f], Edges[i].From) - Radius;
-            bool bKnown = false;
-            for (int k = 0; k < N && !bKnown; k++)
-                bKnown = Length(Planes[k] - Faces[f]) < 1e-9 && fabs(Levels[k] - Level) < 1e-6;
-            if (!bKnown && N < MostPlanes)
+            int          Known = -1;
+            for (int k = 0; k < N && Known < 0; k++)
+                if (Length(Planes[k] - Faces[f]) < 1e-5 && fabs(Levels[k] - Level) < 0.05)
+                    Known = k;
+            if (Known >= 0)
+                Levels[Known] = (Level < Levels[Known]) ? Level : Levels[Known];
+            else if (N < MostPlanes)
             {
                 Planes[N] = Faces[f];
                 Levels[N] = Level;
@@ -164,20 +240,35 @@ inline int Round(const FEdge* Edges, int Count, FV3 P, double Radius, FV3& Moved
             }
         }
     }
+    Best  = 1e300;
+    Inner = P;
     if (N == 0)
         return 0;
+    // Two planes facing each other, as far apart as twice the radius up to the same noise - a plank two radii thick:
+    // the worn solid there is the one plane between them. Left as they come, the hair's turn between them would open
+    // it far along their crossing, past the plank's other faces, which no band here brings in.
+    for (int a = 0; a < N; a++)
+        for (int b = a + 1; b < N; b++)
+            if (Length(Planes[a] + Planes[b]) < 1e-5 && fabs(Levels[a] + Levels[b]) < 0.05)
+            {
+                Levels[a] = 0.5 * (Levels[a] - Levels[b]);
+                Planes[b] = Planes[a] * -1.0;
+                Levels[b] = -Levels[a];
+            }
     // The worn solid's nearest place: of the places on one, two or three of the planes, the nearest that lies within
-    // them all.
-    double Best  = 1e300;
-    FV3    Inner = P;
-    auto   Try   = [&](const int* Pick, int Picks) {
+    // them all. None further than FarRounds radii: a wedge just short of a knife's (LevelBevel.h) wears to within three,
+    // and three planes all but sharing a line meet far out along it, where the solid is not.
+    static const double FarRounds = 32.0;
+    auto                Try       = [&](const int* Which, int Count) {
         FV3 At;
-        if (!Detail::OnPlanes(P, Planes, Levels, Pick, Picks, At))
+        if (!OnPlanes(P, Planes, Levels, Which, Count, At))
             return;
         for (int k = 0; k < N; k++)
             if (Dot(At, Planes[k]) > Levels[k] + 1e-7)
                 return;
         const double D = Length(At - P);
+        if (D > FarRounds * Radius)
+            return;
         if (D < Best)
         {
             Best  = D;
@@ -199,14 +290,10 @@ inline int Round(const FEdge* Edges, int Count, FV3 P, double Radius, FV3& Moved
             }
         }
     }
-    if (Best >= 1e300)
-        return -1;
-    if (Best <= Radius * (1.0 + 1e-9))
-        return N;
-    Normal = (P - Inner) * (1.0 / Best);
-    Moved  = Inner + Normal * Radius;
     return N;
 }
+
+} // namespace Detail
 
 static const double OnLine = 1e-4;   // units: a corner this near a cutting line lies on it
 

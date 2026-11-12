@@ -129,6 +129,8 @@ UBOOL FTextureCache::Init(ID3D12Device* InDevice)
             if (Ring[f]) { Ring[f]->Release(); Ring[f] = nullptr; }
             RingCpu[f] = nullptr;
         }
+        else
+            RdxUploadCensus::Note(Ring[f], RING_SIZE, L"texture ring");
     }
 
     // The thread pool for converting big textures side by side (ConvertLevelsParallel). Not
@@ -380,6 +382,7 @@ UBOOL FTextureCache::SpillAlloc(UINT64 Size, ID3D12Resource*& Buffer, UINT64& Of
         Chunk->Release();
         return 0;
     }
+    RdxUploadCensus::Note(Chunk, ChunkSize, L"texture spill");
     SpillChunk[F][N] = Chunk;
     SpillCount[F]    = N + 1;
     SpillCpu[F]      = Mapped;

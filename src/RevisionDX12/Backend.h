@@ -143,6 +143,9 @@ public:
 
     // See Backend.cpp: what this process uses of the card's memory, and what Windows says it may use.
     void VideoMemoryMB(DOUBLE& Used, DOUBLE& Budget) const;
+    // What this process's card resources hold of the system's memory (the upload and read-back heaps among them), in MB;
+    // negative where DXGI will not say.
+    INT SystemVideoMemoryMB() const;
 
     INT GetWidth()  const { return Width; }
     INT GetHeight() const { return Height; }
@@ -429,6 +432,8 @@ public:
     UBOOL WalkWanted() const { return (Solid.GetCloudsOn() || bFireWanted) ? 1 : 0; }
     // Whether the smoke asked for can be walked at all: what the menu and the readout say beside the switch.
     UBOOL VolumetricsCanRun() const { return (VolumeReady >= 0 && !VolumeOut() && !bCloudListsRefused) ? 1 : 0; }
+    // A level change: the geometry pass's frame buffers back to their first room (FSolidPass::ForgetVertexPeak).
+    void  ForgetVertexPeak() { Solid.ForgetVertexPeak(); }
     // A level change: the puffs followed are the level's that went.
     void  ForgetClouds()
     {
@@ -846,6 +851,15 @@ public:
     void  SetBlendedLast(UBOOL bOn)  { Solid.SetBlendedLast(bOn); }
     UBOOL AddRepeatRun(INT Start, INT Count, INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL bNoSmooth)
     { return bInFrame ? Solid.AddRepeatRun(Start, Count, SrvIndex, LightSrv, Mode, bNoSmooth) : 0; }
+    // The spherifier's pieces drawn from the card (FSolidPass::SphereRoom, SphereRunsNow, AddSphereRun).
+    FLOAT* SphereRoom(INT Words, INT& First)
+    {
+        First = -1;
+        return bInFrame ? Solid.SphereRoom(Words, First) : nullptr;
+    }
+    UBOOL  SphereRunsNow() const { return bInFrame ? Solid.SphereRunsNow() : 0; }
+    UBOOL  AddSphereRun(INT TriCount, INT RecordWord, INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL bNoSmooth)
+    { return bInFrame ? Solid.AddSphereRun(TriCount, RecordWord, SrvIndex, LightSrv, Mode, bNoSmooth) : 0; }
     // One texture's own choice: whether its relief is on, and how deep it goes. Changing it writes the list back,
     // because gathering those choices is the whole point of being able to change one.
     UBOOL PomIsOn(INT Entry) const { return Pom.GetOn(Entry); }
@@ -1298,9 +1312,12 @@ public:
     }
     // The wet floors' measuring view (SecondRevision-wet-view.txt; SolidPass.hlsl's WetScreen.w): 0 none.
     void  RequestWetView(INT View) { WetShowView = (View > 0 && View < 16) ? View : 0; }
+    // A measurement: the pipeline's counts over the world drawn before the shadows (GPU time points 0-1), a frame's mean
+    // logged with the times (ReadGpuTime) - made at the next frame's start.
+    void  RequestGpuStats(UBOOL bWant) { bGpuStats = bWant ? 1 : 0; }
     // The lamps whose streaks the wet floors give back this frame (WetReflect.hlsl's WetLamp; RdxMath::WetLampMax at
     // most): two rows of four a lamp - its place in the world view's space and its glass's radius, its glass's colour by
-    // its brightness. Within a frame; a frame begins without any.
+    // its brightness and its kind (RdxMath::WetLampKind). Within a frame; a frame begins without any.
     void  SetWetLamps(const FLOAT* Lamps, INT Count);
     // How thick the rain falls on the floors this frame (RdxFloorRainThick) and the level's clock its rings run by: the
     // puddles' rings, the late reflection pass's Rays.yz.
@@ -1365,6 +1382,10 @@ public:
     }
     // Trees3D (FSolidPass::AddLeafDraw): a grown plant's leaves, Count instances of the blade from First on, the
     // blade's frame or the flat blade (FrameFirst, FrameIndices); in the motion vectors' pass the frame from MotionFirst.
+    // How the leaves are drawn (FSolidPass::SetLeafDepthMode): 0 their depth first, 1 in one pass, 2 the check.
+    void   SetLeafDepthMode(INT Mode) { Solid.SetLeafDepthMode(Mode); }
+    // A measurement only: kinds of the world's runs left undrawn (FSolidPass::SetWorldSkip).
+    void   SetWorldSkip(INT Kinds) { Solid.SetWorldSkip(Kinds); }
     void   AddLeafDraw(const D3D12_VERTEX_BUFFER_VIEW& Vb, const D3D12_INDEX_BUFFER_VIEW& Ib, INT FrameFirst,
                        INT FrameIndices, INT MotionFirst, INT MotionIndices, INT First, INT Count,
                        D3D12_GPU_VIRTUAL_ADDRESS Block, INT Srv, UBOOL bWorldView)
@@ -1528,9 +1549,9 @@ private:
     // that goes through the compiler (RdxCompileWatch), from the thread that makes the backend, until its start is
     // done; a start with every shader in the cache's file never shows it.
     void  PresentCompiling();
-    // How many shaders the backend's start compiles where the cache's file gave none (no file, or the cache off): every
-    // one the renderer has, made by Init and WarmShaders whatever the settings - the caption's total from its first
-    // moment. Where a shader comes or goes, the start's end says so in the log and this number follows it.
+    // How many shaders the backend's start compiles where the cache's file has none of them (a new renderer, or no
+    // file): every one the renderer has, made by Init and WarmShaders whatever the settings - the caption's total from
+    // its first moment. Where a shader comes or goes, the start's end says so in the log and this number follows it.
     enum { START_SHADERS = 170 };
     static void CompilingWatch(void* Who);
     // The wait while a shader compiles on its own thread (RdxCompileWatch's Wait): AnswerWhile on the thread that makes
@@ -1767,8 +1788,28 @@ private:
     UBOOL                             TimeLive[BACKEND_FRAME_COUNT];     // the set holds a resolved frame not read yet
     // maps, factor, apply, shadows, frame, motion vectors, upscaler, ambient occlusion, the water's copies, the ripples,
     // ..., and through the host: its copies, and its side (the crossing, its work, the draw back); the depth of field;
-    // the fog in its rooms
-    enum { GPU_TIME_PARTS = 22 };
+    // the fog in its rooms; the world drawn before the shadows, and from the shadows' end to the frame's
+    enum { GPU_TIME_PARTS = 24 };
+    // The pipeline's counts (RequestGpuStats): begun at point 0, ended at point 1 - a frame that does not reach it is
+    // ended at its end and left out of the sums. A query may not stay open across a split of the frame's list (a
+    // hand-over to the host, StatsSplit): it is ended before and the next of the frame's GPU_STATS_SEGMENTS begun after,
+    // and the frame's are summed. The sums are D3D12_QUERY_DATA_PIPELINE_STATISTICS's, in its order.
+    enum { GPU_STATS_FIELDS = 11, GPU_STATS_SEGMENTS = 8 };
+    UBOOL                             bGpuStats;
+    UBOOL                             bStatsFailed;
+    TComRef<ID3D12QueryHeap>          StatsHeap;
+    TComRef<ID3D12Resource>           StatsReadback;
+    UINT64*                           StatsMapped;
+    INT                               StatsSeg[BACKEND_FRAME_COUNT];     // the frame's queries begun
+    UBOOL                             StatsOpen[BACKEND_FRAME_COUNT];    // its last one is open
+    UBOOL                             StatsPaused[BACKEND_FRAME_COUNT];  // ended for a split, to be begun again after it
+    UBOOL                             StatsDone[BACKEND_FRAME_COUNT];    // ended at point 1
+    UBOOL                             StatsBad[BACKEND_FRAME_COUNT];     // a split it could not go on after
+    INT                               StatsLive[BACKEND_FRAME_COUNT];    // resolved, not read yet: how many
+    DOUBLE                            StatsSum[GPU_STATS_FIELDS];
+    INT                               StatsFrames;
+    void                              CreateGpuStats();
+    void                              StatsSplit(ID3D12GraphicsCommandList* Cmd, UBOOL bAfter, UBOOL bOk);
     DOUBLE                            TimeSum[GPU_TIME_PARTS];
     DOUBLE                            TimeMax[GPU_TIME_PARTS];
     INT                               TimeCount[GPU_TIME_PARTS];
@@ -2485,11 +2526,29 @@ private:
     TComRef<ID3D12PipelineState>  CausticHalve;
     UBOOL                         bCausticsWanted = 0;    // SetCaustics
     UBOOL                         bCausticsFailed = 0;    // a pass could not be made: no caustics, said once
-    UBOOL                         bCausticsDrawn  = 0;    // the net holds a picture
+    UBOOL                         bCausticsDrawn  = 0;    // a frame has asked for the net: CausticNetConsts hold its waves
     DOUBLE                        CausticStart    = 0.0;
+    // The net's constants as the last frame that asked for it took them at its start (WantCausticNet): its time and
+    // the rest of the splat's four. The net is drawn from them where it is laid on (LayCaustics) - so a frame draws
+    // the net of the waves its own start took, and a frame that lays it on without asking the net of the last frame
+    // that asked for one.
+    FLOAT                         CausticNetConsts[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     UBOOL EnsureCaustics();
+    void  WantCausticNet();
     void  DrawCausticNet(ID3D12GraphicsCommandList* Cmd);
     UBOOL                         bCausticOldNet  = 0;    // SetCausticOldNet
+    // Whether the laying-on has any pixel to light (LayCaustics): a binary occlusion query round the mask's borders,
+    // one a frame slot, resolved into the predicate the net and the laying-on are drawn under - nothing in a liquid,
+    // and the camera in none, and the GPU passes both over: the laying-on would have discarded every pixel, and the
+    // net is read by nothing else. Resolved into a read-back buffer as well, for the log. Made on first use; where it
+    // cannot be, both are drawn as without it (bCausticCountFailed, said once).
+    TComRef<ID3D12QueryHeap>      CausticCountHeap;
+    TComRef<ID3D12Resource>       CausticPredicate;
+    TComRef<ID3D12Resource>       CausticCountReadback;
+    UINT64*                       CausticCountMapped  = nullptr;
+    UBOOL                         bCausticCountFailed = 0;
+    UBOOL                         CausticCounted[BACKEND_FRAME_COUNT] = {};   // the slot's query was resolved
+    UBOOL EnsureCausticCount();
     // The laying-on (LayCaustics). Its mask: a picture of the scene's size that says of every pixel which liquid it
     // lies in (RdxMath::CausticMaskValue), drawn from the liquids' borders - their triangles in an upload buffer, a
     // place for each frame slot - with its view in the texture heap's reserved slots; made on first use, gone with the
@@ -2591,9 +2650,13 @@ private:
     INT                           CausticCamWet     = 0;  // the liquid zone the camera is in, plus one
     UBOOL                         bCausticView      = 0;
     UBOOL                         bCausticsLaid     = 0;
-    // For the log, with the GPU timing's lines: the frames of its window that drew the net, and those that laid it on.
+    // For the log, with the GPU timing's lines: the frames of its window that asked for the net, and those that laid it
+    // on; and the frames whose laying-on is known in it - the camera in a liquid as it was laid on, a count as its frame
+    // slot comes round again - with how many of them drew the net.
     INT                           CausticNetFrames  = 0;
     INT                           CausticLaidFrames = 0;
+    INT                           CausticNetKnown   = 0;
+    INT                           CausticNetDrawn   = 0;
     UBOOL EnsureCausticLay(DXGI_FORMAT Format, UINT Samples);
     UBOOL EnsureCausticBorders();
     UBOOL EnsureCausticMask();

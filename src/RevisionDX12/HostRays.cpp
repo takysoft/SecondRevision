@@ -452,6 +452,8 @@ UBOOL FHostRayFeed::MakeShare(ID3D12Device* Device, FHost64Link& Link, const FRt
             Hr = Device->CreateCommittedResource(&Up, D3D12_HEAP_FLAG_NONE, &UpDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
                                                  nullptr, __uuidof(ID3D12Resource), ListUpload.VoidSlot());
         if (SUCCEEDED(Hr))
+            RdxUploadCensus::Note(ListUpload.Get(), UpDesc.Width, L"host rays' lists");
+        if (SUCCEEDED(Hr))
             Hr = ListUpload->Map(0, nullptr, (void**)&ListMapped);
         // The counts' read-back, the requests' and the passed surfaces': two slots for each hand-over a frame
         // slot's frame may make. Without it the buffers stay as long as they were made.

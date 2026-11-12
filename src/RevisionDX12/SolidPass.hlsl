@@ -133,6 +133,28 @@ float2 JitterUv()
 // With POM_RATES: the height read as fine as the screen asks, not as the bark's displacement builds it - a bullet
 // hole's own map (the renderer's BulletHoleRun), which has no displacement to match.
 #define POM_FINE     1024.0f
+// Measurements only (RdxMath::PomFlag_NoShade and the rest, the renderer's ReliefMeasure): a part of the tessellated
+// relief's work left out - the pixels' relief shading, the covers' walk (ReliefClear), every patch cut once, the held
+// edges (ReliefHeldAt), the pixel shader past the texture, the spherifier's move of the patches' points, and all of
+// the points' lift (the patches drawn flat, cut as ever).
+#define POM_NOSHADE      2048.0f
+#define POM_NOCLEAR      4096.0f
+#define POM_CUTONCE      8192.0f
+#define POM_NOHELD      16384.0f
+#define POM_TEXTUREONLY 32768.0f
+#define POM_NOSPHERE    65536.0f
+#define POM_FLAT       131072.0f
+// Measurements only, inside the spherifier's move of the patches' points (SphereMoveAt): the drawn triangles' lookup
+// (SpherePieceMoveAt) left out, and the curve's faces' lookup (SphereFaceAt).
+#define POM_NOPIECES   262144.0f
+#define POM_NOFACES    524288.0f
+// A check (RdxMath::PomFlag_CheckHeld): the held edges walked with the patch's mask (ReliefHeldMask) and with every
+// edge, side by side - the relief black, blue where the two differ in their last bits only, magenta where by more than
+// a hundred-thousandth (DSRelief's Pom.x).
+#define POM_CHECKHELD 1048576.0f
+// With it, the control (RdxMath::PomFlag_CheckSame): every edge on both sides, by two ways the compiler cannot tell are
+// the same - what the card's compiler makes of the same sums twice.
+#define POM_CHECKSAME 2097152.0f
 // How much of the baked light the lamps' directions reshape, 0..1: the rest of it is taken as coming from all around
 // (the light the level bounces, which the relief shadows little), and stays as it was.
 #define ReliefLampStrength WaterWave.x
@@ -201,6 +223,12 @@ cbuffer WaterLampConsts : register(b2)
 // triangle its three places, sixteen bits each, in two words; the items its triangles over each cell, sixteen bits
 // each, two to a word (LevelRound.h's PackRound).
 ByteAddressBuffer SphereField : register(t20);
+// This frame's room of the spherifier's pieces drawn from the card (FSolidPass::SphereRoom): the runs' records and the
+// views they are drawn in (SphereVertexOutOf). Not in the stages on rays (RDX_RT): their root signature has neither
+// this register nor the field's, and no such run is drawn on rays.
+#ifndef RDX_RT
+ByteAddressBuffer SphereRoom : register(t28);
+#endif
 #define ROUND_HEADER        22u
 #define ROUND_FACE_WORDS    77u
 #define ROUND_CHORD_WORDS   8u
@@ -479,7 +507,7 @@ float SpherePiecePlaneOff(uint At, float3 W, float3 Nl)
     const float  Off   = abs(dot(Plane.xyz, W) - Plane.w);
     return (Off > ROUND_NEAR || abs(dot(Plane.xyz, Nl)) < ROUND_ALONG) ? 1e30f : Off;
 }
-bool SpherePieceMoveAt(float3 W, float3 Nl, out float3 Move, out float3 Normal, out float3 Flat)
+bool SpherePieceMoveAt(float3 W, float3 Nl, uint OwnMask, out float3 Move, out float3 Normal, out float3 Flat)
 {
     Move   = float3(0.0f, 0.0f, 0.0f);
     Normal = Nl;
@@ -505,6 +533,9 @@ bool SpherePieceMoveAt(float3 W, float3 Nl, out float3 Move, out float3 Normal, 
     float Nearest = 1e30f;
     [loop] for (uint i = 0u; i < Count; i++)
     {
+        // The run's own polygons the patch's mask leaves out could take no point of it (ReliefPieceMask).
+        if (Own > 0u && ((OwnMask >> i) & 1u) == 0u)
+            continue;
         const uint P  = (Own > 0u) ? SphereNodes[i >> 2u][i & 3u] : SphereField.Load((First + i) * 4u);
         const uint At = SphereField.Load((PiecesAt + P) * 4u);
         if (At != 0u)
@@ -517,6 +548,8 @@ bool SpherePieceMoveAt(float3 W, float3 Nl, out float3 Move, out float3 Normal, 
     uint   BestAt = 0u, BestT = 0u;
     [loop] for (uint i2 = 0u; i2 < Count && Best < -ROUND_PIECE_INSIDE; i2++)
     {
+        if (Own > 0u && ((OwnMask >> i2) & 1u) == 0u)
+            continue;
         const uint P  = (Own > 0u) ? SphereNodes[i2 >> 2u][i2 & 3u] : SphereField.Load((First + i2) * 4u);
         const uint At = SphereField.Load((PiecesAt + P) * 4u);
         if (At == 0u || SpherePiecePlaneOff(At, W, Nl) > Nearest + ROUND_PIECE_PLANE)
@@ -602,18 +635,28 @@ bool SpherePieceMoveAt(float3 W, float3 Nl, out float3 Move, out float3 Normal, 
 // the same face - towards its inside. Nl, the polygon's own normal, orients it. Where the drawn triangle it lies on is
 // had (SpherePieceMoveAt, bFloor), the place goes where that triangle has it, and its normal is the drawn surface's
 // there, between the triangle's corners: the faces' curve's would stand off the triangles it rises from, and the
-// relief's lines step at their edges. False where W lies on no moved polygon.
-bool SphereMoveAt(float3 W, float3 Tu, float3 Tv, float3 Nl, out float3 Move, out float3 Normal, out bool bFloor,
-                  out float3 Flat)
+// relief's lines step at their edges. False where W lies on no moved polygon. bNoPieces, bNoFaces: measurements only
+// (POM_NOPIECES, POM_NOFACES), the drawn triangles' lookup or the faces' left out.
+bool SphereMoveAt(float3 W, float3 Tu, float3 Tv, float3 Nl, uint OwnMask, out float3 Move, out float3 Normal,
+                  out bool bFloor, out float3 Flat, bool bNoPieces, bool bNoFaces)
 {
     Move   = float3(0.0f, 0.0f, 0.0f);
     Normal = Nl;
-    float3     Piece, PieceNormal;
-    const bool bPiece = SpherePieceMoveAt(W, Nl, Piece, PieceNormal, Flat);
+    float3     Piece = float3(0.0f, 0.0f, 0.0f), PieceNormal = Nl;
+    Flat              = Nl;
+    const bool bPiece = !bNoPieces && SpherePieceMoveAt(W, Nl, OwnMask, Piece, PieceNormal, Flat);
     bFloor            = bPiece;
-    uint   FaceAt, Kind;
-    float3 B, E1, E2;
-    if (!SphereFaceAt(W, Nl, FaceAt, Kind, B, E1, E2))
+    // On a drawn triangle its own move and normal stand, whatever face of the curve the point lies on (below): that
+    // face is not looked for.
+    if (bPiece)
+    {
+        Move   = Piece;
+        Normal = PieceNormal;
+        return true;
+    }
+    uint   FaceAt = 0u, Kind = 0u;
+    float3 B = float3(0.0f, 0.0f, 0.0f), E1 = B, E2 = B;
+    if (bNoFaces || !SphereFaceAt(W, Nl, FaceAt, Kind, B, E1, E2))
     {
         Move   = Piece;
         Normal = PieceNormal;
@@ -643,11 +686,6 @@ bool SphereMoveAt(float3 W, float3 Tu, float3 Tv, float3 Nl, out float3 Move, ou
     {
         Normal = normalize(N);
         Normal = (dot(Normal, Nl) < 0.0f) ? -Normal : Normal;
-    }
-    if (bPiece)
-    {
-        Move   = Piece;
-        Normal = PieceNormal;
     }
     return true;
 }
@@ -703,16 +741,156 @@ float3 SphereTurnedBy(float3 Dir, float3 From, float3 To)
     return SphereViewDir(L * C + cross(K, L) * S + K * (dot(K, L) * (1.0f - C)));
 }
 
+// A direction turned as From turns onto To (both of length one), round their common perpendicular by the angle between
+// them, all three in one space. In a mirror's view, whose axes are turned inside out, both cross products change their
+// sign, so the turn comes out the mirror's image of the level's.
+float3 TurnedFromTo(float3 Dir, float3 From, float3 To)
+{
+    const float3 Ax = cross(From, To);
+    const float  S  = length(Ax), C = dot(From, To);
+    if (S < 1e-6f)
+        return Dir;
+    const float3 K = Ax / S;
+    return Dir * C + cross(K, Dir) * S + K * (dot(K, Dir) * (1.0f - C));
+}
+
 struct VSIn  { float3 Pos : POSITION; float2 Uv : TEXCOORD0; float2 Lv : TEXCOORD1; float4 Colour : COLOR;
                float4 Pom : TEXCOORD2; };
 // View: the point's place in view space, for the relief's lamps (POM_LAMPS). Only a relief run's constants make it
 // right, and only such a run reads it.
+// Surf: the drawn surface's normal in view space where it has turned from its polygon's - on the spherifier's curves
+// and the bevel's round, for the relief's light to turn with it (ReliefTurnTo) -, else nought.
 struct VSOut { float4 Pos : SV_Position; float2 Uv : TEXCOORD0; float2 Lv : TEXCOORD1;
-               float4 Colour : COLOR; float4 Pom : TEXCOORD2; float3 View : TEXCOORD3; };
+               float4 Colour : COLOR; float4 Pom : TEXCOORD2; float3 View : TEXCOORD3; float3 Surf : TEXCOORD4; };
 
-VSOut VSMain(VSIn In)
+// The spherifier's pieces drawn from the card (FSolidPass::AddSphereRun, RenderDevice.cpp's SphereCardOf): a run of
+// them carries SPHERE_RUN_MARK in the screen tint's third number and its record's first word in this frame's room in
+// the first. The level's field holds, once a rounding, each node's triangles - three of its corners each, numbered in
+// the node - and its corners, SPHERE_CORNER_WORDS each: the place in the level's space, how far it moved along its
+// node's plane's normal, and the drawn surface's normal there, packed (RenderDevice.cpp's SphereCardPack). The record
+// (SphereCardRecordOf), SPHERE_RECORD_WORDS: the triangles' and the corners' first words in the field; the light's
+// gain; whether the pixel shader walks a relief; the texture's U and V axes in the view, each with its dot with the
+// mapping's origin, as RenderMath.h's SurfaceCoord takes them; along each, the texture's pan, one over its side, the
+// relief's tiling and the light map's pan; one over the light map's sides; how many triangles and corners; the node's
+// plane's normal in the view and how far behind the relief's patches it is drawn; the relief's axes in the view, each
+// with the texture's units a unit of the level along it; the view's word in the room, the field's size and the depth's
+// scale; the relief's third axis. The view (SphereCardView), SPHERE_VIEW_WORDS: the eye in the level's space and the
+// engine's projection's scale, the view's axes, the first two with the middle of the screen. Each corner is turned,
+// projected and mapped here as the CPU does for a piece (SpherePieceInView, ProjectAsEngine, DrawComplexSurface).
+#define SPHERE_RUN_MARK     0x7FC5A3E1u
+#define SPHERE_RECORD_WORDS 44u         // FSolidPass's
+#define SPHERE_VIEW_WORDS   16u
+#define SPHERE_CORNER_WORDS 5u
+#define SPHERE_ROOM_WORDS   1048576u    // FSolidPass::SPHERE_ROOM_BYTES, in words
+#ifndef RDX_RT
+// A normal packed in a word (RenderDevice.cpp's PackNormal): each of its three numbers in ten bits.
+float3 SphereNormalOf(uint W)
+{
+    const float3 N = float3(float(W & 1023u), float((W >> 10) & 1023u), float((W >> 20) & 1023u)) / 511.5f - 1.0f;
+    const float  L = dot(N, N);
+    return (L > 1e-6f) ? N * rsqrt(L) : float3(0.0f, 0.0f, 0.0f);
+}
+
+// Corner Corner of the run whose record starts at byte R (its first four words Head, the triangles' and the corners'
+// counts Count, its words 36 to 39 Tail) into Out.
+void SphereCornerInto(uint R, uint4 Head, uint2 Count, uint4 Tail, uint Corner, inout VSOut Out)
+{
+    const uint   C        = (Head.y + Corner * SPHERE_CORNER_WORDS) * 4u;
+    const float4 At       = asfloat(SphereField.Load4(C));          // the place, how far it moved along the normal
+    const float3 Nl       = SphereNormalOf(SphereField.Load(C + 16u));
+    const uint   V        = Tail.x * 4u;
+    const float4 Eye      = asfloat(SphereRoom.Load4(V));           // the eye, the projection's scale
+    const float4 Ax       = asfloat(SphereRoom.Load4(V + 16u));     // the view's axes, two with the screen's middle
+    const float4 Ay       = asfloat(SphereRoom.Load4(V + 32u));
+    const float4 Az       = asfloat(SphereRoom.Load4(V + 48u));
+    const float4 AxisU    = asfloat(SphereRoom.Load4(R + 16u));
+    const float4 AxisV    = asfloat(SphereRoom.Load4(R + 32u));
+    const float4 AlongU   = asfloat(SphereRoom.Load4(R + 48u));
+    const float4 AlongV   = asfloat(SphereRoom.Load4(R + 64u));
+    const float2 LightInv = asfloat(SphereRoom.Load2(R + 80u));
+    const float4 Plane    = asfloat(SphereRoom.Load4(R + 96u));     // the node's plane's normal, how far behind
+    // Into the view as the engine turns a point (TransformPointBy); its pictures read where it was, moved as far as it
+    // moved along its plane (RenderDevice.cpp's SphereReadAt); the surface's normal there.
+    const float3 D    = At.xyz - Eye.xyz;
+    const float3 P    = float3(dot(D, Ax.xyz), dot(D, Ay.xyz), dot(D, Az.xyz));
+    const float3 Read = P - Plane.xyz * At.w;
+    const float3 Nv   = float3(dot(Nl, Ax.xyz), dot(Nl, Ay.xyz), dot(Nl, Az.xyz));
+    const float3 N    = (dot(Nv, Nv) > 0.25f) ? normalize(Nv) : Plane.xyz;
+    // Onto the screen as the engine projects (ProjectAsEngine) and VSMain un-projects, written out so that no division
+    // by the depth is left in it: a corner within a unit of the eye, or behind it, is clipped like any other. The depth
+    // is DrawComplexSurface's for a piece, the depth's scale over how far away it is - further back under a relief's
+    // patches (Plane.w). Every number of the four stays one the clipper may cut along a side between two corners: with
+    // nothing pushed back the depth's own number is the scale, the same at every corner; pushed back, it never parts
+    // from its corner's distance, the eye's own place and behind it included.
+    const float Scale = asfloat(Tail.z);
+    Out.Pos.x = P.x * (Eye.w * InvHalfSize.x) + (Ax.w * InvHalfSize.x - 1.0f + Jitter.x) * P.z;
+    Out.Pos.y = -P.y * (Eye.w * InvHalfSize.y) + (1.0f - Ay.w * InvHalfSize.y + Jitter.y) * P.z;
+    Out.Pos.z = (Plane.w > 0.0f) ? Scale * P.z / (max(P.z, 0.0f) + Plane.w) : Scale;
+    Out.Pos.w = P.z;
+    const float OnU = dot(AxisU.xyz, Read) - AxisU.w;
+    const float OnV = dot(AxisV.xyz, Read) - AxisV.w;
+    Out.Uv     = float2((OnU - AlongU.x) * AlongU.y - AlongU.z, (OnV - AlongV.x) * AlongV.y - AlongV.z);
+    Out.Lv     = float2((OnU - AlongU.w) * LightInv.x, (OnV - AlongV.w) * LightInv.y);
+    const float Gain = asfloat(Head.z);
+    Out.Colour = float4(Gain, Gain, Gain, 1.0f);
+    // Where the pixel shader walks a relief: the way to the eye in its axes (RenderMath.h's PomVertex), the axes turned
+    // as the surface turned from its plane there.
+    [branch] if ((Head.w & 1u) != 0u)
+    {
+        const float4 T    = asfloat(SphereRoom.Load4(R + 112u));
+        const float4 B    = asfloat(SphereRoom.Load4(R + 128u));
+        const float3 Np   = asfloat(SphereRoom.Load3(R + 160u));
+        const float3 Tt   = TurnedFromTo(T.xyz, Plane.xyz, N);
+        const float3 Bt   = TurnedFromTo(B.xyz, Plane.xyz, N);
+        const float3 Nt   = TurnedFromTo(Np, Plane.xyz, N);
+        const float  Rate = T.w * B.w;
+        Out.Pom = float4(dot(-P, Tt) * T.w, dot(-P, Bt) * B.w, abs(dot(-P, Nt)), (Rate > 0.0f) ? sqrt(Rate) : 1.0f);
+    }
+    Out.View = P;
+    Out.Surf = N;
+}
+
+// The vertex Id of the run whose record starts at word Record. Nothing is read past the room, the field or the node's
+// own words - a root view has no bounds, and a read through a wrong word takes the card down -, each read in a branch
+// of its own, never laid out of it; a corner that cannot be read lies past the far plane.
+VSOut SphereVertexOutOf(uint Record, uint Id)
 {
     VSOut Out;
+    Out.Pos    = float4(0.0f, 0.0f, -1.0f, 1.0f);
+    Out.Uv     = float2(0.0f, 0.0f);
+    Out.Lv     = float2(0.0f, 0.0f);
+    Out.Colour = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    Out.Pom    = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    Out.View   = float3(0.0f, 0.0f, 1.0f);
+    Out.Surf   = float3(0.0f, 0.0f, 0.0f);
+    [branch] if (Record <= SPHERE_ROOM_WORDS - SPHERE_RECORD_WORDS)
+    {
+        const uint  R     = Record * 4u;
+        const uint4 Head  = SphereRoom.Load4(R);
+        const uint2 Count = SphereRoom.Load2(R + 88u);
+        const uint4 Tail  = SphereRoom.Load4(R + 144u);
+        [branch] if (Id < Count.x * 3u && Head.x + Id < Tail.y && Tail.x <= SPHERE_ROOM_WORDS - SPHERE_VIEW_WORDS)
+        {
+            const uint Corner = SphereField.Load((Head.x + Id) * 4u);
+            [branch] if (Corner < Count.y && Head.y + (Corner + 1u) * SPHERE_CORNER_WORDS <= Tail.y)
+                SphereCornerInto(R, Head, Count, Tail, Corner, Out);
+        }
+    }
+    return Out;
+}
+#endif
+
+VSOut VSMain(VSIn In, uint Id : SV_VertexID)
+{
+    VSOut Out;
+    Out.Surf = float3(0.0f, 0.0f, 0.0f);
+    // A run of the spherifier's pieces drawn from the card: the vertex turned, projected and mapped here
+    // (SphereVertexOutOf). A branch of its own, never flattened: every other run binds neither the room nor, maybe, the
+    // field, and a read of them laid out of the branch would read through whatever their registers hold.
+#ifndef RDX_RT
+    [branch] if (asuint(FlashFog.z) == SPHERE_RUN_MARK)
+        return SphereVertexOutOf(asuint(FlashFog.x), Id);
+#endif
     // The engine hands us vertices that are already projected to pixels, so there is
     // no matrix here - but the perspective divide still has to be undone and redone.
     // With w = 1 the rasteriser interpolates texture coordinates linearly in SCREEN
@@ -984,7 +1162,9 @@ float3 OwnLampsAt(float3 W, float3 N, uint First)
     const float4 Rims  = OwnRow(1u);
     const float4 Fall  = OwnRow(2u);
     const float4 Reach = OwnRow(3u);
-    const uint   Count = (uint)Head.x;
+    // The rows hold RDX_OWN_LAMPS lamps at the most: a count past that is no table's - read on the mirror rays'
+    // see-through layers it made the loop run for seconds, and the card was taken down (docs/d2-weirdfloor-fagyas.md).
+    const uint   Count = min((uint)Head.x, (uint)RDX_OWN_LAMPS);
     float3 Sum = float3(0.0f, 0.0f, 0.0f);
     [loop] for (uint L = First; L < Count; L++)
     {
@@ -1348,13 +1528,37 @@ float PomOcclusion(float2 At, float Height, float Level)
     return saturate(Blocked * 0.12f);
 }
 
+// The relief's own axes at this pixel: the surface's (ReliefAxisU, ReliefAxisV, ReliefNormal), turned as far as the
+// drawn surface has turned from its polygon there - on the spherifier's curves and the bevel's round, where the vertex
+// hands the drawn surface's normal over (VSOut::Surf) -, so that a lamp lights the round as it faces it. Set once a
+// pixel (ReliefTurnTo), before the relief's light is read.
+static float3 ReliefOwnU = float3(1.0f, 0.0f, 0.0f);
+static float3 ReliefOwnV = float3(0.0f, 1.0f, 0.0f);
+static float3 ReliefOwnN = float3(0.0f, 0.0f, 1.0f);
+
+void ReliefTurnTo(float3 Surf)
+{
+    ReliefOwnU = ReliefAxisU;
+    ReliefOwnV = ReliefAxisV;
+    ReliefOwnN = ReliefNormal;
+    const float Len = dot(Surf, Surf);
+    const float Own = dot(ReliefNormal, ReliefNormal);
+    if (Len < 0.25f || Own < 0.25f)
+        return;
+    const float3 From = ReliefNormal * rsqrt(Own);
+    const float3 To   = Surf * rsqrt(Len);
+    ReliefOwnU = TurnedFromTo(ReliefAxisU, From, To);
+    ReliefOwnV = TurnedFromTo(ReliefAxisV, From, To);
+    ReliefOwnN = TurnedFromTo(ReliefNormal, From, To);
+}
+
 // How much of a lamp's light gets to a point of the relief past the relief itself: a walk from the point towards the
 // lamp through the height map, until the walk is above the highest the relief goes. Where the relief rises above the
 // walk the light is cut - softly, by how far it rises above and how near to the point.
 float ReliefLampShadow(float2 Uv, float Height, float Level, float3 L)
 {
-    // The lamp's direction along the surface's own axes; behind the wall it lights nothing.
-    const float3 Lt = float3(dot(L, ReliefAxisU), dot(L, ReliefAxisV), dot(L, ReliefNormal));
+    // The lamp's direction along the surface's own axes as drawn here; behind the surface it lights nothing.
+    const float3 Lt = float3(dot(L, ReliefOwnU), dot(L, ReliefOwnV), dot(L, ReliefOwnN));
     if (Lt.z <= 0.0f)
         return 0.0f;
     // From here up to the top of the relief: how far that is along the wall, in the level's units, then in the
@@ -1417,16 +1621,18 @@ float2 ReliefSlopeAt(float2 Uv, float Level)
     const float  HD    = SceneCopy.SampleLevel(Samp, Uv - float2(0.0f, Texel.y), Level).r;
     return float2(HR - HL, HU - HD) / (2.0f * max(Texel, 1e-6f)) * ReliefRate * PomDepth;
 }
-// The relief's normal for that slope, in the view's space: the surface's own turned along the texture's directions.
+// The relief's normal for that slope, in the view's space: the surface's own as drawn here (ReliefTurnTo) turned
+// along the texture's directions.
 float3 ReliefTilt(float2 Slope)
 {
-    return normalize(ReliefNormal - Slope.x * ReliefAxisU - Slope.y * ReliefAxisV);
+    return normalize(ReliefOwnN - Slope.x * ReliefOwnU - Slope.y * ReliefOwnV);
 }
 
 // The lamps around the relief (POM_LAMPS): a factor for the baked light here, 1 on a flat wall. The light map says how
 // much light reaches the wall, but not where it comes from - the lamps do. Each lamp's share is what it would give the
 // flat wall here: its colour, how near it is within its reach, the angle it falls at. The relief's slope there
-// (ReliefSlopeAt) turns that share up or down (Lambert against the slope over Lambert against the wall), and
+// (ReliefSlopeAt), on the surface as drawn there (a curve's, a round's: ReliefTurnTo), turns that share up or down
+// (Lambert against the slope over Lambert against the flat wall the light map was made for), and
 // ReliefLampShadow takes away what the relief itself shades. Only proportions: the light map's own level stays, and a
 // wall no lamp of the list reaches is left as it was.
 float ReliefLamps(float2 Uv, float Height, float Level, float3 View, float2 Slope)
@@ -1474,6 +1680,7 @@ float ReliefLamps(float2 Uv, float Height, float Level, float3 View, float2 Slop
 // reflection pass. Every other entry point passes false, and the compiler leaves all of it out of theirs.
 float4 PSCoreAny(VSOut In, bool bWet)
 {
+    ReliefTurnTo(In.Surf);
     // The relief, where this surface has a height map. Everything below then works from the place the eye actually
     // reaches INTO the surface rather than the place the flat wall would have shown.
     float2 Uv    = In.Uv;
@@ -1568,7 +1775,12 @@ float4 PSCoreAny(VSOut In, bool bWet)
     // Geometry=Tessellation: the surface already stands out of the wall (DSRelief), so there is nothing to walk - only
     // the shading the relief gives it, from the height map at the texel's own place and at the screen's own copy.
     const bool bTess = PomHas(POM_TESS);
-    if (bTess)
+    if (bTess && PomHas(POM_TEXTUREONLY))
+        return float4(Tex.SampleBias(Samp, Uv, MipBias).rgb, 1.0f);
+    if (bTess && PomHas(POM_CHECKHELD))
+        return (In.Pom.x > 2.0f) ? float4(1.0f, 0.0f, 1.0f, 1.0f)
+                                 : ((In.Pom.x > 0.5f) ? float4(0.0f, 0.3f, 1.0f, 1.0f) : float4(0.0f, 0.0f, 0.0f, 1.0f));
+    if (bTess && !PomHas(POM_NOSHADE))
     {
         const float2 PixU   = RateX / max(PomTexel, 1e-6f);
         const float2 PixV   = RateY / max(PomTexel, 1e-6f);
@@ -1742,6 +1954,26 @@ void PSCover(VSOut In)
     const float4 T = NoSmooth ? Tex.Sample(SampPoint, In.Uv) : Tex.SampleBias(Samp, In.Uv, MipBias);
     clip(T.a - 0.5f);
 #endif
+}
+
+// The leaves' check (FSolidPass's LeafHolePipelines and LeafCheckPipelines, the marker SecondRevision-leaf-depth.txt's
+// 2): their depth pass drawn cyan, their picture's pass magenta where its depth is that depth - cyan left anywhere is a
+// leaf the two passes put in different places. With the holes the picture has, as the covers have them (PSCover).
+float4 PSLeafHole(VSOut In) : SV_Target
+{
+#if !RDX_DEBUG_NOCLIP
+    const float4 T = NoSmooth ? Tex.Sample(SampPoint, In.Uv) : Tex.SampleBias(Samp, In.Uv, MipBias);
+    clip(T.a - 0.5f);
+#endif
+    return float4(0.0f, 1.0f, 1.0f, 1.0f);
+}
+float4 PSLeafCheck(VSOut In) : SV_Target
+{
+#if !RDX_DEBUG_NOCLIP
+    const float4 T = NoSmooth ? Tex.Sample(SampPoint, In.Uv) : Tex.SampleBias(Samp, In.Uv, MipBias);
+    clip(T.a - 0.5f);
+#endif
+    return float4(1.0f, 0.0f, 1.0f, 1.0f);
 }
 #if RDX_LIGHT_TARGET
 // The shadows (Init with stencil kinds): the same colour, and in a second target the light the surface receives - the
@@ -2054,7 +2286,12 @@ void RtOwnHit(inout FRtHit Q, float3 Origin, float3 Way, float From, float To)
     }
     else
     {
-        const uint Info = RtGeoFirst(Q.CommittedGeometryIndex());
+        // The table is a root view, with no bounds: a geometry past this frame's rows (they end where the lamps begin)
+        // stays as it came, and the colouring shows nothing of it (WaterReflectRtSolid).
+        const uint Row = RtGeoRow(Q.CommittedGeometryIndex());
+        [branch] if (Row + RDX_RT_GEO_BYTES > RtWater.Load(32u))
+            return;
+        const uint Info = RtWater.Load(Row);
         const uint At   = ((Info & 0x7FFFFFFFu) + Prim * 3u) * 12u;
         [branch] if ((Info >> 31) != 0u)
         {
@@ -2572,9 +2809,17 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
     const float3 Hit = Sp + Ray * Q.CommittedRayT();       // in the frame around the camera
     if (Q.CommittedInstanceID() == 0u)
     {
-        const uint  Surf = LevelMaterial.Load(Q.CommittedPrimitiveIndex() * 4u);
-        const uint  At   = RtLevel.x + Surf * RDX_RT_RECORD_BYTES;
-        const uint4 Rec  = (Surf < RtLevel.y) ? LevelMaterial.Load4(At) : uint4(0x808080u, 0xFFFFFFFFu, 0u, 0u);
+        // The level's colours and the rows below are root views, which have no bounds: a read past them takes the card
+        // down. So nothing is read for a triangle past the level's pieces (RtLevel.w; an answer traced against another
+        // share's level), and each read stands in a branch of its own - a choice of two values reads both.
+        const uint Prim = Q.CommittedPrimitiveIndex();
+        uint       Surf = 0xFFFFFFFFu;
+        [branch] if (Prim < RtLevel.w)
+            Surf = LevelMaterial.Load(Prim * 4u);
+        const uint At  = RtLevel.x + Surf * RDX_RT_RECORD_BYTES;
+        uint4      Rec = uint4(0x808080u, 0xFFFFFFFFu, 0u, 0u);
+        [branch] if (Surf < RtLevel.y)
+            Rec = LevelMaterial.Load4(At);
         const bool  bOwn = (Rec.x & 0x1000000u) != 0u;
         const float3 Spot = RtEye.xyz + (Hit - Eye);       // the place the ray met, in the level
         // The light of that very spot. Where the engine has made the surface's light map - it makes it for every
@@ -2586,11 +2831,18 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
         float3 L = 1.0f;
         if (!bOwn)
         {
-            float3 N = asfloat(LevelMaterial.Load3(At + RDX_RT_RECORD_NORMAL));
+            // A surface with no record reads none: its normal is the way back along the ray, its light all round none.
+            float3 N = float3(0.0f, 0.0f, 0.0f);
+            uint   Ambient = 0u;
+            [branch] if (Surf < RtLevel.y)
+            {
+                N       = asfloat(LevelMaterial.Load3(At + RDX_RT_RECORD_NORMAL));
+                Ambient = LevelMaterial.Load(At + RDX_RT_RECORD_AMBIENT);
+            }
             N = (dot(N, N) < 0.25f) ? -Ray : normalize(N);
             N = (dot(N, Ray) > 0.0f) ? -N : N;
             const bool bSpecial = (Rec.x & 0x2000000u) != 0u;
-            if (Rec.w != 0u)
+            [branch] if (Rec.w != 0u)
             {
                 const float4 RowU = asfloat(LevelMaterial.Load4(At + RDX_RT_RECORD_LIGHT_ROWS));
                 const float4 RowV = asfloat(LevelMaterial.Load4(At + RDX_RT_RECORD_LIGHT_ROWS + 16u));
@@ -2610,8 +2862,7 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
             }
             else
             {
-                L = (RtLight(LevelMaterial.Load(At + RDX_RT_RECORD_AMBIENT)) + RtLampLight(Spot, N, bSpecial, 0x03u)) *
-                    (asfloat(RtWater.Load(60u)) * LightBoost);
+                L = (RtLight(Ambient) + RtLampLight(Spot, N, bSpecial, 0x03u)) * (asfloat(RtWater.Load(60u)) * LightBoost);
                 // No light map on record, and the zone's light and the lamps the spot sees give it (nearly) none: what
                 // the ray met is nothing the eye is shown - along a pool's wall at its waterline, met by the mirror
                 // rays the waves tilt, it lay as black stripes over the water's edge. Nothing of it in the image, then:
@@ -2638,7 +2889,7 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
         // would show it from as far as the view has come to it: to the mirror, and on along the ray. Its texture's
         // average colour until then. The measuring view 7: the average colour everywhere, as view 4 with no texture.
         float3 Colour = RtAlbedo(Rec.x);
-        if (Rec.z != 0u && RtLevel.z != 7u)
+        [branch] if (Rec.z != 0u && RtLevel.z != 7u)
         {
             const float4 RowU  = asfloat(LevelMaterial.Load4(At + 16u));
             const float4 RowV  = asfloat(LevelMaterial.Load4(At + 32u));
@@ -2654,14 +2905,23 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
     else
     {
         // An actor: the three corners of the triangle the ray met - their texture places, and in those the face's
-        // key, its own light and the corners' normals.
+        // key, its own light and the corners' normals. The rows and the corners are root views, with no bounds: a
+        // geometry past this frame's rows (they end where the lamps begin, RtLampLight's head) or a triangle past its
+        // own vertices (an answer traced against another frame's bodies) shows nothing, and is read no further.
         const uint Row  = RtGeoRow(Q.CommittedGeometryIndex());
+        const uint Prim = Q.CommittedPrimitiveIndex();
+        uint Vertices = 0u;
+        [branch] if (Row + RDX_RT_GEO_BYTES <= RtWater.Load(32u))
+            Vertices = RtWater.Load(Row + RDX_RT_GEO_VERTICES);
+        [branch] if (Prim >= Vertices / 3u)
+            return float4(0.0f, 0.0f, 0.0f, 0.0f);
         const uint Info = RtWater.Load(Row);
         const uint C    = RtWater.Load(Row + 4u);
         bShown = (C & 0x8000000u) == 0u;
-        const uint At   = ((Info & 0x7FFFFFFFu) + Q.CommittedPrimitiveIndex() * 3u) * 12u;
+        const uint At   = ((Info & 0x7FFFFFFFu) + Prim * 3u) * 12u;
         float3 VA, VB, VC;
-        if ((Info >> 31) != 0u)
+        // A branch, not a choice: flattened, the frame's corners would be read in the arena's buffer too, past its end.
+        [branch] if ((Info >> 31) != 0u)
         {
             VA = asfloat(ArenaUvw.Load3(At));
             VB = asfloat(ArenaUvw.Load3(At + 12u));
@@ -2678,11 +2938,13 @@ float4 WaterReflectRtSolid(float3 Eye, float3 Sp, float3 Ray, float3 AX, float3 
         const uint   Face = (uint)(frac(VA.z) * 64.0f + 0.5f);     // twice the key plus one, and the own light's bit
         const bool   bOwn = (C & 0x1000000u) != 0u || (Face & 1u) != 0u;
         const uint   Key  = Face >> 1;
-        const uint   Tex  = (Key != 0u) ? RtWater.Load(Row + RDX_RT_GEO_TEXTURES + (Key - 1u) * 4u) : 0u;
+        uint         Tex  = 0u;
+        [branch] if (Key != 0u && Key <= RDX_RT_GEO_KEYS)
+            Tex = RtWater.Load(Row + RDX_RT_GEO_TEXTURES + (Key - 1u) * 4u);
         // The face's own picture where the texture heap holds it, as fine as the picture would show it from as far
         // as the view has come to it; the caster's average colour otherwise, and in the measuring view 7.
         float3 Colour = RtAlbedo(C);
-        if (Tex != 0u && RtLevel.z != 7u)
+        [branch] if (Tex != 0u && RtLevel.z != 7u)
         {
             const float2 Uv = VA.xy * W0 + VB.xy * Bary.x + VC.xy * Bary.y;
             uint TW, TH;
@@ -2774,12 +3036,18 @@ float4 RtThinOver(float3 Eye, float3 Sp, float3 Ray, float Focal, float Reach, f
             break;
         const float T = Q.CommittedRayT();
         From = T + 0.5f;
-        const uint Surf = LevelMaterial.Load((RtLevel.w + Q.CommittedPrimitiveIndex()) * 4u);
-        if (Surf >= RtLevel.y)
+        // The see-through surfaces' triangles lie from RtLevel.w on, up to where the records begin (RtLevel.x, in
+        // bytes): one past them (an answer traced against another share's) is passed over - a root view has no bounds.
+        // Each read in a branch of its own, so that none of them runs ahead of its test.
+        const uint Prim = Q.CommittedPrimitiveIndex();
+        [branch] if (Prim >= RtLevel.x / 4u - RtLevel.w)
+            continue;
+        const uint Surf = LevelMaterial.Load((RtLevel.w + Prim) * 4u);
+        [branch] if (Surf >= RtLevel.y)
             continue;
         const uint  At  = RtLevel.x + Surf * RDX_RT_RECORD_BYTES;
         const uint4 Rec = LevelMaterial.Load4(At);
-        if (Rec.z == 0u)
+        [branch] if (Rec.z == 0u)
             continue;       // its texture is not in the heap yet
         const uint   Kind  = LevelMaterial.Load(At + RDX_RT_RECORD_KIND);
         const float3 Spot  = RtEye.xyz + (Sp - Eye) + Ray * T;
@@ -3436,6 +3704,8 @@ float3 WaterSurface(VSOut In, out float3 Added)
     float  Behind = Behind0;
     float  Path   = Depth0;                                // how far the view goes through water
     float  Tir    = 0.0f;                              // 1: from below, beyond the critical angle - the surface is a mirror
+    float2 FadeUv = ScreenUv;                          // the bent view's place where it fades into the straight one
+    float  FadeIn = 0.0f;                              // and how much of it is taken (below)
     if (dot(Bent, Bent) > 0.0f && Behind0 < 1.0e5f)
     {
         float2 Guess  = ScreenUv;
@@ -3481,13 +3751,42 @@ float3 WaterSurface(VSOut In, out float3 Added)
         // off the picture, that must not show under the water: there the view goes straight through. The water it is
         // seen through is the bent ray's all the same, down to that depth: by the straight ray's own long way through
         // it a band along the near shore would stand out darker than the bed beside it.
+        // Where the two views meet, the step from one to the other would show as a seam a little way out from the rim:
+        // the furthest share of the way to the bent view's landing whose picture still lies under the water (found by
+        // halving) tells how near the seam the pixel is, and over the last quarter of that way the bent view at that
+        // share fades into the straight one. Further in the straight view alone: a bent view held at the rim's edge
+        // there would draw the same few pixels out into streaks.
         if (Far >= SurfaceZ)
         {
             Uv     = Guess;
             Behind = Far;
         }
         else
-            Path = min(Along0, Depth0);
+        {
+            const float BentPath = Path;
+            float       Lo = 0.0f, Hi = 1.0f;
+            [unroll] for (int h = 0; h < 5; h++)
+            {
+                const float  Mid = 0.5f * (Lo + Hi);
+                const float2 T   = lerp(ScreenUv, Guess, Mid);
+                bool         bOk = all(T >= 0.0f) && all(T <= 1.0f);
+                if (bOk)
+                {
+                    const float  Z    = 1.0f / max(DepthCopy.Load(int3(min(T * Size, Size - 1.0f), 0)).r, 1e-6f);
+                    const float2 TEng = (T - JitterUv()) * (2.0f / InvHalfSize);
+                    const float3 P    = Eye + (TEng.x - WaterScreen.x) * (Z / Focal) * AX +
+                                        (TEng.y - WaterScreen.y) * (Z / Focal) * AY + Z * AZ;
+                    bOk               = Z >= SurfaceZ && (dot(Tilt, P.xy) - P.z) * Up > 0.0f;
+                }
+                if (bOk)
+                    Lo = Mid;
+                else
+                    Hi = Mid;
+            }
+            FadeIn = smoothstep(0.75f, 1.0f, Lo);
+            FadeUv = lerp(ScreenUv, Guess, Lo);
+            Path   = lerp(min(Along0, Depth0), BentPath, FadeIn);
+        }
     }
     else if (dot(Bent, Bent) <= 0.0f)
         Tir = 1.0f;
@@ -3509,7 +3808,12 @@ float3 WaterSurface(VSOut In, out float3 Added)
     }
     // What lies behind the surface, as the copy has it - with the caustics on it already, where the water runs with
     // them (FBackend::LayCaustics): they are light on the bed, and the surface shows them bent with it.
-    const float3 Seen0 = SceneCopy.SampleLevel(Samp, Uv, 0.0f).rgb;
+    float3 Seen0 = SceneCopy.SampleLevel(Samp, Uv, 0.0f).rgb;
+    if (FadeIn > 0.0f)
+    {
+        Seen0 = lerp(Seen0, SceneCopy.SampleLevel(Samp, FadeUv, 0.0f).rgb, FadeIn);
+        Uv    = lerp(Uv, FadeUv, FadeIn);
+    }
     // The deeper, the more of the water's own light instead: the light that reaches the surface (its light map), in
     // the water's hue - so the sea stays dark at night and a lit pool shows its colour. Red goes first, blue last.
     // Kept apart as they are added up, for the shadows (WaterShade): the bed seen through the water takes the shadow of
@@ -3730,6 +4034,7 @@ float2 WaterLiftUv(float2 World)
 VSOut DSWater(WaterPatch C, float3 B : SV_DomainLocation, const OutputPatch<WaterPoint, 3> P)
 {
     VSOut Out;
+    Out.Surf = float3(0.0f, 0.0f, 0.0f);
     float3 View = B.x * P[0].View + B.y * P[1].View + B.z * P[2].View;
     Out.Uv      = B.x * P[0].Uv + B.y * P[1].Uv + B.z * P[2].Uv;
     Out.Lv      = B.x * P[0].Lv + B.y * P[1].Lv + B.z * P[2].Lv;
@@ -3810,6 +4115,8 @@ struct ReliefPatch
 {
     float Edge[3] : SV_TessFactor;
     float Inner   : SV_InsideTessFactor;
+    uint2 Held    : RELIEFHELD;   // which of the run's held edges can reach the patch (ReliefHeldMask)
+    uint  Pieces  : RELIEFPIECES; // which of the run's own polygons the drawn triangles' lookup can take (ReliefPieceMask)
 };
 
 ReliefPoint VSRelief(VSIn In)
@@ -3845,9 +4152,96 @@ float ReliefCuts(float3 A, float3 B)
     return clamp(length(A - B) * ReliefFocal / (Z * max(ReliefEdge, 1.0f)) * ReliefDensity(Z), 1.0f, 64.0f);
 }
 
+// Which of the run's held edges can reach any point of the patch (ReliefHeldAt), a bit each in their order: an edge's
+// band ends Width from it - Width times its share where that is more, a hundredth of a unit for a seam carried over -
+// and past it the edge adds nothing, to the last bit: its smoothstep is one, its shear is taken nought times. Measured
+// from the ball round the patch's corners, which holds every point of the patch, with room for both sides' rounding.
+uint2 ReliefHeldMask(InputPatch<ReliefPoint, 3> P)
+{
+    uint2     Mask  = uint2(0u, 0u);
+    const int Count = min((int)ReliefHeldCount.x, RELIEF_HELD_MAX);
+    if (Count <= 0)
+        return Mask;
+    const float  Bevel = (ReliefBevel > 0.0f) ? ReliefBevel : RELIEF_BEVEL;
+    const float  Width = Bevel * max(PomDepth, 1e-3f);
+    const float3 C     = (P[0].View + P[1].View + P[2].View) / 3.0f;
+    const float  R     = sqrt(max(max(dot(P[0].View - C, P[0].View - C), dot(P[1].View - C, P[1].View - C)),
+                                  dot(P[2].View - C, P[2].View - C)));
+    const float  Slack = 0.01f + 1e-4f * (length(C) + R);
+    for (int i = 0; i < Count; i++)
+    {
+        const float3 A     = ReliefHeld[3 * i].xyz;
+        const float3 AB    = ReliefHeld[3 * i + 1].xyz - A;
+        const float  T     = saturate(dot(C - A, AB) / max(dot(AB, AB), 1e-8f));
+        const float  D     = length(C - A - AB * T);
+        const float  W     = ReliefHeld[3 * i].w;
+        const float  Reach = (W < -0.5f) ? 0.01f : Width * max(W, 1.0f);
+        if (D - R <= Reach * 1.001f + Slack)
+        {
+            if (i < 32)
+                Mask.x |= 1u << (uint)i;
+            else
+                Mask.y |= 1u << (uint)(i - 32);
+        }
+    }
+    return Mask;
+}
+
+// Which of the run's own polygons (SphereNodes) the drawn triangles' lookup can take any point of the patch on
+// (SpherePieceMoveAt), a bit each: one with no record, or not facing the run's way, or whose plane lies more than
+// ROUND_NEAR off every point of the patch, adds nothing to the lookup - and one whose plan's box lies further off the
+// patch's than 0.15 of its diagonal cannot hold the point within a share of 0.05 of any of its triangles (a point a share
+// e outside a triangle lies within 3e of its widest reach), the most the lookup ever takes. Those bits are clear, and
+// the lookup passes them by as it passed them. All set where the run lists no polygons of its own.
+uint ReliefPieceMask(InputPatch<ReliefPoint, 3> P)
+{
+    const uint Own = (uint)SphereRun.w;
+    if (SphereRun.x <= 0.5f || Own == 0u)
+        return 0xFFFFFFFFu;
+    const uint PiecesAt = SphereField.Load(60u);
+    if (PiecesAt == 0u)
+        return 0xFFFFFFFFu;
+    const float3 Nl = normalize(SphereLevelDir(ReliefNormal));
+    const float3 W0 = SphereLevelOf(P[0].View), W1 = SphereLevelOf(P[1].View), W2 = SphereLevelOf(P[2].View);
+    uint Mask = 0u;
+    for (uint i = 0u; i < Own && i < 8u; i++)
+    {
+        const uint At = SphereField.Load((PiecesAt + SphereNodes[i >> 2u][i & 3u]) * 4u);
+        if (At == 0u)
+            continue;
+        const float4 Plane = asfloat(SphereField.Load4(At * 4u));
+        if (abs(dot(Plane.xyz, Nl)) < ROUND_ALONG - 1e-4f)
+            continue;
+        const float3 F   = float3(dot(Plane.xyz, W0), dot(Plane.xyz, W1), dot(Plane.xyz, W2)) - Plane.w;
+        const float  Far = ROUND_NEAR + 0.05f;
+        if (all(F > Far) || all(F < -Far))
+            continue;
+        const uint   Drop = SphereField.Load((At + 4u) * 4u);
+        const uint   GxGy = SphereField.Load((At + 5u) * 4u);
+        const float4 Plan = asfloat(SphereField.Load4((At + 6u) * 4u));
+        const float2 Size = float2((float)(GxGy & 0xFFFFu), (float)(GxGy >> 16)) / max(Plan.zw, 1e-12f);
+        const float2 Q0 = float2((Drop == 0u) ? W0.y : W0.x, (Drop == 2u) ? W0.y : W0.z);
+        const float2 Q1 = float2((Drop == 0u) ? W1.y : W1.x, (Drop == 2u) ? W1.y : W1.z);
+        const float2 Q2 = float2((Drop == 0u) ? W2.y : W2.x, (Drop == 2u) ? W2.y : W2.z);
+        const float2 Lo = min(Q0, min(Q1, Q2)), Hi = max(Q0, max(Q1, Q2));
+        const float2 Gap = max(max(Plan.xy - Hi, Lo - (Plan.xy + Size)), 0.0f);
+        if (length(Gap) > 0.16f * length(Size) + 0.05f)
+            continue;
+        Mask |= 1u << i;
+    }
+    return Mask;
+}
+
 ReliefPatch ReliefPatchConstants(InputPatch<ReliefPoint, 3> P)
 {
     ReliefPatch C;
+    C.Held   = ReliefHeldMask(P);
+    C.Pieces = ReliefPieceMask(P);
+    if (PomHas(POM_CUTONCE))
+    {
+        C.Edge[0] = C.Edge[1] = C.Edge[2] = C.Inner = 1.0f;
+        return C;
+    }
     C.Edge[0] = ReliefCuts(P[1].View, P[2].View);
     C.Edge[1] = ReliefCuts(P[2].View, P[0].View);
     C.Edge[2] = ReliefCuts(P[0].View, P[1].View);
@@ -3886,29 +4280,36 @@ float ReliefLevel(float3 View)
 // less a band's width in, so the rim lies on a wall that leans (RenderMath.h, ReliefRimFromWall). A seam carried over
 // (w -1) holds nothing down: a point on it reads its height where the other side reads it - Seam is what to add to
 // the texture coordinate there, and zero elsewhere. The row gives it at both ends of the seam (A: the second and third
-// rows' w; B: the third row's xy), in a straight line between them (ReliefSeamRow).
-void ReliefHeldAt(float3 P, float Width, out float Keep, out float3 Shear, out float2 Seam)
+// rows' w; B: the third row's xy), in a straight line between them (ReliefSeamRow). Only the edges the patch's mask
+// has (ReliefHeldMask), in their order: the others add nothing here.
+void ReliefHeldAt(float3 P, float Width, uint2 Mask, out float Keep, out float3 Shear, out float2 Seam)
 {
     Keep  = 1.0f;
     Shear = float3(0.0f, 0.0f, 0.0f);
     Seam  = float2(0.0f, 0.0f);
-    const int Count = min((int)ReliefHeldCount.x, RELIEF_HELD_MAX);
-    for (int i = 0; i < Count; i++)
+    [loop] for (uint h = 0u; h < 2u; h++)
     {
-        const float3 A  = ReliefHeld[3 * i].xyz;
-        const float3 AB = ReliefHeld[3 * i + 1].xyz - A;
-        const float  T  = saturate(dot(P - A, AB) / max(dot(AB, AB), 1e-8f));
-        const float  D  = length(P - A - AB * T);
-        const float  W  = ReliefHeld[3 * i].w;
-        if (W < -0.5f)
+        uint Bits = (h == 0u) ? Mask.x : Mask.y;
+        [loop] while (Bits != 0u)
         {
-            if (D < 0.01f)
-                Seam = lerp(float2(ReliefHeld[3 * i + 1].w, ReliefHeld[3 * i + 2].w), ReliefHeld[3 * i + 2].xy, T);
-            continue;
+            const int i = (int)(firstbitlow(Bits) + 32u * h);
+            Bits &= Bits - 1u;
+            const float3 A  = ReliefHeld[3 * i].xyz;
+            const float3 AB = ReliefHeld[3 * i + 1].xyz - A;
+            const float  T  = saturate(dot(P - A, AB) / max(dot(AB, AB), 1e-8f));
+            const float  D  = length(P - A - AB * T);
+            const float  W  = ReliefHeld[3 * i].w;
+            if (W < -0.5f)
+            {
+                if (D < 0.01f)
+                    Seam = lerp(float2(ReliefHeld[3 * i + 1].w, ReliefHeld[3 * i + 2].w), ReliefHeld[3 * i + 2].xy,
+                                T);
+                continue;
+            }
+            if (W > 0.001f)
+                Keep = min(Keep, smoothstep(0.0f, Width * W, D));
+            Shear += ReliefHeld[3 * i + 2].xyz * (1.0f - smoothstep(0.0f, Width, D));
         }
-        if (W > 0.001f)
-            Keep = min(Keep, smoothstep(0.0f, Width * W, D));
-        Shear += ReliefHeld[3 * i + 2].xyz * (1.0f - smoothstep(0.0f, Width, D));
     }
 }
 
@@ -4051,6 +4452,7 @@ float ReliefOutlineOf(float3 B, float C0, float C1, float C2)
 VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<ReliefPoint, 3> P)
 {
     VSOut Out;
+    Out.Surf = float3(0.0f, 0.0f, 0.0f);
     float3 View = B.x * P[0].View + B.y * P[1].View + B.z * P[2].View;
     Out.Uv      = B.x * P[0].Uv + B.y * P[1].Uv + B.z * P[2].Uv;
     Out.Lv      = B.x * P[0].Lv + B.y * P[1].Lv + B.z * P[2].Lv;
@@ -4064,8 +4466,26 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     float  Keep  = smoothstep(0.0f, Width, B.x * P[0].Rim + B.y * P[1].Rim + B.z * P[2].Rim);
     float3 Shear = float3(0.0f, 0.0f, 0.0f);
     float2 Seam  = float2(0.0f, 0.0f);
-    if (ReliefHeldCount.x > 0.5f)
-        ReliefHeldAt(View, Width, Keep, Shear, Seam);
+    const bool bFlat = PomHas(POM_FLAT);
+    if (ReliefHeldCount.x > 0.5f && !PomHas(POM_NOHELD) && !bFlat)
+        ReliefHeldAt(View, Width, C.Held, Keep, Shear, Seam);
+    float HeldDiffers = 0.0f;
+    if (PomHas(POM_CHECKHELD) && ReliefHeldCount.x > 0.5f)
+    {
+        const uint Count = (uint)min((int)ReliefHeldCount.x, RELIEF_HELD_MAX);
+        const uint2 Every = uint2((Count >= 32u) ? 0xFFFFFFFFu : ((1u << Count) - 1u),
+                                  (Count >= 64u) ? 0xFFFFFFFFu : ((Count > 32u) ? ((1u << (Count - 32u)) - 1u) : 0u));
+        float  K1 = Keep, K2;
+        float3 S1 = Shear, S2;
+        float2 M1 = Seam, M2;
+        if (PomHas(POM_CHECKSAME))
+            ReliefHeldAt(View, Width, C.Held | Every, K1, S1, M1);
+        ReliefHeldAt(View, Width, Every, K2, S2, M2);
+        const bool bBits = any(asuint(float4(K2, S2)) != asuint(float4(K1, S1))) || any(asuint(M2) != asuint(M1));
+        const bool bBig  = abs(K2 - K1) > 1e-5f || length(S2 - S1) > 1e-5f * (1.0f + length(S1)) ||
+                           length(M2 - M1) > 1e-5f;
+        HeldDiffers = bBig ? 3.0f : (bBits ? 1.0f : 0.0f);
+    }
     // The spherifier's rounding (SphereMoveAt), measured where the point was - as the rim band above is, the held edges
     // being the level's own: the point moved as the polygon it lies on is moved there, a floor's texture read where it
     // is now (a wall's goes with it), and the way the relief is lifted along turned as the surface turned there
@@ -4080,14 +4500,15 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     float  OnChord    = 0.0f;
     bool   bFloor     = false;
     float3 FloorFlat  = float3(0.0f, 0.0f, 0.0f);
-    if (SphereRun.x > 0.5f && dot(DirSum, DirSum) < RELIEF_STILL_TEST)
+    if (SphereRun.x > 0.5f && dot(DirSum, DirSum) < RELIEF_STILL_TEST && !PomHas(POM_NOSPHERE) && !bFlat)
     {
         const float3 W  = SphereLevelOf(View);
         const float3 Nl = normalize(SphereLevelDir(ReliefNormal));
         const float3 Ul = SphereLevelDir(ReliefAxisU);
         const float3 Tu = normalize(Ul - Nl * dot(Ul, Nl));
         float3       Ml, Nm, Mc;
-        const bool   bOn = SphereMoveAt(W, Tu, cross(Nl, Tu), Nl, Ml, Nm, bFloor, FloorFlat);
+        const bool   bOn = SphereMoveAt(W, Tu, cross(Nl, Tu), Nl, C.Pieces, Ml, Nm, bFloor, FloorFlat,
+                                        PomHas(POM_NOPIECES), PomHas(POM_NOFACES));
         // A point of the polygon's outline goes where the pieces' side through it goes (SphereChordAt): the pieces
         // beside it and under it end on those straight sides, and an outline on the curve itself would stand off
         // them, with what is behind showing through between.
@@ -4107,6 +4528,7 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
             Out.Lv += Slide * SphereRun.yz;
             SphereFrom = Nl;
             SphereTo   = Nm;
+            Out.Surf   = SphereViewDir(Nm);
         }
     }
     // A texture laid on once reads its height inside itself: the wrap would bring the far side in at the rim. On a seam
@@ -4115,7 +4537,7 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     if (PomHas(POM_ONCE))
         At = clamp(At, 0.5f * PomTexel, 1.0f - 0.5f * PomTexel);
     const float Level  = ReliefLevel(View) + ReliefSmooth;
-    const float Height = SceneCopy.SampleLevel(Samp, At, Level).r;
+    const float Height = bFlat ? 0.0f : SceneCopy.SampleLevel(Samp, At, Level).r;
     // Lifted along the corners' direction: the surface's normal on a flat one, and at a bend (a round tower's faces)
     // the one both faces share there, so each lifts the edge between them alike.
     float3 Dir = (dot(DirSum, DirSum) > 1e-8f) ? normalize(DirSum) : ReliefNormal;
@@ -4123,7 +4545,8 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
         Dir = bFloor ? SphereViewDir(SphereTo) : SphereTurnedBy(Dir, SphereFrom, SphereTo);
     // Never through what stands above the point (ReliefClear).
     const float Wanted = PomDepth * Height * Keep;
-    const float Lift   = ReliefClear(View, Dir + Shear, bFloor ? SphereViewDir(FloorFlat) : ReliefNormal, Wanted);
+    const float Lift   = PomHas(POM_NOCLEAR) ? Wanted
+                       : ReliefClear(View, Dir + Shear, bFloor ? SphereViewDir(FloorFlat) : ReliefNormal, Wanted);
     View += (Dir + Shear) * Lift;
     // The detail texture's pass over the same patches reads its own coordinate; the height above was read with the
     // surface's, so both passes lift every point alike (FSolidPass::SetTessUvMap).
@@ -4136,6 +4559,8 @@ VSOut DSRelief(ReliefPatch C, float3 B : SV_DomainLocation, const OutputPatch<Re
     Out.Pos.w = View.z;
     // w: how far the direction lifted along turns from the surface's normal - only the measurement view reads it.
     Out.Pom   = float4(Height, Level, Keep, 1.0f - dot(Dir, ReliefNormal));
+    if (PomHas(POM_CHECKHELD))
+        Out.Pom.x = HeldDiffers;
     // The measurement view reads, in the level's place, how much of the lift the covers took (ReliefClear); and in the
     // height's, whether the point went onto the pieces' side (SphereChordAt): 1 it did, -1 it lies on the outline and
     // the field had no side for it, -2 it lies inside the polygon and the field had no face for it (SphereMoveAt).
@@ -4168,11 +4593,14 @@ struct MeshPoint
     float2 Uv     : TEXCOORD0;
     float4 Colour : COLOR;
     float  Ref    : MESHEDGE;     // the edge from this corner to the next: its number times two, and one where this face
-                                  // goes along it from B to A
+                                  // goes along it from B to A; below nought, a piece's face's record (DSMesh)
     float  Size   : MESHSIZE;     // how far its bends reach together (each by its room), units
     float  Room   : MESHROOM;     // the least of its rooms
     float  Poly   : MESHPOLY;     // the face's flat polygon of several faces: its outline's number among the frame's
                                   // edges, plus one (MeshPolyPlaneMove); 0 none
+    float2 Lam    : MESHLAM;      // where on its face the corner lies: its shares of the face's first two corners - a
+                                  // whole face's own corner one and nought; a piece's corner (the fine bevel's,
+                                  // RenderDevice's MeshBevelPatchesOut) its place's before the bevel moved it
 };
 struct MeshPatch
 {
@@ -4190,6 +4618,7 @@ MeshPoint VSMesh(VSIn In)
     Out.Size   = In.Pom.y;
     Out.Room   = In.Pom.z;
     Out.Poly   = In.Pom.w;
+    Out.Lam    = In.Lv;
     return Out;
 }
 
@@ -4289,27 +4718,57 @@ MeshPoint HSMesh(InputPatch<MeshPoint, 3> P, uint I : SV_OutputControlPointID)
     return P[I];
 }
 
+// A piece's corner's share of the face's bend (RenderDevice's MeshBevelPatchesOut): a quarter past its record's number in
+// its Ref where the bevel left the place - the patch bends it - else none: drawn where the bevel put it.
+float MeshPieceBend(float Ref)
+{
+    const float R = -Ref;
+    return saturate((R - 1.0f - floor(R - 0.5f)) * 4.0f);
+}
+
 [domain("tri")]
 VSOut DSMesh(MeshPatch C, float3 B : SV_DomainLocation, const OutputPatch<MeshPoint, 3> P)
 {
     VSOut Out;
+    Out.Surf = float3(0.0f, 0.0f, 0.0f);
     const float3 Flat = B.x * P[0].View + B.y * P[1].View + B.z * P[2].View;
+    // Where on its face the point lies: the shares of the face's corners - the domain's own on a whole face, its
+    // corners' blended on a piece of one, which bows as the face does there.
+    const float2 Lxy = B.x * P[0].Lam + B.y * P[1].Lam + B.z * P[2].Lam;
+    const float3 L   = float3(Lxy.x, Lxy.y, 1.0f - Lxy.x - Lxy.y);
+    // A piece of a face names the face's record in Ref, below nought (RenderDevice's MeshBevelPatchesOut): the face's
+    // own edges, and its corners in the view - where on the face the point lay before the bevel moved it (OnFace), the
+    // place a flat polygon's move along its plane is read at, as the faces beside it read their edges' curves at L.
+    float  Ref0 = P[0].Ref, Ref1 = P[1].Ref, Ref2 = P[2].Ref;
+    float3 OnFace = Flat;
+    float  Bend   = 1.0f;
+    if (P[0].Ref < 0.0f)
+    {
+        Bend = B.x * MeshPieceBend(P[0].Ref) + B.y * MeshPieceBend(P[1].Ref) + B.z * MeshPieceBend(P[2].Ref);
+        const uint   At = (uint)(-P[0].Ref - 0.5f) * 64u;
+        const float4 R  = asfloat(MeshEdges.Load4(At));
+        Ref0            = R.x;
+        Ref1            = R.y;
+        Ref2            = R.z;
+        OnFace          = L.x * asfloat(MeshEdges.Load3(At + 16u)) + L.y * asfloat(MeshEdges.Load3(At + 28u)) +
+                          L.z * asfloat(MeshEdges.Load3(At + 40u));
+    }
     // Each edge's curve by the cube of its two corners' shares together - nothing on an edge but its own - and half of
     // every term at its room for the middle, at most MeshMost from the flat.
-    const float  S0 = B.x + B.y, S1 = B.y + B.z, S2 = B.z + B.x;
+    const float  S0 = L.x + L.y, S1 = L.y + L.z, S2 = L.z + L.x;
     float3       Middle = 0.0f;
-    float3       Move   = MeshEdge(P[0].Ref, B.y / max(S0, 1e-6f), Middle) * (S0 * S0 * S0) +
-                          MeshEdge(P[1].Ref, B.z / max(S1, 1e-6f), Middle) * (S1 * S1 * S1) +
-                          MeshEdge(P[2].Ref, B.x / max(S2, 1e-6f), Middle) * (S2 * S2 * S2);
-    Move += Middle * (0.5f * B.x * B.y * B.z);
+    float3       Move   = MeshEdge(Ref0, L.y / max(S0, 1e-6f), Middle) * (S0 * S0 * S0) +
+                          MeshEdge(Ref1, L.z / max(S1, 1e-6f), Middle) * (S1 * S1 * S1) +
+                          MeshEdge(Ref2, L.x / max(S2, 1e-6f), Middle) * (S2 * S2 * S2);
+    Move += Middle * (0.5f * L.x * L.y * L.z);
     // A flat polygon of several faces: along its plane its one smooth move, off it the patch's.
     if (P[0].Poly >= 1.0f)
     {
         float3       Normal;
-        const float3 Along = MeshPolyPlaneMove((uint)(P[0].Poly - 0.5f), Flat, Normal);
+        const float3 Along = MeshPolyPlaneMove((uint)(P[0].Poly - 0.5f), OnFace, Normal);
         Move = Along + Normal * dot(Move, Normal);
     }
-    Move *= MeshShape;
+    Move *= MeshShape * Bend;
     const float Long = length(Move);
     if (Long > MeshMost)
         Move *= MeshMost / Long;

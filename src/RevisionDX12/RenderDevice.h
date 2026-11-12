@@ -105,7 +105,7 @@ public:
     UBOOL   Fire3D;               // the fires' flame sheets as a body of flame (docs/terv-3d-tuz.md)
     FString Grass3D;              // blades of grass on the level's grass, in the wind: Off, Low, Medium or High
     FString Trees3D;              // the game's trees and bushes grown again by code (TreeGen.h): Off, Low, Medium or High
-    UBOOL   Spherifier;           // the level's and the models' round shapes rounded (Spherify.h)
+    FString Spherifier;           // the level's and the models' round shapes rounded (Spherify.h): Off, Low, Medium or High
     INT     SpherifierDistance;   // the most it moves a wall, in the level's units - the settings file's alone
     INT     SpherifierAngle;      // the sharpest angle between two faces it still rounds, degrees - the file's alone
     UBOOL   Wind;                 // the rain leaning with the level's wind, and the dust in it

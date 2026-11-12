@@ -5,13 +5,13 @@
 ; the glass. Not read by the renderer yet. What follows a ';' is a remark: where it was found, the level's light
 ; nearest it there (the readout's NEAREST LIGHT), and in how many of the game's 225 maps it is used.
 ;
-; name                          kind     remark
+; name                          kind     strength  remark
 BatteryPark.BP_LightLens2       texture  ; wall and post lanterns - 01_NYC_UNATCOIsland: Light398, 94 from it, radius 525; 02_NYC_BatteryPark: Light86, 162 from it; in 26 maps
-BatteryPark.BP_LightLens3       texture  ; glowing cube on a ledge - 02_NYC_BatteryPark: Light438, 86 from it; in 14 maps
+BatteryPark.BP_LightLens3       texture  0.5       ; glowing cube on a ledge - 02_NYC_BatteryPark: Light438, 86 from it; in 14 maps
 BatteryPark.BP_LightLens1       texture  ; beside LightLens2 and 3 in the package's Glass group, not seen on a level yet (Laci: in)
 UNATCO.un_light_a               texture  ; street lamp head, its underside - 01_NYC_UNATCOIsland: Light290, 390 from it; 15_Area51_Bunker: Light18, 30 from it, radius 1225; in 37 maps
 V_Com_Center.ClenBlueLight_A    texture  ; box lantern on the lawn - 01_NYC_UNATCOIsland: Light460, 40 from it, radius 825; in 34 maps
-Catacombs.pa_sqrlight           texture  ; row of square wall lights - 01_NYC_UNATCOIsland: Light38, 186 from it; in 48 maps
+Catacombs.pa_sqrlight           texture  0.05      ; row of square wall lights - 01_NYC_UNATCOIsland: Light38, 186 from it; in 48 maps. Its texture dark (0.35 at its brightest part) and the lamp low by the floor: at 1 its streak burns white under it, ten times the lamp's own look
 Paris.pa_streetlight_           texture  ; street lamp's lantern (the name ends in an underscore) - 10_Paris_Metro: Light19, 284 from it, radius 1525; in 17 maps
 Paris.pa_litwindow_a            texture  ; lit window - 10_Paris_Metro: Light433, 278 from it; Light190, 298 from it, radius 400; in 7 maps
 Paris.pa_bldng_c_e              texture  ; frosted glass of a lit bay window behind iron railings - 10_Paris_Metro: Light43, 418 from it, radius 1025; in 11 maps

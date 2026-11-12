@@ -13,6 +13,7 @@
 #include "../src/RevisionDX12/Spherify.h"
 #include "../src/RevisionDX12/MeshRound.h"
 #include "../src/RevisionDX12/LevelRound.h"
+#include "../src/RevisionDX12/LevelBevel.h"
 #include "../src/RevisionDX12/EdgeBevel.h"
 #include "../src/RevisionDX12/PomArchive.h"
 #include "../src/Host64/Host64Camera.h"
@@ -1141,6 +1142,20 @@ static void TestCaption()
     Check(AddressSpaceLow(AddressSpaceLowMB - 1) && AddressSpaceLow(0) && !AddressSpaceLow(AddressSpaceLowMB) &&
           !AddressSpaceLow(-1),
           "the address space is low under its limit, not at it - and never where the system gave no number");
+    {
+        const unsigned long long MB = 1ull << 20;
+        Check(AddressRoomFor(2000 * MB, 1500 * MB, 100 * MB), "a block with room in all and a long stretch is taken");
+        Check(!AddressRoomFor(2000 * MB, 200 * MB, 100 * MB),
+              "a block that would leave the longest stretch short is not taken, however much is free in all");
+        Check(AddressRoomFor(2000 * MB, (100 + LongestKeepMB) * MB, 100 * MB) &&
+                  !AddressRoomFor(2000 * MB, (100 + LongestKeepMB) * MB - 1, 100 * MB),
+              "the longest stretch keeps its share exactly, the block counted off it");
+        Check(!AddressRoomFor((100 + AddressSpaceLowMB) * MB - 1, 1500 * MB, 100 * MB) &&
+                  AddressRoomFor((100 + AddressSpaceLowMB) * MB, 1500 * MB, 100 * MB),
+              "what is free in all keeps its share exactly");
+        Check(AddressRoomFor(2000 * MB, 0, 100 * MB) && !AddressRoomFor(550 * MB, 0, 100 * MB),
+              "the longest stretch not known: the rule on all that is free alone");
+    }
     Lo2 = Hi2 = 1;
     Check(!CaptionGlyph('#', Lo2, Hi2) && Lo2 == 0 && Hi2 == 0, "an unknown character behaves as a space");
     bool bAll = true;
@@ -1491,6 +1506,16 @@ static void TestShadowOccluders()
           "occlusion rule: masked, translucent, invisible and modulated do not");
     Check(BspBlocksLightSeeThrough(RDX_PF_Translucent | RDX_PF_Occlude),
           "occlusion rule: a translucent surface marked PF_Occlude does");
+
+    // The rays' scene's flags: the sky marker drawn is a sky wall, on an invisible surface it is not.
+    Check(RtSurfaceFlags(0, true) == RDX_PF_FakeBackdrop && RtSurfaceFlags(RDX_PF_Masked, true) ==
+          (RDX_PF_Masked | RDX_PF_FakeBackdrop), "rays' flags: a drawn sky marker is a sky wall");
+    Check(RtSurfaceFlags(RDX_PF_Invisible | 0x20u, true) == (RDX_PF_Invisible | 0x20u) &&
+          RtSurfaceFlags(RDX_PF_Invisible | RDX_PF_Portal, true) == (RDX_PF_Invisible | RDX_PF_Portal),
+          "rays' flags: an invisible blocker or portal bearing the marker is no sky wall");
+    Check(RtSurfaceFlags(RDX_PF_Invisible | RDX_PF_FakeBackdrop, true) == (RDX_PF_Invisible | RDX_PF_FakeBackdrop) &&
+          RtSurfaceFlags(RDX_PF_Translucent, false) == RDX_PF_Translucent,
+          "rays' flags: the surface's own sky flag stays, an unmarked surface keeps its flags");
 }
 
 static void TestShadowLightPick()
@@ -2637,6 +2662,22 @@ static void TestUpscaling()
                       !LampListed(List, N, "Rev_SphereLight", Lamp_Texture) &&
                       !LampListed(List, N, "Paris.pa_streetlight", Lamp_Texture),
                   "lamps' list: a name of its kind only, whole, the case aside");
+            // A third word, a number, is the lamp's strength (1 where none is written); one that is no number or past
+            // the most, or a fourth word after it, and the line is not read.
+            const char Strong[] = "Catacombs.pa_sqrlight texture 0.1 ; row of square wall lights\n"
+                                  "UNATCO.un_light_a texture\nRev_SphereLight class 2\nA.B texture 0.5 more\n"
+                                  "C.D texture 1.2.3\nE.F texture 17\nG.H texture .25\n";
+            FLampSurface S[8];
+            const int    K = ParseLampSurfaces(Strong, (int)sizeof(Strong) - 1, S, 8, Bad);
+            Check(K == 4 && Bad == 3 && S[0].Strength > 0.0999f && S[0].Strength < 0.1001f && S[1].Strength == 1.0f &&
+                      S[2].Kind == Lamp_Class && S[2].Strength == 2.0f && S[3].Strength > 0.2499f &&
+                      S[3].Strength < 0.2501f,
+                  "lamps' list: a number after the kind its strength, 1 without; no number, past the most, or another "
+                  "word after it, not read");
+            Check(LampEntryOf(S, K, "catacombs.pa_sqrlight", Lamp_Texture) == 0 &&
+                      LampEntryOf(S, K, "Rev_SphereLight", Lamp_Class) == 2 &&
+                      LampEntryOf(S, K, "X.Y", Lamp_Texture) == -1,
+                  "lamps' list: a name's own line, -1 for one not listed");
             // Two panes of one lantern, side by side, are one lamp about both; a lamp across the street stays its own;
             // a small body inside a larger one adds nothing to it.
             FLampBody B[4] = { { 0.0f, 0.0f, 0.0f, 8.0f, 1.0f, 1.0f, 1.0f },
@@ -2653,6 +2694,51 @@ static void TestUpscaling()
                                  { 124.0f, 0.0f, 0.0f, 30.0f, 1.0f, 1.0f, 1.0f } };
             Check(MergeLampBodies(Row, 3, 8.0f, 48.0f) == 3 && Row[0].Extent == 30.0f && Row[1].X == 62.0f,
                   "lamps' bodies: windows in a row stay apart, none grown");
+            // The glass as it is seen: a ball, a cube and a square pane stay the ball they were - no axis, the same
+            // radius -; a rod lying along a wall a tube along it, as thick as it is.
+            FLampBody Ball = {};
+            Ball.X = 10.0f; Ball.Y = 20.0f; Ball.Z = 30.0f; Ball.Extent = 12.0f;
+            LampBoxAbout(Ball, Ball.Extent);
+            LampShapeOf(Ball, 4.0f);
+            FLampBody Cube = {};
+            Cube.HiX = Cube.HiY = Cube.HiZ = 30.0f;
+            Cube.Extent = 0.5f * sqrtf(3.0f * 30.0f * 30.0f);
+            LampShapeOf(Cube, 4.0f);
+            FLampBody Pane = {};
+            Pane.HiX = 16.0f; Pane.HiY = 2.0f; Pane.HiZ = 16.0f;
+            Pane.Extent = 0.5f * sqrtf(16.0f * 16.0f + 2.0f * 2.0f + 16.0f * 16.0f);
+            LampShapeOf(Pane, 4.0f);
+            FLampBody Rod = {};
+            Rod.LoX = 2043.0f; Rod.LoY = -792.0f; Rod.LoZ = 1045.0f; Rod.HiX = 2047.0f; Rod.HiY = -728.0f;
+            Rod.HiZ = 1049.0f;
+            Rod.Extent = 0.5f * sqrtf(4.0f * 4.0f + 64.0f * 64.0f + 4.0f * 4.0f);
+            LampShapeOf(Rod, 4.0f);
+            Check(Ball.AxisX == 0.0f && Ball.AxisY == 0.0f && Ball.AxisZ == 0.0f && Ball.Tube == 12.0f &&
+                      Cube.AxisX == 0.0f && Cube.AxisY == 0.0f && Cube.AxisZ == 0.0f && Cube.Tube == Cube.Extent &&
+                      Pane.AxisX == 0.0f && Pane.AxisY == 0.0f && Pane.AxisZ == 0.0f && Pane.Tube == Pane.Extent,
+                  "lamps' glass: a ball, a cube, a square pane each the ball it was");
+            Check(Rod.Tube == 4.0f && Rod.AxisX == 0.0f && Rod.AxisZ == 0.0f && Rod.AxisY > 27.99f && Rod.AxisY < 28.01f,
+                  "lamps' glass: a rod a tube along its length, as thick as the least glass, its ends round");
+            // Its kind for the shader: a rod along the level's Y, half 28, as -(4096 * 1 + 28 + 1), read back the same; a
+            // ball 0; a fire 1, whatever its shape.
+            const float RodKind = WetLampKind(Rod);
+            const float RodV    = -RodKind - 1.0f;
+            const float RodK    = floorf(RodV / WetLampAxisStep);
+            FLampBody   Fire    = Ball;
+            Fire.Flicker        = 1.0f;
+            Check(RodKind < -4124.9f && RodKind > -4125.1f && RodK == 1.0f &&
+                      RodV - WetLampAxisStep * RodK > 27.99f && RodV - WetLampAxisStep * RodK < 28.01f &&
+                      WetLampKind(Ball) == 0.0f && WetLampKind(Cube) == 0.0f && WetLampKind(Fire) == 1.0f,
+                  "lamps' kind: a rod's axis and half written in one number and read back; a ball 0, a fire 1");
+            // Two bodies made one: their boxes one box over both.
+            FLampBody Pair[2] = {};
+            Pair[0].X = 0.0f;  Pair[0].Extent = 8.0f;
+            Pair[1].X = 20.0f; Pair[1].Extent = 8.0f;
+            LampBoxAbout(Pair[0], 8.0f);
+            LampBoxAbout(Pair[1], 8.0f);
+            Check(MergeLampBodies(Pair, 2, 8.0f, 48.0f) == 1 && Pair[0].LoX == -8.0f && Pair[0].HiX == 28.0f &&
+                      Pair[0].LoY == -8.0f && Pair[0].HiZ == 8.0f,
+                  "lamps' bodies: two made one, their boxes one over both");
             const float Dist[5] = { 30.0f, 10.0f, 50.0f, 10.0f, 20.0f };
             int         Order[5];
             LampsByDistance(Dist, 5, Order);
@@ -5203,13 +5289,41 @@ static void TestPom()
     Check(PomMapSide(1024, 1) == 1024, "relief: the full-size sets keep the texture's size");
 
     // How the relief is drawn.
-    Check(ParseGeometry("DisplacementMapping", bKnown) == Geometry_Tess && bKnown,
-          "geometry: DisplacementMapping is understood");
+    Check(ParseGeometry("DisplacementMapping", bKnown) == Geometry_TessHigh && bKnown,
+          "geometry: DisplacementMapping alone is understood, as High");
+    Check(ParseGeometry("DisplacementMappingLow", bKnown) == Geometry_TessLow && bKnown &&
+              ParseGeometry("displacementmappingmedium", bKnown) == Geometry_TessMedium && bKnown &&
+              ParseGeometry("DisplacementMappingHigh", bKnown) == Geometry_TessHigh && bKnown,
+          "geometry: and its three densities, whatever the case");
+    Check(ParseGeometry("DisplacementMappingHuge", bKnown) == Geometry_Off && !bKnown,
+          "geometry: a density it does not have is Off, and says so");
     Check(ParseGeometry("pom", bKnown) == Geometry_Pom && bKnown, "geometry: and POM, whatever the case");
     Check(ParseGeometry("Off", bKnown) == Geometry_Off && bKnown, "geometry: and Off");
     Check(ParseGeometry("True", bKnown) == Geometry_Off && !bKnown, "geometry: anything else is Off, and says so");
-    Check(GeometryStep(Geometry_Tess, 1) == Geometry_Off && GeometryStep(Geometry_Off, -1) == Geometry_Tess,
-          "geometry: the menu steps round both ways");
+    Check(GeometryStep(Geometry_TessHigh, 1) == Geometry_Off && GeometryStep(Geometry_Off, -1) == Geometry_TessHigh &&
+              GeometryStep(Geometry_Pom, 1) == Geometry_TessLow && GeometryStep(Geometry_TessMedium, -1) == Geometry_TessLow,
+          "geometry: the menu steps round both ways, through the three densities");
+    Check(!GeometryRaises(Geometry_Off) && !GeometryRaises(Geometry_Pom) && GeometryRaises(Geometry_TessLow) &&
+              GeometryRaises(Geometry_TessMedium) && GeometryRaises(Geometry_TessHigh),
+          "geometry: only the displacement mapping raises the relief, at each of its densities");
+    Check(GeometryEdgeParts(Geometry_TessHigh) == 960 &&
+              GeometryEdgeParts(Geometry_TessMedium) < GeometryEdgeParts(Geometry_TessHigh) &&
+              GeometryEdgeParts(Geometry_TessLow) < GeometryEdgeParts(Geometry_TessMedium),
+          "geometry: High cuts the relief as finely as it was made, Medium and Low coarser");
+    {
+        char GName[GeometryNameChars];
+        bool bAll = true;
+        for (int g = 0; g < Geometry_Count; g++)
+        {
+            GeometryName((EGeometry)g, GName, GeometryNameChars);
+            bAll = bAll && ParseGeometry(GName, bKnown) == (EGeometry)g && bKnown;
+        }
+        Check(bAll, "geometry: every value's name is read back as itself");
+    }
+    Check(strcmp(GeometryMenuText(Geometry_TessLow), "DISP. MAP LOW") == 0 &&
+              strcmp(GeometryMenuText(Geometry_TessMedium), "DISP. MAP MEDIUM") == 0 &&
+              strcmp(GeometryMenuText(Geometry_TessHigh), "DISP. MAP HIGH") == 0,
+          "geometry: the menu names the densities as Laci asked");
 
     // A texture laid on once, and one that tiles.
     float TileU = 0.0f, TileV = 0.0f;
@@ -5557,10 +5671,10 @@ static void TestPom()
             }
             Check(bNames, "trees: each level read back as it is written");
         }
-        Check(TreeFullReachOf(Trees_High) == 10.0f && TreeLeastShareOf(Trees_High) == 0.12f &&
+        Check(TreeFullReachOf(Trees_High) == 20.0f && TreeLeastShareOf(Trees_High) == 0.12f &&
                   TreeThinPixelsOf(Trees_High) == 0.0f,
-              "trees: High's far plants as they always were - every leaf within ten crowns' reach, 0.12 of them at the "
-              "least, the bark whole at every distance");
+              "trees: High's far plants - every leaf within twenty crowns' reach, 0.12 of them at the least, the bark "
+              "whole at every distance");
         Check(TreeFullReachOf(Trees_Low) < TreeFullReachOf(Trees_Medium) &&
                   TreeFullReachOf(Trees_Medium) < TreeFullReachOf(Trees_High) &&
                   TreeLeastShareOf(Trees_Low) < TreeLeastShareOf(Trees_Medium) &&
@@ -6537,14 +6651,15 @@ static void TestGrass()
         Check(R.Aa == AaChoice_Auto && R.Upscale == Upscaling_NativeAA && R.ShadowQ == ShadowQuality_High && R.bShadows &&
               R.Hdr == Hdr_Ten && R.Ao == Ao_Ssao && R.Water == Water_High && R.Reflections == Reflections_High &&
               R.Geometry == Geometry_Pom && R.bSoft && R.bVolumetric && R.bDof && R.bEndless && R.bFire && R.bFogRooms &&
-              R.Flashlight == Flashlight_Fixed && R.ForceField == ForceField_Volume && R.Grass == Grass_High && R.Trees == Trees_High &&
+              R.Flashlight == Flashlight_Fixed && R.ForceField == ForceField_Volume && R.Grass == Grass_Medium && R.Trees == Trees_Medium &&
               R.bWind && !R.bBlur && !R.bRays && !R.bAberr && !R.bVign && !R.bGrain && R.Bloom == Bloom_Off &&
               R.Flare == LensFlare_Off && !R.bFrameGen && !R.bVsync && R.FpsLimit == FpsLimit_Auto,
               "presets: Recommended, line by line");
         Check(I.ShadowQ == ShadowQuality_Rt && I.Hdr == Hdr_On && I.Ao == Ao_Rt && I.Reflections == Reflections_RtMedium &&
-              I.Geometry == Geometry_Tess && I.Grass == R.Grass && I.Trees == R.Trees && I.bWind == R.bWind &&
+              I.Geometry == Geometry_TessHigh && I.Grass == Grass_High && I.Trees == Trees_High && I.bWind == R.bWind &&
               I.bVolumetric == R.bVolumetric && I.Water == R.Water && I.Flashlight == Flashlight_Everybody,
-              "presets: INeverAskedForThis - the rays, HDR and the displacement mapping, the rest Recommended's");
+              "presets: INeverAskedForThis - the rays, HDR, the displacement mapping and the plants at High, the rest "
+              "Recommended's");
         Check(V.Aa == AaChoice_Off && V.Upscale == Upscaling_Off && !V.bShadows && V.Hdr == Hdr_Off && V.Ao == Ao_Off &&
               V.Water == Water_Off && V.Reflections == Reflections_Default && V.FpsLimit == FpsLimit_Off &&
               V.Geometry == Geometry_Off && !V.bSoft && !V.bVolumetric && !V.bDof && !V.bEndless && !V.bFire &&
@@ -6845,11 +6960,33 @@ static void TestMeshRound()
     Check(RdxMath::SpherifierDistanceOf(8) == 8 && RdxMath::SpherifierDistanceOf(0) == 1 &&
               RdxMath::SpherifierDistanceOf(-3) == 1 && RdxMath::SpherifierDistanceOf(40) == 16,
           "models rounded: the distance setting is held to 1..16");
-    // The presets switch it, nothing more: off in Vanilla, on in the other two.
-    Check(RdxMath::PresetPicture(RdxMath::Preset_Recommended).bSpherifier &&
-              RdxMath::PresetPicture(RdxMath::Preset_INeverAskedForThis).bSpherifier &&
-              !RdxMath::PresetPicture(RdxMath::Preset_Vanilla).bSpherifier,
-          "models rounded: the spherifier is on in Recommended and INeverAskedForThis, off in Vanilla");
+    // The presets set its level, nothing more: off in Vanilla, Medium in Recommended, High in INeverAskedForThis.
+    Check(RdxMath::PresetPicture(RdxMath::Preset_Recommended).Spherifier == RdxMath::Spherifier_Medium &&
+              RdxMath::PresetPicture(RdxMath::Preset_INeverAskedForThis).Spherifier == RdxMath::Spherifier_High &&
+              RdxMath::PresetPicture(RdxMath::Preset_Vanilla).Spherifier == RdxMath::Spherifier_Off,
+          "models rounded: the spherifier is Medium in Recommended, High in INeverAskedForThis, off in Vanilla");
+    // Its word in the settings file: the four levels, and On - the file's own word for it - as Medium.
+    Check(RdxMath::ParseSpherifier("Off") == RdxMath::Spherifier_Off &&
+              RdxMath::ParseSpherifier("low") == RdxMath::Spherifier_Low &&
+              RdxMath::ParseSpherifier("MEDIUM") == RdxMath::Spherifier_Medium &&
+              RdxMath::ParseSpherifier("High") == RdxMath::Spherifier_High &&
+              RdxMath::ParseSpherifier("On") == RdxMath::Spherifier_Medium && RdxMath::ParseSpherifier("True") == -1,
+          "models rounded: Off, Low, Medium, High and On (Medium) are read, anything else is not");
+    {
+        char SName[16];
+        bool bAll = true;
+        for (int l = 0; l < RdxMath::Spherifier_Count; l++)
+        {
+            RdxMath::SpherifierName(l, SName, 16);
+            bAll = bAll && RdxMath::ParseSpherifier(SName) == l;
+        }
+        RdxMath::SpherifierName(RdxMath::Spherifier_Low, SName, 16);
+        Check(bAll && strcmp(SName, "Low") == 0, "models rounded: each level's word is read back as itself");
+    }
+    Check(RdxMath::SpherifierSagOf(RdxMath::Spherifier_High) == 0.25f &&
+              RdxMath::SpherifierSagOf(RdxMath::Spherifier_Medium) > RdxMath::SpherifierSagOf(RdxMath::Spherifier_High) &&
+              RdxMath::SpherifierSagOf(RdxMath::Spherifier_Low) > RdxMath::SpherifierSagOf(RdxMath::Spherifier_Medium),
+          "models rounded: High cuts the curves as finely as the spherifier was made, Medium and Low coarser");
     // A flat polygon of several faces moved along its plane as one (PolyPlaneMoveAt): on its outline as the outline's own
     // curve there, along the plane alone; nothing at a corner; and smoothly on from the outline inside.
     {
@@ -7236,6 +7373,55 @@ static void TestMeshRound()
         Check(Most < 8.5f && Most > 1.0f, "models rounded: a long wall's bend at a soft corner moves it by about the cap");
         Check(fabsf(Half.Y) < 0.01f, "models rounded: ... and half way along the wall stands where it was");
     }
+    // A face laid on another (a datacube's screen on its top): where the surface under it, bowed, would come out to it,
+    // the flat polygon under it is held - its true edge stays fixed; laid further off than the surface bows to, it
+    // leaves the surface bowing, as with nothing laid on it.
+    {
+        // A top (A0..A3) with a soft slope off its edge A1-A2, and a screen laid over the top at height Z (none: 0).
+        auto Build = [](FTestMesh& M, float Z)
+        {
+            const int A0 = M.Add(0.0f, 0.0f, 0.0f), A1 = M.Add(10.0f, 0.0f, 0.0f), A2 = M.Add(10.0f, 10.0f, 0.0f),
+                      A3 = M.Add(0.0f, 10.0f, 0.0f), B1 = M.Add(20.0f, 0.0f, -2.0f), B2 = M.Add(20.0f, 10.0f, -2.0f);
+            M.Face(A0, A1, A2);
+            M.Face(A0, A2, A3);
+            M.Face(A1, B1, B2);
+            M.Face(A1, B2, A2);
+            if (Z > 0.0f)
+            {
+                const int D0 = M.Add(2.0f, 2.0f, Z), D1 = M.Add(8.0f, 2.0f, Z), D2 = M.Add(8.0f, 8.0f, Z),
+                          D3 = M.Add(2.0f, 8.0f, Z);
+                M.Face(D0, D1, D2);
+                M.Face(D0, D2, D3);
+            }
+        };
+        FTestMesh  BareMesh;
+        FTestShape Bare;
+        Build(BareMesh, 0.0f);
+        Check(Bare.Make(BareMesh, nullptr, TestTurn, 8.0f), "models rounded: a top and a soft slope make a shape");
+        // How far the top bows out over the screen's square, 2 to 8 each way (face 0 holds X >= Y, face 1 the rest).
+        float Bow = 0.0f;
+        for (int i = 0; i <= 6; i++)
+            for (int j = 0; j <= 6; j++)
+            {
+                const float            X = 2.0f + (float)i, Y = 2.0f + (float)j;
+                const RdxMeshRound::FV Q = (X >= Y) ? Bare.S.MovedAt(0, 1.0f - 0.1f * X, 0.1f * (X - Y), 0.1f * Y)
+                                                    : Bare.S.MovedAt(1, 1.0f - 0.1f * Y, 0.1f * X, 0.1f * (Y - X));
+                Bow = (Q.Z > Bow) ? Q.Z : Bow;
+            }
+        FTestMesh  NearMesh, FarMesh;
+        FTestShape Near, Far;
+        Build(NearMesh, 0.5f * Bow);
+        Build(FarMesh, 2.0f * Bow);
+        Check(Near.Make(NearMesh, nullptr, TestTurn, 8.0f) && Far.Make(FarMesh, nullptr, TestTurn, 8.0f) &&
+                  0.5f * Bow > Near.S.PlaneHair && 2.0f * Bow <= 8.0f,
+              "models rounded: ... and with a screen laid over the top at half and at twice the height it bows to");
+        Check(Bare.S.EdgeKind[Bare.S.EdgeOf[0 * 3 + 1]] == FShape::Edge_Soft,
+              "models rounded: the top's edge to the slope (A1-A2) bows");
+        Check(Near.S.EdgeKind[Near.S.EdgeOf[0 * 3 + 1]] == FShape::Edge_Fixed,
+              "models rounded: a screen laid nearer the top than it bows to holds it - the edge stays where it is");
+        Check(Far.S.EdgeKind[Far.S.EdgeOf[0 * 3 + 1]] == FShape::Edge_Soft,
+              "models rounded: one laid further off than it bows to leaves the edge bowing");
+    }
     // Two vertices at one place are one: the fans and the bends go across them - and so are two a hair apart.
     {
         FTestMesh M;
@@ -7281,6 +7467,68 @@ static void TestMeshRound()
 }
 
 // ---------------------------------------------------------------------------
+// The lists' room (Spherify.h's RoomFor): a block of RoomAskFrom bytes or more asked of the hook first, refused where
+// it says no - the list's growing failing as with no memory, what it held kept; smaller blocks not asked; and a length
+// whose bytes a size_t cannot count refused without asking the system.
+static int    GRoomAsked = 0;
+static size_t GRoomMost  = 0;
+static bool   RoomUnder(size_t Bytes)
+{
+    GRoomAsked++;
+    return Bytes <= GRoomMost;
+}
+
+static void TestRoomFor()
+{
+    printf("the lists' room\n");
+    RdxSphere::FRoomFor& Hook = RdxSphere::RoomFor();
+    const RdxSphere::FRoomFor Was = Hook;
+    Hook       = RoomUnder;
+    GRoomMost  = (size_t)4 << 20;
+    GRoomAsked = 0;
+    {
+        // Small blocks are never asked about.
+        RdxSphere::TList<int> Small;
+        bool bAll = true;
+        for (int i = 0; i < 1000 && bAll; i++)
+            bAll = Small.Add(i);
+        Check(bAll && Small.Num == 1000, "a small list grows as before");
+        Check(GRoomAsked == 0, "a block under RoomAskFrom is not asked about");
+    }
+    {
+        // A list growing past the hook's four megabytes: refused there, what it held kept.
+        RdxSphere::TList<double> Big;
+        int Added = 0;
+        while (Big.Add((double)Added))
+            Added++;
+        Check(GRoomAsked > 0, "a large block is asked about");
+        Check((size_t)Big.Room * sizeof(double) <= GRoomMost, "the list stays within the room it was given");
+        Check(Added == Big.Num && Added > 0, "the refused growing leaves the list as it was");
+        bool bKept = true;
+        for (int i = 0; i < Big.Num && bKept; i++)
+            bKept = Big[i] == (double)i;
+        Check(bKept, "what the list held is kept");
+        Check(!Big.ReserveExact(Big.Room + (int)(GRoomMost / sizeof(double))), "an exact reserve past the room fails");
+        GRoomMost = (size_t)64 << 20;
+        Check(Big.Add(-1.0) && Big[Big.Num - 1] == -1.0, "with more room the same list grows on");
+    }
+    {
+        // A length whose bytes a size_t cannot count: refused before the system or the hook is asked.
+        struct FFat
+        {
+            double V[64];
+        };
+        RdxSphere::TList<FFat> Fat;
+        GRoomAsked     = 0;
+        GRoomMost      = ~(size_t)0;
+        const bool bOk = Fat.ReserveExact(0x7FFFFFFF);
+        Check(!bOk || sizeof(size_t) > 4, "a length past what a size_t counts is refused");
+        if (sizeof(size_t) == 4)
+            Check(GRoomAsked == 0, "the refusal comes before the hook is asked");
+    }
+    Hook = Was;
+}
+
 // The level rounded (LevelRound.h)
 // ---------------------------------------------------------------------------
 
@@ -7618,7 +7866,7 @@ static void TestLevelRound()
         RdxSphere::FV3       None;
         const RdxSphere::FV3 A0 = R.ChordEnds[2 * First], B0 = R.ChordEnds[2 * First + 1];
         const RdxSphere::FV3 Mid0 = (A0 + B0) * 0.5, Away = Mid0 * (1.0 + 2.0 / RdxSphere::Length(Mid0 - RdxSphere::V3(0.0, 0.0, Mid0.Z)));
-        Check(bSame && Off < 1e-3 && Bow > 1e-4 && Bow <= (double)RdxLevelRound::Sag + 0.05 &&
+        Check(bSame && Off < 1e-3 && Bow > 1e-4 && Bow <= (double)RdxLevelRound::HighSag + 0.05 &&
                   !RdxLevelRound::PackedChordAt(Words, (unsigned int)First, RdxSphere::V3(Away.X, Away.Y, Mid0.Z), None) &&
                   !RdxLevelRound::PackedChordAt(Words, (unsigned int)R.ChordFirst.Num, Mid0, None),
               "relief outline: the card's copy puts a place of the edge on the triangles' side, off the curve, and none "
@@ -8167,6 +8415,306 @@ static void TestBevelCut()
           "bevel cut: one edge - three strips along it");
     printf("  four edges: %d pieces, %d points; one edge: %d pieces, %d points\n", FourPieces, FourPoints, Count,
            Points.Num);
+}
+
+// A list whose room is one - made one long on its first sizing, or cut down to one it holds - grows on: half of one is
+// none, and growing by half alone kept it one, the loop endless (a level's load hung on it, 2026-11-06).
+// A rounding abandoned (RdxSphere::Abandoned, set by whoever waits to throw it away) gives up at its next part's end; the
+// flag put back, the same level is rounded whole.
+static void TestRoundAbandoned()
+{
+    printf("a rounding abandoned\n");
+    const double Angle = (double)RdxMath::SpherifierAngleDefault;
+    FTestLevel   L;
+    L.Pillar(12, 64.0, 128.0);
+    RdxSphere::FResult R;
+    RdxSphere::Abandoned() = true;
+    const bool bGaveUp = !RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+    RdxSphere::Abandoned() = false;
+    Check(bGaveUp, "a rounding abandoned gives up");
+    RdxSphere::FResult Again;
+    Check(RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, Again) && Again.Tri.Num > 0,
+          "the flag put back, the same level is rounded whole");
+}
+
+// A rounding abandoned at each of its parts' ends in turn - the flag raised from its own clock, which the end of every
+// part reads -: whichever part it was in, every list it had made is given back.
+static int    GAbandonAtRead = -1, GClockReads = 0;
+static double AbandonClock()
+{
+    if (++GClockReads == GAbandonAtRead)
+        RdxSphere::Abandoned() = true;
+    return 0.0;
+}
+static void TestRoundAbandonedEachPart()
+{
+    printf("a rounding abandoned at each part's end\n");
+    const double Angle = (double)RdxMath::SpherifierAngleDefault;
+    FTestLevel   L;
+    L.Pillar(12, 64.0, 128.0);
+    int Reads = 0;
+    {
+        RdxSphere::FResult R;
+        R.Seconds      = AbandonClock;
+        GAbandonAtRead = -1;
+        GClockReads    = 0;
+        RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        Reads = GClockReads;
+    }
+    int GaveUp = 0, Kept = 0;
+    for (int At = 1; At <= Reads; At++)
+    {
+        const long long Before = RdxSphere::ListBytesHeld();
+        {
+            RdxSphere::FResult R;
+            R.Seconds      = AbandonClock;
+            GAbandonAtRead = At;
+            GClockReads    = 0;
+            GaveUp += RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R) ? 0 : 1;
+            RdxSphere::Abandoned() = false;
+        }
+        Kept += (RdxSphere::ListBytesHeld() != Before) ? 1 : 0;
+    }
+    GAbandonAtRead = -1;
+    Check(Reads > 1 && GaveUp > 1 && Kept == 0,
+          "an abandoned rounding gives back every list it held, whichever part's end it gave up at");
+}
+
+static void TestListGrowsFromOne()
+{
+    printf("a list grows from room for one\n");
+    RdxSphere::TList<int> L;
+    bool bOk = L.Resize(1);
+    for (int i = 0; i < 100 && bOk; i++)
+        bOk = L.Add(i);
+    RdxSphere::TList<int> M;
+    bool bShrunk = M.Add(7);
+    M.Shrink();
+    for (int i = 0; i < 10 && bShrunk; i++)
+        bShrunk = M.Add(i);
+    Check(bOk && L.Num == 101 && bShrunk && M.Num == 11, "list: grows from room for one, sized or shrunk to it");
+}
+
+// The fine bevel's cuts into triangles (LevelBevel.h): a piece cut the best-shaped way - a band's points on a side of
+// a face whose only far corner is across it go to the near corners, not in slivers to the far one; a piece the moves
+// bent out of convex cut where its places now are, its triangles covering it once; and a piece's ring read back from
+// its triangles.
+static void TestBevelTriangles()
+{
+    printf("the bevel's triangles\n");
+    using RdxSphere::FV3;
+    const FV3 Up = RdxSphere::V3(0.0, 0.0, 1.0);
+    // Triangle a, b, c's shape - twice its area over its longest side's square -, and its area along Up, signed.
+    auto Shape = [](const FV3& A, const FV3& B, const FV3& C) {
+        const FV3    X  = RdxSphere::Cross(B - A, C - A);
+        const double L  = fmax(RdxSphere::Length(B - A), fmax(RdxSphere::Length(C - B), RdxSphere::Length(A - C)));
+        return RdxSphere::Length(X) / (L * L);
+    };
+    auto Area = [&](const FV3& A, const FV3& B, const FV3& C) { return 0.5 * RdxSphere::Dot(RdxSphere::Cross(B - A, C - A), Up); };
+
+    // A square with a band's two points on its left side by its top corner: the best-shaped cut.
+    const FV3 Sq[6] = { RdxSphere::V3(0.0, 0.0, 0.0), RdxSphere::V3(10.0, 0.0, 0.0), RdxSphere::V3(10.0, 10.0, 0.0),
+                        RdxSphere::V3(0.0, 10.0, 0.0), RdxSphere::V3(0.0, 9.5, 0.0), RdxSphere::V3(0.0, 9.0, 0.0) };
+    RdxSphere::TList<int> Ids, Tri;
+    for (int c = 0; c < 6; c++)
+        Ids.Add(c);
+    const bool bCut = RdxLevelRound::BevelDetail::CutIntoTriangles([&](int w) { return Sq[w]; }, Ids, Up, 1.0, Tri);
+    double Worst = 1e30, Sum = 0.0;
+    bool   bUp = true, bAll[6] = {};
+    for (int t = 0; bCut && t + 2 < Tri.Num; t += 3)
+    {
+        const FV3 A = Sq[Tri[t]], B = Sq[Tri[t + 1]], C = Sq[Tri[t + 2]];
+        Worst = fmin(Worst, Shape(A, B, C));
+        Sum += Area(A, B, C);
+        bUp = bUp && Area(A, B, C) > 0.0;
+        bAll[Tri[t]] = bAll[Tri[t + 1]] = bAll[Tri[t + 2]] = true;
+    }
+    bool bEvery = true;
+    for (int c = 0; c < 6; c++)
+        bEvery = bEvery && bAll[c];
+    Check(bCut && Tri.Num == 12 && bUp && bEvery && fabs(Sum - 100.0) < 1e-9,
+          "bevel triangles: a square with two points on a side cut into four triangles, every corner on one");
+    // The fan from the far corner (10, 0) would leave the sliver (10, 0), (0, 9), (0, 9.5) - its shape 0.026; the near
+    // corner's are about twice that.
+    Check(Worst > 0.045, "bevel triangles: the side's points go to the near corner, not in slivers to the far one");
+
+    // The piece's ring back from its triangles, from the first triangle's first corner.
+    int Ring[6] = {};
+    const bool bRing = bCut && RdxLevelRound::BevelDetail::RingOfTriangles(&Tri[0], 4, Ring, 6);
+    bool bSame = bRing;
+    for (int c = 0; c < 6 && bSame; c++)
+        bSame = Ring[c] == (Tri[0] + c) % 6;
+    Check(bSame, "bevel triangles: a piece's ring read back from its triangles");
+
+    // A dart: a square whose top middle corner the moves pushed down into it - convex no more.
+    const FV3 Dart[5] = { RdxSphere::V3(0.0, 0.0, 0.0), RdxSphere::V3(4.0, 0.0, 0.0), RdxSphere::V3(4.0, 4.0, 0.0),
+                          RdxSphere::V3(2.0, 1.0, 0.0), RdxSphere::V3(0.0, 4.0, 0.0) };
+    const int DartIds[5] = { 0, 1, 2, 3, 4 };
+    int       Out[9]     = {};
+    const bool bMoved = RdxLevelRound::BevelDetail::CutMovedIntoTriangles(Dart, DartIds, 5, Up, Out);
+    double     DartSum = 0.0;
+    bool       bDartUp = true;
+    for (int t = 0; bMoved && t < 9; t += 3)
+    {
+        const double A = Area(Dart[Out[t]], Dart[Out[t + 1]], Dart[Out[t + 2]]);
+        DartSum += A;
+        bDartUp = bDartUp && A > 0.0;
+    }
+    // The dart's area: the square's 16 less the notch (4, 4), (2, 1), (0, 4): 6.
+    Check(bMoved && bDartUp && fabs(DartSum - 10.0) < 1e-9,
+          "bevel triangles: a piece the moves bent out of convex cut where its places are, covering it once");
+    // Folded over - one corner across the piece's far side: no ears left.
+    const FV3 Folded[4] = { RdxSphere::V3(0.0, 0.0, 0.0), RdxSphere::V3(4.0, 0.0, 0.0), RdxSphere::V3(0.0, 4.0, 0.0),
+                            RdxSphere::V3(4.0, 4.0, 0.0) };
+    const int FoldedIds[4] = { 0, 1, 2, 3 };
+    Check(!RdxLevelRound::BevelDetail::CutMovedIntoTriangles(Folded, FoldedIds, 4, Up, Out),
+          "bevel triangles: a piece the moves fold is left as it was cut");
+}
+
+// The level's fine bevel (LevelBevel.h) on boxes the rounding leaves still: a box's twelve edges rounded by a ball of a
+// unit, the whole still closed, every place a unit from the box worn down by it - its faces, its quarter cylinders and
+// its corners' eighths of a ball all lie so -, no triangle turned over; a slab thinner than twice the radius keeps its
+// long edges sharp.
+static void TestLevelBevel()
+{
+    printf("level bevelled\n");
+    const double Angle  = (double)RdxMath::SpherifierAngleDefault;
+    const double Radius = 1.0;
+    // A box from Lo to Hi: its six faces, each its corners round its outward normal.
+    auto Box = [](FTestLevel& L, RdxSphere::FV3 Lo, RdxSphere::FV3 Hi) {
+        const double X0 = Lo.X, Y0 = Lo.Y, Z0 = Lo.Z, X1 = Hi.X, Y1 = Hi.Y, Z1 = Hi.Z;
+        const RdxSphere::FV3 Faces[6][4] = {
+            { RdxSphere::V3(X0, Y0, Z1), RdxSphere::V3(X1, Y0, Z1), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X0, Y1, Z1) },
+            { RdxSphere::V3(X0, Y0, Z0), RdxSphere::V3(X0, Y1, Z0), RdxSphere::V3(X1, Y1, Z0), RdxSphere::V3(X1, Y0, Z0) },
+            { RdxSphere::V3(X0, Y0, Z0), RdxSphere::V3(X1, Y0, Z0), RdxSphere::V3(X1, Y0, Z1), RdxSphere::V3(X0, Y0, Z1) },
+            { RdxSphere::V3(X0, Y1, Z0), RdxSphere::V3(X0, Y1, Z1), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X1, Y1, Z0) },
+            { RdxSphere::V3(X0, Y0, Z0), RdxSphere::V3(X0, Y0, Z1), RdxSphere::V3(X0, Y1, Z1), RdxSphere::V3(X0, Y1, Z0) },
+            { RdxSphere::V3(X1, Y0, Z0), RdxSphere::V3(X1, Y1, Z0), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X1, Y0, Z1) },
+        };
+        for (int f = 0; f < 6; f++)
+            L.Poly(Faces[f], 4);
+    };
+    // How far P lies from the box Lo..Hi worn down by the radius.
+    auto FromWorn = [&](RdxSphere::FV3 P, RdxSphere::FV3 Lo, RdxSphere::FV3 Hi) {
+        const double Dx = fmax(fmax(Lo.X + Radius - P.X, 0.0), P.X - (Hi.X - Radius));
+        const double Dy = fmax(fmax(Lo.Y + Radius - P.Y, 0.0), P.Y - (Hi.Y - Radius));
+        const double Dz = fmax(fmax(Lo.Z + Radius - P.Z, 0.0), P.Z - (Hi.Z - Radius));
+        return sqrt(Dx * Dx + Dy * Dy + Dz * Dz);
+    };
+    {
+        FTestLevel                L;
+        const RdxSphere::FV3      Lo = RdxSphere::V3(0.0, 0.0, 0.0), Hi = RdxSphere::V3(64.0, 64.0, 32.0);
+        Box(L, Lo, Hi);
+        RdxSphere::FResult        R;
+        RdxLevelRound::FBevelStats S;
+        RdxLevelRound::FBevelMade  M;
+        const bool bRound = RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        Check(bRound && R.Tri.Num == 0, "bevel: the rounding leaves a box still");
+        const bool bBevel = RdxLevelRound::Bevel(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, nullptr, nullptr, 0,
+                                                 Angle, Radius, R, S, M);
+        Check(bBevel, "bevel: made");
+        Check(S.Edges == 12 && S.LeftFree == 0 && S.LeftThin == 0,
+              "bevel: a box's twelve edges, none left sharp");
+        Check(M.Polygons == 6 && M.LeftTouching == 0 && M.LeftWorn == 0 && M.PiecesFlat == 0 && M.SidesMissed == 0,
+              "bevel: its six faces cut, nothing left sharp after");
+        Check(LevelClosed(R), "bevel: the box stays closed");
+        double Worst = 0.0;
+        for (int t = 0; t < R.Tri.Num; t++)
+            Worst = fmax(Worst, fabs(FromWorn(R.Moved[R.Tri[t]], Lo, Hi) - Radius));
+        Check(Worst < 1e-6, "bevel: every place a unit from the worn box (faces, cylinders, the corners' balls)");
+        // No triangle turned over: its normal along the way out from the worn box at its middle.
+        int Over = 0;
+        for (int t = 0; t + 2 < R.Tri.Num; t += 3)
+        {
+            const RdxSphere::FV3 A = R.Moved[R.Tri[t]], B = R.Moved[R.Tri[t + 1]], C = R.Moved[R.Tri[t + 2]];
+            const RdxSphere::FV3 Mid = (A + B + C) * (1.0 / 3.0);
+            const RdxSphere::FV3 In  = RdxSphere::V3(fmin(fmax(Mid.X, Lo.X + Radius), Hi.X - Radius),
+                                                     fmin(fmax(Mid.Y, Lo.Y + Radius), Hi.Y - Radius),
+                                                     fmin(fmax(Mid.Z, Lo.Z + Radius), Hi.Z - Radius));
+            if (RdxSphere::Dot(RdxSphere::Cross(B - A, C - A), Mid - In) <= 0.0)
+                Over++;
+        }
+        Check(Over == 0, "bevel: no triangle turned over");
+        // The faces' middles stay where they were.
+        int MiddleMoved = 0;
+        for (int w = 0; w < R.Orig.Num; w++)
+        {
+            const RdxSphere::FV3& P = R.Orig[w];
+            const bool bInside = P.X > Lo.X + 2.0 && P.X < Hi.X - 2.0 && P.Y > Lo.Y + 2.0 && P.Y < Hi.Y - 2.0;
+            if (bInside && RdxSphere::Length(R.Moved[w] - P) > 0.0)
+                MiddleMoved++;
+        }
+        Check(MiddleMoved == 0, "bevel: the faces' middles stay");
+    }
+    // A slab 1.5 thick: its four long edges' faces are too narrow for both bands - left sharp - and so the slab is left
+    // as it was.
+    {
+        FTestLevel                 L;
+        Box(L, RdxSphere::V3(0.0, 0.0, 0.0), RdxSphere::V3(64.0, 64.0, 1.5));
+        RdxSphere::FResult         R;
+        RdxLevelRound::FBevelStats S;
+        RdxLevelRound::FBevelMade  M;
+        RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        const bool bBevel = RdxLevelRound::Bevel(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, nullptr, nullptr, 0,
+                                                 Angle, Radius, R, S, M);
+        Check(bBevel && S.LeftThin >= 8, "bevel: a slab thinner than twice the radius keeps its long edges sharp");
+        int Moved = 0;
+        for (int w = 0; w < R.Orig.Num; w++)
+            if (RdxSphere::Length(R.Moved[w] - R.Orig[w]) > 0.0)
+                Moved++;
+        Check(Moved == 0 || LevelClosed(R), "bevel: what of the slab is cut stays closed");
+    }
+    // A box whose front face is two polygons, the line between them just where the top edge's band ends: corners of the
+    // upper one on the band's line - more than one in a row -, one a few hundredths beyond it. The pieces either side
+    // of the line keep to their own halves of it: none of no area, the box closed, every place a unit from the worn box.
+    {
+        FTestLevel           L;
+        const RdxSphere::FV3 Lo = RdxSphere::V3(0.0, 0.0, -5.0), Hi = RdxSphere::V3(10.0, 10.0, 1.0);
+        const double         X0 = Lo.X, Y0 = Lo.Y, Z0 = Lo.Z, X1 = Hi.X, Y1 = Hi.Y, Z1 = Hi.Z;
+        const RdxSphere::FV3 Faces[5][4] = {
+            { RdxSphere::V3(X0, Y0, Z1), RdxSphere::V3(X1, Y0, Z1), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X0, Y1, Z1) },
+            { RdxSphere::V3(X0, Y0, Z0), RdxSphere::V3(X0, Y1, Z0), RdxSphere::V3(X1, Y1, Z0), RdxSphere::V3(X1, Y0, Z0) },
+            { RdxSphere::V3(X0, Y1, Z0), RdxSphere::V3(X0, Y1, Z1), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X1, Y1, Z0) },
+            { RdxSphere::V3(X0, Y0, Z0), RdxSphere::V3(X0, Y0, Z1), RdxSphere::V3(X0, Y1, Z1), RdxSphere::V3(X0, Y1, Z0) },
+            { RdxSphere::V3(X1, Y0, Z0), RdxSphere::V3(X1, Y1, Z0), RdxSphere::V3(X1, Y1, Z1), RdxSphere::V3(X1, Y0, Z1) },
+        };
+        for (int f = 0; f < 5; f++)
+            L.Poly(Faces[f], 4);
+        const RdxSphere::FV3 Upper[6] = { RdxSphere::V3(0.0, 0.0, 0.0),  RdxSphere::V3(2.0, 0.0, 0.0),
+                                          RdxSphere::V3(5.0, 0.0, -0.03), RdxSphere::V3(10.0, 0.0, 0.0),
+                                          RdxSphere::V3(10.0, 0.0, 1.0), RdxSphere::V3(0.0, 0.0, 1.0) };
+        const RdxSphere::FV3 Lower[6] = { RdxSphere::V3(0.0, 0.0, -5.0), RdxSphere::V3(10.0, 0.0, -5.0),
+                                          RdxSphere::V3(10.0, 0.0, 0.0), RdxSphere::V3(5.0, 0.0, -0.03),
+                                          RdxSphere::V3(2.0, 0.0, 0.0),  RdxSphere::V3(0.0, 0.0, 0.0) };
+        L.Poly(Upper, 6);
+        L.Poly(Lower, 6);
+        RdxSphere::FResult         R;
+        RdxLevelRound::FBevelStats S;
+        RdxLevelRound::FBevelMade  M;
+        const bool bRound = RdxLevelRound::Round(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, 8.0, Angle, R);
+        Check(bRound && R.Tri.Num == 0, "bevel: the rounding leaves the box of the split face still");
+        const bool bBevel = RdxLevelRound::Bevel(L.Pts.Data, L.Pts.Num, L.Polys.Data, L.Polys.Num, nullptr, nullptr, 0,
+                                                 Angle, Radius, R, S, M);
+        Check(bBevel && M.Polygons == 7 && M.PiecesFlat == 0 && M.SidesMissed == 0 && M.LeftTouching == 0,
+              "bevel: the split face's polygons cut along the band's line between them, no piece of no area");
+        Check(LevelClosed(R), "bevel: the box of the split face stays closed");
+        double Worst = 0.0;
+        for (int t = 0; t < R.Tri.Num; t++)
+            Worst = fmax(Worst, fabs(FromWorn(R.Moved[R.Tri[t]], Lo, Hi) - Radius));
+        Check(Worst < 1e-6, "bevel: every place of the box of the split face a unit from the worn box");
+        int Over = 0;
+        for (int t = 0; t + 2 < R.Tri.Num; t += 3)
+        {
+            const RdxSphere::FV3 A = R.Moved[R.Tri[t]], B = R.Moved[R.Tri[t + 1]], C = R.Moved[R.Tri[t + 2]];
+            const RdxSphere::FV3 Mid = (A + B + C) * (1.0 / 3.0);
+            const RdxSphere::FV3 In  = RdxSphere::V3(fmin(fmax(Mid.X, Lo.X + Radius), Hi.X - Radius),
+                                                     fmin(fmax(Mid.Y, Lo.Y + Radius), Hi.Y - Radius),
+                                                     fmin(fmax(Mid.Z, Lo.Z + Radius), Hi.Z - Radius));
+            if (RdxSphere::Dot(RdxSphere::Cross(B - A, C - A), Mid - In) <= 0.0)
+                Over++;
+        }
+        Check(Over == 0, "bevel: no triangle of the box of the split face turned over");
+    }
 }
 
 static void TestEdgeBevel()
@@ -9369,10 +9917,16 @@ int main(int argc, char** argv)
     TestGrass();
     TestTrees();
     TestMeshRound();
+    TestRoomFor();
     TestLevelRound();
     TestLevelHold();
     TestEdgeBevel();
     TestBevelCut();
+    TestLevelBevel();
+    TestBevelTriangles();
+    TestListGrowsFromOne();
+    TestRoundAbandoned();
+    TestRoundAbandonedEachPart();
     TestProbe();
 
     printf("\n%d checks, %d failed\n", GChecks, GFailed);

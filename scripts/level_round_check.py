@@ -24,7 +24,10 @@ import upkg  # noqa: E402
 import water_edge_survey as wes  # noqa: E402
 from volume_survey import Map  # noqa: E402
 
-TOOL = os.path.join(PROJ, 'build', 'levelroundcheck', 'LevelRoundCheck.exe')
+# The checker as last built: the 64-bit one (build\levelroundcheck64) and the 32-bit one (build\levelroundcheck) are
+# built apart, and the one not built for a while checks an older rounding than the source's.
+_TOOLS = [os.path.join(PROJ, 'build', d, 'LevelRoundCheck.exe') for d in ('levelroundcheck64', 'levelroundcheck')]
+TOOL = max((t for t in _TOOLS if os.path.exists(t)), key=os.path.getmtime, default=_TOOLS[0])
 WORK = os.path.join(PROJ, '_levelround')
 
 PF_INVISIBLE, PF_FAKEBACKDROP, PF_TWOSIDED, PF_PORTAL, PF_MIRRORED = 0x1, 0x80, 0x100, 0x4000000, 0x8000000

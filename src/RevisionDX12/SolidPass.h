@@ -223,6 +223,8 @@ public:
     // With DRED on (FBackend::RequestDred), every run's draw is preceded by a marker naming it, so a lost device's
     // breadcrumbs say which run the GPU stopped in.
     void  SetDredMarkers(UBOOL bOn) { bDredMarkers = bOn ? 1 : 0; }
+    // With DRED on: the run the GPU stopped in, from the pass's own breadcrumbs, into the log (FBackend::LogDred).
+    void  LogCrumbs();
     // The sub-pixel shift a temporal upscaler (FSR 3.1) asks for, in clip space: X = 2 * jitter in pixels / width,
     // Y = -2 * jitter / height, since the screen's y runs down and clip space's up. Zero without one, and then the
     // vertex shader adds nothing - the vanilla path is untouched (docs/szabaly-vanilla.md).
@@ -289,6 +291,14 @@ public:
 
     // FrameIndex: the frame slot this frame's vertices go to - see Dest.
     void Begin(INT Width, INT Height, INT FrameIndex);
+    // A level's change: the most a frame asked for forgotten, and each slot's buffer back to its first room at the slot's
+    // next frame start (VertexShrink).
+    void ForgetVertexPeak()
+    {
+        VertexPeak = 0;
+        for (INT f = 0; f < BACKEND_FRAME_COUNT; f++)
+            VertexShrink[f] = 1;
+    }
 
     // SrvIndex < 0 means untextured; the pass substitutes a white texture so the
     // shader needs no branch.
@@ -438,6 +448,14 @@ public:
     enum { ROOT_SPHERE = 10 };
     // And for the wet floors' block (b5, SetWetBlocks): the pass's own root signature's - no floor is drawn on rays.
     enum { ROOT_WET = 11 };
+    // And for this frame's room of the spherifier's pieces drawn from the card (t28, SphereRoom): the pass's own root
+    // signature's - such a run is never one on rays.
+    enum { ROOT_SPHERE_ROOM = 12 };
+    // The spherifier's pieces drawn from the card (AddSphereRun, RenderDevice.cpp's SphereCardOf): the run's mark in the
+    // screen tint's third number, which no colour has (a NaN's bits), the words of a run's record and of the frame's
+    // view in the room, and of a node's corner in the level's field - SolidPass.hlsl's SphereVertexOutOf reads them so.
+    static const UINT SPHERE_RUN_MARK = 0x7FC5A3E1u;
+    enum { SPHERE_RECORD_WORDS = 44, SPHERE_VIEW_WORDS = 16, SPHERE_CORNER_WORDS = 5 };
     void SetWaterConstants(const FLOAT* C) { for (INT i = 0; i < WATER_CONSTANTS; i++) WaterNow[i] = C[i]; }
     // What follows is seen through a mirror whose image is traced: the engine's own drawing of the see-through things
     // in the mirror - a flame, a sprite, a pane - which the rays' scene does not hold. It comes before the world and
@@ -561,6 +579,21 @@ public:
     // run is never extended by the geometry after it. False if the draw list is full or the stretch is not there.
     INT   GetVertexCount() const { return VertexCount; }
     UBOOL AddRepeatRun(INT Start, INT Count, INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL bNoSmooth);
+    // The spherifier's pieces drawn from the card (RenderDevice.cpp's SphereCardOf): this frame's room for a run's
+    // record or a view, Words of them - where to write them (write-combined, never read) and, in First, the first one's
+    // number in the room; null when the frame's room is used up: the node's pieces go the CPU's way.
+    FLOAT* SphereRoom(INT Words, INT& First);
+    // Whether AddSphereRun would take a run now: the level's field on the card, and no relief's patches' or model's
+    // state in force.
+    UBOOL  SphereRunsNow() const
+    {
+        return (Dest && SphereBuffer && SphereAddress && !bSphereDirty && !bTessNow && !bMeshNow) ? 1 : 0;
+    }
+    // A run drawing a node's TriCount triangles from the card: its record at RecordWord in this frame's room, the
+    // triangles' corners in the level's field (SetSphereField) - with the texture, light map, blend and filtering and
+    // every other state now in force, as the fan of its pieces would have had them. False: no such run can be drawn now
+    // - the field is not on the card yet, the state is a relief's patches or a model's, or the draw list is full.
+    UBOOL AddSphereRun(INT TriCount, INT RecordWord, INT SrvIndex, INT LightSrv, EBlendMode Mode, UBOOL bNoSmooth);
     // Grass3D (GrassShader.h, docs/terv-novenyzet-szel.md): the frame's room for the grass's blocks - one a draw: the
     // constants and the tiles the blades' vertex shader reads, Rows float4s, at most RdxMath::GrassBlockRows - and the
     // draws themselves, each a run of its own right after its ground's: drawn where the ground is, in whatever view
@@ -579,6 +612,13 @@ public:
     // GrassBlock's room), its picture, and the stencil kind and flashlight's share now in force.
     void   AddTreeDraw(const D3D12_VERTEX_BUFFER_VIEW& Vb, const D3D12_INDEX_BUFFER_VIEW& Ib, INT IndexStart,
                        INT IndexCount, D3D12_GPU_VIRTUAL_ADDRESS Block, INT SrvIndex, UBOOL bWorldView);
+    // How the leaves are drawn (LeafDepthPipelines): 0 their depth first, 1 in one pass as before, 2 the check.
+    void   SetLeafDepthMode(INT Mode) { LeafDepthMode = Mode; }
+    // A measurement only (the marker SecondRevision-world-skip.txt): kinds of the world's runs left undrawn, to see what
+    // each costs - the sum of: 1 the level's opaque surfaces, 2 the actors' opaque ones, 4 the see-through, 8 the
+    // modulated (decals, the detail textures' passes), 16 the fog, 32 the spherifier's pieces from the card, 64 the
+    // rounded models' patches. The relief's patches, the plants and the water are never left out.
+    void   SetWorldSkip(INT Kinds) { WorldSkip = Kinds; }
     UBOOL  CanTrees() const
     {
         return TreePipelines[0].Get() && LeafPipelines[0].Get() &&
@@ -771,6 +811,14 @@ private:
         UBOOL      bMesh;                    // mesh patches, rounded on the GPU (SetMeshRun); its numbers in Water
         UBOOL      bRepeat;                  // draws vertices another run drew (AddRepeatRun): never extended
         UBOOL      bInMirror;                // SetInMirror's: seen through a traced mirror, drawn over its image
+        // A node's pieces drawn from the card (AddSphereRun): VSMain makes its vertices from its record, at SphereWord
+        // in this frame's room, and from the level's field - none of them in the frame's vertex buffer. Never extended.
+        // SphereField: the field on the card when it was added, which its record's words are of - a rounding taken over
+        // later in the frame (a new one from the menu, or none) hands over another field, and this one is retired, not
+        // freed, while the frame may read it (RetireSphereField).
+        UBOOL      bSphere;
+        INT        SphereWord;
+        D3D12_GPU_VIRTUAL_ADDRESS SphereField;
         D3D12_GPU_VIRTUAL_ADDRESS ReliefBlock;   // its held edges and lamps (SetReliefHeld); zero: the frame's lamps
         // A grass run (AddGrassDraw): no vertices of its own - this many blades, made by the grass's vertex shader
         // from the block at GrassBlock. Zero for every other run.
@@ -829,11 +877,25 @@ private:
     // And the leaves': the same with their own vertex shader and a leaf's instance as the input (MakeTree).
     TComRef<ID3D12PipelineState> LeafPipelines[PIPE_SETS];
     TComRef<ID3DBlob>            LeafVs;
+    // The leaves drawn twice: their depth alone first, with the holes their picture has (PSCover), and their stencil
+    // kind - then their picture where its depth is equal to that, writing neither. Under the pass's own test, which
+    // passes equal, the leaf left in each pixel is the same either way - the last drawn of those nearest the eye - and
+    // the pixel is lit once, not once for every leaf behind it drawn before it. And the check's pair in their place
+    // (PSLeafHole, PSLeafCheck).
+    TComRef<ID3D12PipelineState> LeafDepthPipelines[PIPE_SETS];
+    TComRef<ID3D12PipelineState> LeafEqualPipelines[PIPE_SETS];
+    TComRef<ID3D12PipelineState> LeafHolePipelines[PIPE_SETS];
+    TComRef<ID3D12PipelineState> LeafCheckPipelines[PIPE_SETS];
+    // How the leaves are drawn this frame (SetLeafDepthMode): 0 their depth first, 1 in one pass as before, 2 the check.
+    INT                          LeafDepthMode = 0;
+    // The kinds of runs left undrawn this frame (SetWorldSkip), a measurement only.
+    INT                          WorldSkip = 0;
     // And the bark's relief made real (Geometry=DisplacementMapping): its triangles as patches, cut and pushed in by the
     // height map (TreeShader.h's VSTreePatch, HSTree, DSTree; MakeTree). None: the bark's relief is its shading alone.
     TComRef<ID3D12PipelineState> TreePatchPipelines[PIPE_SETS];
     TComRef<ID3DBlob>            TreePatchVs, TreeHs, TreeDs;
-    void MakeTree(ID3D12Device* Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& Desc);
+    void MakeTree(ID3D12Device* Device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& Desc, ID3DBlob* DepthPs,
+                  ID3DBlob* HolePs, ID3DBlob* CheckPs);
     // Wind: the see-through pipeline with the dust's vertex shader (MakeDust).
     TComRef<ID3D12PipelineState> DustPipelines[PIPE_SETS];
     TComRef<ID3DBlob>            DustVs;
@@ -862,6 +924,22 @@ private:
     FLOAT MipBias = 0.0f;                       // the world's textures' mip bias (SetMipBias)
     UBOOL bModeStats = 0;                       // measurement only: the per-blend-mode breakdown
     UBOOL bDredMarkers = 0;                     // see SetDredMarkers
+    // A lost device's own breadcrumbs, with DRED on (SetDredMarkers, LogCrumbs): before each run's draws the GPU writes
+    // the run's number once all work before it is done (WriteBufferImmediate's marker out), into a read-back buffer that
+    // outlives the loss - the run that number names is the one the GPU stopped in. Each Flush's runs kept described, the
+    // last few, to tell which run that was.
+    struct FCrumbRun
+    {
+        INT  Mode, Count, Start, Srv, LightSrv, PomTable;
+        BYTE bTess, bRelief, bMesh, bSphere, bRepeat, bInMirror, bGrass, bTree;
+    };
+    enum { CRUMB_FLUSHES = 4 };
+    TComRef<ID3D12Resource> Crumbs;
+    volatile UINT*          CrumbsMapped               = nullptr;
+    UINT                    CrumbSeq                   = 0;   // the Flush calls so far
+    UINT                    CrumbSeqOf[CRUMB_FLUSHES]  = {};  // each kept Flush's number
+    INT                     CrumbCountOf[CRUMB_FLUSHES] = {};
+    FCrumbRun*              CrumbRunsOf[CRUMB_FLUSHES] = {};  // MAX_RUNS each, made with the buffer
     UBOOL bAddedTranslucentOff = 0;             // measurement only: translucent draws skip the added target
     UBOOL bWaterMarkOff        = 0;             // measurement only: see SetWaterMarkOff
 
@@ -875,6 +953,10 @@ private:
     // refuses a buffer, is geometry dropped, and every such frame is counted.
     INT                     VertexRoom[BACKEND_FRAME_COUNT] = {};
     INT                     VertexPeak     = 0;
+    // A level's change asked each slot's buffer back to RdxMath::VertexRoomFirst (ForgetVertexPeak), at the slot's next
+    // frame start: a larger level's room is held in the upload heap - and in the 32-bit address space - for as long as
+    // the buffer lives, and the next level grows it again only where it asks for as much.
+    UBOOL                   VertexShrink[BACKEND_FRAME_COUNT] = {};
     INT                     VertexSwitchAt = -1;
     ID3D12Resource*         VertexOld      = nullptr;
     TComRef<ID3D12Resource> VertexJoined;
@@ -1047,6 +1129,13 @@ private:
     BYTE*           GrassMapped[BACKEND_FRAME_COUNT]  = {};
     INT             GrassUsed       = 0;
     UBOOL           bGrassFullSaid  = 0;
+    // The spherifier's pieces drawn from the card (SphereRoom): an upload buffer a frame slot - the runs' records and
+    // their nodes' corners, read by VSMain through t28.
+    enum { SPHERE_ROOM_BYTES = 4 * 1024 * 1024 };
+    ID3D12Resource* SphereRoomBuffers[BACKEND_FRAME_COUNT] = {};
+    BYTE*           SphereRoomMapped[BACKEND_FRAME_COUNT]  = {};
+    INT             SphereRoomUsed      = 0;
+    UBOOL           bSphereRoomFullSaid = 0;
     INT             GrassRuns       = 0;        // the frame's grass runs so far
     // The plants' draws this frame (AddTreeDraw), the runs pointing into it.
     enum { TREE_DRAWS = 2048 };

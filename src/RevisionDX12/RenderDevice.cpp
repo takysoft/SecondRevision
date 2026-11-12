@@ -6,6 +6,7 @@
 #include "Spherify.h"
 #include "MeshRound.h"
 #include "LevelRound.h"
+#include "LevelBevel.h"
 #include "PomArchive.h"
 #include "PresentWatch.h"
 #include "CrashLog.h"
@@ -207,6 +208,9 @@ enum { DRAW_SAMPLE = 8 };
 // were and how many pieces, and the time the turned-away polygons' bulges took (SphereBackBulges).
 static DOUBLE GSphereSurfSec = 0.0, GSphereBackSec = 0.0, GSpherePieceSec = 0.0, GSphereMade = 0.0;
 static DOUBLE GSphereSurfs = 0.0, GSpherePieces = 0.0;
+// And the nodes and their triangles drawn from the card (FSolidPass::AddSphereRun), the time the game thread spent on
+// their records (SphereCardOf), and how many corners the card turned for them.
+static DOUBLE GSphereCardNodes = 0.0, GSphereCardTris = 0.0, GSphereCardSec = 0.0, GSphereCardCorners = 0.0;
 struct FSphereSurfTimer
 {
     DOUBLE T0;
@@ -980,7 +984,7 @@ static const UBOOL        RdxDefaultEndlessWater    = 1;
 static const UBOOL        RdxDefaultFire3D          = 1;
 static const TCHAR* const RdxDefaultGrass3D         = TEXT("Medium");
 static const TCHAR* const RdxDefaultTrees3D         = TEXT("Medium");
-static const UBOOL        RdxDefaultSpherifier      = 1;
+static const TCHAR* const RdxDefaultSpherifier      = TEXT("Medium");
 static const INT          RdxDefaultSpherifierDistance = 8;
 static const INT          RdxDefaultSpherifierAngle = 105;
 static const UBOOL        RdxDefaultWind            = 1;
@@ -1390,7 +1394,6 @@ void URevisionRenderDevice::StaticConstructor()
     Preset  = RdxDefaultPreset;
     Vanilla = 0;
 
-
     // BorderlessWindow: the game in a borderless window over its monitor, with the engine in its WINDOWED mode - which
     // lets the mouse go in the menus (ESC, F1), so it can be taken to another monitor, and catches it again in play
     // (docs/nyitott-hibak.md 4., measured there). The picture is the same as in
@@ -1517,7 +1520,7 @@ void URevisionRenderDevice::StaticConstructor()
     Trees3D = RdxDefaultTrees3D;
     // Spherifier: the level's and the models' round shapes rounded (Spherify.h).
     new(GetClass(), TEXT("Spherifier"), RF_Public)
-        UBoolProperty(CPP_PROPERTY(Spherifier), TEXT("Options"), 0);
+        UStrProperty(CPP_PROPERTY(Spherifier), TEXT("Options"), 0);
     Spherifier = RdxDefaultSpherifier;
     // SpherifierDistance: the most it moves a wall, in the level's units.
     new(GetClass(), TEXT("SpherifierDistance"), RF_Public)
@@ -1567,7 +1570,6 @@ void URevisionRenderDevice::StaticConstructor()
     new(GetClass(), TEXT("GodRays"), RF_Public)
         UBoolProperty(CPP_PROPERTY(GodRays), TEXT("Options"), 0);
     GodRays = RdxDefaultGodRays;
-
 
     // ShadowVerticalWeight: how much more a light's height counts than its horizontal distance when the shadows pick the
     // nearest lights. The eye scans
@@ -1687,6 +1689,7 @@ static void LogWindowState(HWND Window, const TCHAR* When, INT ChainX, INT Chain
 // left behind switches nothing on for long. A game started the usual way has neither. It
 // becomes a real setting if the experiment proves out, and not before Alt+Tab is tested.
 static UBOOL FreshMarker(const WCHAR* Name);
+static UBOOL MarkerWrittenWithin(const WCHAR* Name, unsigned __int64 Seconds);
 
 // The shadow-visibility cull (RdxMath::ShadowCanReachView), off for one run with the marker
 // SecondRevision-shadow-visibility-off.txt. It has to be switchable, and not for tidiness: the cull takes the draws from
@@ -1821,12 +1824,9 @@ static UBOOL WantBorderless(UBOOL bSetting)
     return bSetting || FreshMarker(L"SecondRevision-borderless.txt");
 }
 
-// A fresh marker's first number, or Missing when the marker is not there (or holds no number). The file stays: unlike
-// the load sequence, these markers govern a whole run, not one event.
-static INT MarkerNumber(const WCHAR* Name, INT Missing, INT Empty)
+// A marker's first number, whatever its age: Missing when it is not there, Empty when it holds no number.
+static INT MarkerFileNumber(const WCHAR* Name, INT Missing, INT Empty)
 {
-    if (!FreshMarker(Name))
-        return Missing;
     WCHAR       Path[MAX_PATH + 64];
     const DWORD N = ::GetTempPathW(MAX_PATH, Path);
     if (N == 0 || N >= MAX_PATH)
@@ -1852,6 +1852,25 @@ static INT MarkerNumber(const WCHAR* Name, INT Missing, INT Empty)
             break;
     }
     return (Value >= 0) ? Value : Empty;
+}
+
+// A fresh marker's first number, or Missing when the marker is not there (or holds no number). The file stays: unlike
+// the load sequence, these markers govern a whole run, not one event.
+static INT MarkerNumber(const WCHAR* Name, INT Missing, INT Empty)
+{
+    if (!FreshMarker(Name))
+        return Missing;
+    return MarkerFileNumber(Name, Missing, Empty);
+}
+
+// The first number of a marker a measuring run changes while the game plays (looked for once a second): whatever its age
+// within a day, Missing past it - one a stopped run left behind, or a script parked with the year 2000's stamp, does not
+// change a later game.
+static INT LiveMarkerNumber(const WCHAR* Name, INT Missing, INT Empty)
+{
+    if (!MarkerWrittenWithin(Name, 24ull * 60 * 60))
+        return Missing;
+    return MarkerFileNumber(Name, Missing, Empty);
 }
 
 // A fresh marker's first line as text (a folder, say), or 0 when the marker is not there or holds nothing.
@@ -1887,8 +1906,8 @@ static UBOOL MarkerLine(const WCHAR* Name, WCHAR* Out, INT Max)
     return n > 0;
 }
 
-// A marker file in the temp folder, written less than 10 minutes ago.
-static UBOOL FreshMarker(const WCHAR* Name)
+// A marker file in the temp folder, written less than Seconds ago.
+static UBOOL MarkerWrittenWithin(const WCHAR* Name, unsigned __int64 Seconds)
 {
     WCHAR Path[MAX_PATH + 64];
     const DWORD N = ::GetTempPathW(MAX_PATH, Path);
@@ -1902,7 +1921,13 @@ static UBOOL FreshMarker(const WCHAR* Name)
     ::GetSystemTimeAsFileTime(&Now);
     const unsigned __int64 T = ((unsigned __int64)A.ftLastWriteTime.dwHighDateTime << 32) | A.ftLastWriteTime.dwLowDateTime;
     const unsigned __int64 C = ((unsigned __int64)Now.dwHighDateTime << 32) | Now.dwLowDateTime;
-    return C >= T && C - T < 10ull * 60 * 10000000;      // FILETIME counts 100 ns
+    return C >= T && C - T < Seconds * 10000000ull;      // FILETIME counts 100 ns
+}
+
+// A marker file in the temp folder, written less than 10 minutes ago.
+static UBOOL FreshMarker(const WCHAR* Name)
+{
+    return MarkerWrittenWithin(Name, 10ull * 60);
 }
 
 // ---------------------------------------------------------------------------
@@ -1937,7 +1962,7 @@ static UBOOL ReadLoadSequence(INT* Saves, INT MaxSaves, INT& Count, FLOAT& Dwell
     HANDLE F = ::CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (F == INVALID_HANDLE_VALUE)
         return 0;
-    char        Text[256];
+    char        Text[1024];   // room for StepLoadSequence's most saves, each number and its space
     DWORD       Got   = 0;
     const BOOL  bRead = ::ReadFile(F, Text, sizeof(Text) - 1, &Got, nullptr);
     ::CloseHandle(F);
@@ -1976,7 +2001,8 @@ static UBOOL ReadLoadSequence(INT* Saves, INT MaxSaves, INT& Count, FLOAT& Dwell
 // Once a frame, after EndFrame. The travel only sets the viewport's TravelURL; the engine's next Tick does the loading.
 static void StepLoadSequence(UViewport* V)
 {
-    enum { MAX_SAVES = 32 };
+    // The most saves a series takes: the save tour's 47 in one start of the game, as a measurement is taken.
+    enum { MAX_SAVES = 64 };
     static INT    State       = -1;       // -1: the marker not read yet; 0: off; 1: running; 2: done
     static INT    Saves[MAX_SAVES];
     static INT    Count       = 0;
@@ -2021,7 +2047,7 @@ static void StepLoadSequence(UViewport* V)
         if (!State)
             return;
         Dwell = Clamp(Dwell, 2.0f, 120.0f);
-        TCHAR List[256] = { 0 };
+        TCHAR List[1024] = { 0 };
         for (INT i = 0; i < Count; i++)
         {
             TCHAR One[16];
@@ -2664,7 +2690,7 @@ enum EMenuItem
     MenuItem_ShadowView,         // the shadows' factor in place of the picture, white where nothing is shadowed
     MenuItem_FalseColour,        // the HDR diagnostic view, only while HDR is On
     // The relief on the walls, in a block of its own at the bottom.
-    MenuItem_Pom,                // how the relief is drawn: off, POM or displacement mapping (Geometry)
+    MenuItem_Pom,                // how the relief is drawn (Geometry): off, POM or displacement mapping, 3 densities
     // The texture the crosshair is on - look at a wall, open the menu, say yes or no to THAT texture.
     MenuItem_PomThis,            // its relief on or off
     MenuItem_PomDepth,           // how deep its relief goes
@@ -2687,7 +2713,7 @@ enum EMenuItem
     MenuItem_ForceField,         // the game's force fields drawn as arcs of light
     MenuItem_Grass3D,            // blades of grass on the level's grass
     MenuItem_Trees3D,            // the game's trees and bushes grown again
-    MenuItem_Spherifier,         // the level's and the models' round shapes rounded
+    MenuItem_Spherifier,         // the level's and the models' round shapes rounded, at three levels
     MenuItem_Wind,              // the rain leaning with the wind, the dust in it
     MenuItem_HdtpHoloFix,        // the holograms: as the game has them, mended, or mended in the original models
     MenuItem_SplashFix,          // the game's loading pictures on a tall screen too, laid by their middle
@@ -2776,8 +2802,8 @@ static UBOOL                   GTreesRegrow   = 0;        // the way they grow c
 static UBOOL                   GRunWind       = 0;        // the rain leaning with the wind, the dust in it (Wind)
 static UBOOL                   GRunPuddles    = 0;        // the floors outdoors wet in the rain (Puddles)
 // The spherifier (Spherifier, Spherify.h): the level's and the models' round shapes rounded.
-static UBOOL                   GRunSpherifier    = 0;
-static UBOOL                   GCustomSpherifier = 1;
+static INT                     GRunSpherifier    = 0;   // RdxMath::Spherifier_Off, Low, Medium or High
+static INT                     GCustomSpherifier = RdxMath::Spherifier_Medium;
 // Its numbers, the settings file's alone - no preset and no menu line moves them: the most it moves a wall, in the
 // level's units (SpherifierDistance), and the sharpest meeting of two faces it still rounds, in degrees
 // (SpherifierAngle).
@@ -3280,6 +3306,13 @@ static LRESULT AnswerAlone(HWND W, UINT Msg, WPARAM WParam, LPARAM LParam)
     case WM_CLOSE:
         GWindowCloseLater = 1;
         return 0;
+    case WM_SYSCOMMAND:
+        // A lone Alt or F10 asks for the window's menu: the default answer is a loop of its own, which would hold this
+        // thread until the next key or click - long after what it waits for has ended. Alt+F4 and Alt+Tab come by
+        // other ways.
+        if ((WParam & 0xFFF0) == SC_KEYMENU)
+            return 0;
+        break;
     case WM_ACTIVATE:
     case WM_ACTIVATEAPP:
     case WM_SETFOCUS:
@@ -4817,7 +4850,21 @@ static const char* const GIniTemplate =
 ";   SecondRevision.log (SecondRevision.1.log is the run before), Revision.log,\n"
 ";   SecondRevision-frames.csv and any SecondRevision-crash-*.dmp. Read at the\n"
 ";   start only; the log stops itself at 1024 MB.\n"
-"LogLevel=@LOGLEVEL@\n";
+"LogLevel=@LOGLEVEL@\n"
+"\n"
+";---------------------------------------------------------\n"
+"; ADDED BY THE RENDERER - the text above is left as it was\n"
+";---------------------------------------------------------\n"
+"; Geometry   -   Off | POM | DisplacementMappingLow | DisplacementMappingMedium\n"
+";                | DisplacementMappingHigh   (DisplacementMapping alone is High)\n"
+";   The displacement mapping at three densities: High cuts the relief as\n"
+";   finely as it was made, Medium and Low coarser - fewer triangles and a\n"
+";   faster frame, the stones' outlines a little softer near the eye.\n"
+"\n"
+"; Spherifier (default Medium)   -   Off | Low | Medium | High   (On is Medium)\n"
+";   How finely the round shapes' curves are cut: High as finely as it was\n"
+";   made, Medium and Low coarser - fewer pieces and a faster frame, the\n"
+";   curves a little more angular near the eye.\n";
 
 // Next to our own DLL, which the engine loads from the System folder - the same place the ini belongs.
 // Names[] and Values[] are the placeholders and what they become; both are plain ASCII, Count long.
@@ -5086,7 +5133,7 @@ static void TakePicture(const RdxMath::FPresetPicture& S, UBOOL bLevel)
     GRunAntiLag     = S.bAntiLag ? 1 : 0;
     // The spherifier's walls are made again beside the game where it comes or goes (EnsureSphere), the shadows' and the
     // rays' level with them once they are drawn; the grass for the mirror rays here.
-    GRunSpherifier  = GCustomSpherifier  = S.bSpherifier ? 1 : 0;
+    GRunSpherifier  = GCustomSpherifier  = S.Spherifier;
     if (bLevel && GRunGrass != WasGrass)
         ForgetShadowLevel();
     // The plants grow again only where they come or go: each level draws the same plants.
@@ -5139,7 +5186,7 @@ static RdxMath::FPresetPicture RunningPicture()
     S.bWind       = GRunWind != 0;
     S.bPuddles    = GRunPuddles != 0;
     S.bAntiLag    = GRunAntiLag != 0;
-    S.bSpherifier = GRunSpherifier != 0;
+    S.Spherifier  = GRunSpherifier;
     return S;
 }
 
@@ -5200,6 +5247,195 @@ static INT FreeAddressSpaceMB()
                  Last, bNow ? TEXT("LOW, under") : TEXT("back over"), (INT)RdxMath::AddressSpaceLowMB);
     bLow = bNow;
     return Last;
+}
+
+// The renderer's lists' room (RdxSphere::RoomFor, set at its start): a block that would leave the process less of its
+// address space than the readout warns under (RdxMath::AddressSpaceLowMB) is not taken - the engine's allocations and
+// the driver's, which end the game where they fail, are left that much. The list that asked fails as with no memory at
+// all: the spherifier's rounding or fine bevel gives up, and the level is drawn as far as it was made. The first block
+// refused since SphereRoomBegin is kept for the log (SphereRoomSay) - the asking may be on the rounding's helpers.
+// GSphereRoomMarker: a measurement's megabytes of free address space as a level's rounding begins, in place of the
+// system's, what the process takes from then on counted off it (GSphereRoomShift) - the marker
+// SecondRevision-sphere-room.txt, looked for as each level's rounding begins, for a run to change between loads.
+// The process's address space walked: the longest free stretch, and where asked, what is committed privately and in
+// mapped views (files, shared sections), and the private part by the size of the allocation it is committed in (By, four
+// classes: under 1 MB, to 16 MB, to 64 MB, 64 MB and over) - an allocator's small pieces and a large block of its own
+// are told apart so.
+static SIZE_T AddressSpaceWalk(SIZE_T* Private = nullptr, SIZE_T* Mapped = nullptr, SIZE_T* By = nullptr)
+{
+    SIZE_T Longest = 0, Own = 0, Views = 0, Classes[4] = { 0, 0, 0, 0 };
+    // The allocation the walk is in, and what is committed privately of it so far.
+    const void* Base = nullptr;
+    SIZE_T      Span = 0, Held = 0;
+    auto        Close = [&]() {
+        if (Held)
+            Classes[(Span < ((SIZE_T)1 << 20)) ? 0 : (Span < ((SIZE_T)16 << 20)) ? 1 : (Span < ((SIZE_T)64 << 20)) ? 2 : 3] +=
+                Held;
+        Span = Held = 0;
+    };
+    for (BYTE* At = nullptr;;)
+    {
+        MEMORY_BASIC_INFORMATION Mbi;
+        if (::VirtualQuery(At, &Mbi, sizeof(Mbi)) != sizeof(Mbi))
+            break;
+        if (Mbi.State == MEM_FREE)
+            Longest = Max(Longest, Mbi.RegionSize);
+        else if (Mbi.State == MEM_COMMIT && Mbi.Type == MEM_PRIVATE)
+            Own += Mbi.RegionSize;
+        else if (Mbi.State == MEM_COMMIT && Mbi.Type == MEM_MAPPED)
+            Views += Mbi.RegionSize;
+        if (By)
+        {
+            const void* const Alloc = (Mbi.State == MEM_FREE) ? nullptr : Mbi.AllocationBase;
+            if (Alloc != Base)
+            {
+                Close();
+                Base = Alloc;
+            }
+            if (Alloc)
+            {
+                Span += Mbi.RegionSize;
+                if (Mbi.State == MEM_COMMIT && Mbi.Type == MEM_PRIVATE)
+                    Held += Mbi.RegionSize;
+            }
+        }
+        BYTE* const Next = (BYTE*)Mbi.BaseAddress + Mbi.RegionSize;
+        if (Next <= At)
+            break;
+        At = Next;
+    }
+    if (By)
+    {
+        Close();
+        for (INT c = 0; c < 4; c++)
+            By[c] = Classes[c];
+    }
+    if (Private)
+        *Private = Own;
+    if (Mapped)
+        *Mapped = Views;
+    return Longest;
+}
+
+// The longest free stretch for the room's rule (RdxMath::AddressRoomFor), walked at most every quarter second - a walk
+// is some thousands of queries, and the lists ask on the rounding's helpers many times a second; a block of a quarter of
+// the last walk's stretch or more walks again at once, where the stretch that is left matters.
+static SRWLOCK          GSphereLongestLock = SRWLOCK_INIT;
+static unsigned __int64 GSphereLongest     = 0;
+static ULONGLONG        GSphereLongestAt   = 0;
+static unsigned __int64 SphereLongestFree(size_t Bytes)
+{
+    ::AcquireSRWLockExclusive(&GSphereLongestLock);
+    const ULONGLONG Now = ::GetTickCount64();
+    if (GSphereLongestAt == 0 || Now - GSphereLongestAt >= 250 || (unsigned __int64)Bytes * 4 >= GSphereLongest)
+    {
+        GSphereLongest   = AddressSpaceWalk();
+        GSphereLongestAt = Now;
+    }
+    const unsigned __int64 Longest = GSphereLongest;
+    ::ReleaseSRWLockExclusive(&GSphereLongestLock);
+    return Longest;
+}
+
+static INT              GSphereRoomMarker  = -1;
+static unsigned __int64 GSphereRoomShift   = 0;
+static volatile LONG    GSphereRoomAskedMB = 0;   // the refused block's megabytes plus one; nought: none refused
+static volatile LONG    GSphereRoomFreeMB  = 0;   // and the free space then,
+static volatile LONG    GSphereRoomLongMB  = 0;   // and its longest stretch
+static unsigned __int64 SphereRoomFree()
+{
+    MEMORYSTATUSEX Ms;
+    appMemzero(&Ms, sizeof(Ms));
+    Ms.dwLength = sizeof(Ms);
+    if (!::GlobalMemoryStatusEx(&Ms))
+        return ~(unsigned __int64)0;
+    return (Ms.ullAvailVirtual > GSphereRoomShift) ? Ms.ullAvailVirtual - GSphereRoomShift : 0;
+}
+// Whether the free space and More with it come to Need: a free space the system did not say leaves it.
+static bool SphereRoomLeaves(unsigned __int64 More, unsigned __int64 Need)
+{
+    const unsigned __int64 Free = SphereRoomFree();
+    return Free == ~(unsigned __int64)0 || Free + More >= Need;
+}
+static bool SphereRoomFor(size_t Bytes)
+{
+    const unsigned __int64 Free    = SphereRoomFree();
+    const unsigned __int64 Longest = SphereLongestFree(Bytes);
+    if (RdxMath::AddressRoomFor(Free, Longest, Bytes))
+        return true;
+    if (::InterlockedCompareExchange(&GSphereRoomAskedMB, (LONG)(Bytes >> 20) + 1, 0) == 0)
+    {
+        ::InterlockedExchange(&GSphereRoomFreeMB, (LONG)(Free >> 20));
+        ::InterlockedExchange(&GSphereRoomLongMB, (LONG)(Longest >> 20));
+    }
+    return false;
+}
+// A level's rounding about to be made: nothing refused yet, and the marker's number, where there is one, the space
+// free from now.
+static void SphereRoomBegin()
+{
+    ::InterlockedExchange(&GSphereRoomAskedMB, 0);
+    ::InterlockedExchange(&GSphereRoomFreeMB, 0);
+    ::InterlockedExchange(&GSphereRoomLongMB, 0);
+    GSphereRoomShift  = 0;
+    GSphereRoomMarker = LiveMarkerNumber(L"SecondRevision-sphere-room.txt", -1, -1);
+    if (GSphereRoomMarker < 0)
+        return;
+    const unsigned __int64 Free = SphereRoomFree(), Told = (unsigned __int64)GSphereRoomMarker << 20;
+    GSphereRoomShift            = (Free != ~(unsigned __int64)0 && Free > Told) ? Free - Told : 0;
+    RDX_LOGF("memory (marker): this level's rounding begins as if %i MB of address space were free (%i MB are) - "
+             "measurement only",
+             GSphereRoomMarker, (Free == ~(unsigned __int64)0) ? -1 : (INT)(Free >> 20));
+}
+// The log's line where a block was refused since SphereRoomBegin: What, what was left out for it.
+static void SphereRoomSay(const TCHAR* What)
+{
+    const LONG Asked = GSphereRoomAskedMB;
+    if (Asked == 0)
+        return;
+    RDX_LOGF("spherifier: %s - a block of %i MB with %i MB of the address space free (its longest stretch %i MB) would "
+             "have left under the %i MB the game keeps for itself, or its longest stretch under %i MB",
+             What, (INT)(Asked - 1), (INT)GSphereRoomFreeMB, (INT)GSphereRoomLongMB, (INT)RdxMath::AddressSpaceLowMB,
+             (INT)RdxMath::LongestKeepMB);
+}
+
+// What a level's load takes of the address space besides its rounding: the space free as the rounding began and as it
+// ended, and the least over the seconds after it (SphereWatchStep, every frame) - its first frames' uploads, the shadows'
+// and the rays' lists, the card's copy -, logged once, for the room the rounding is to leave the rest of the load; cut
+// short by the next level's rounding where that comes first (SphereWatchSay).
+static const double     SphereWatchSeconds = 10.0;
+static double           GSphereWatchUntil  = 0.0, GSphereWatchFrom = 0.0;
+static unsigned __int64 GSphereWatchBegan = 0, GSphereWatchEnded = 0, GSphereWatchLeast = 0;
+// The frames after a rounding made beside the game came in whose length is logged (the game takes it in then: the
+// shadows' and the rays' level made again, the card's copy) - how many are left of SphereCameFramesSaid.
+static const INT SphereCameFramesSaid = 4;
+static INT       GSphereCameFrames    = 0;
+static unsigned __int64 SphereSpaceFree()
+{
+    MEMORYSTATUSEX Ms;
+    appMemzero(&Ms, sizeof(Ms));
+    Ms.dwLength = sizeof(Ms);
+    return ::GlobalMemoryStatusEx(&Ms) ? Ms.ullAvailVirtual : 0;
+}
+static void SphereWatchSay()
+{
+    if (GSphereWatchUntil <= 0.0)
+        return;
+    GSphereWatchUntil = 0.0;
+    RDX_LOGF("spherifier: the address space free as the level's rounding began %i MB, as it ended %i MB, the least in "
+             "the %.1f s after it %i MB",
+             (INT)(GSphereWatchBegan >> 20), (INT)(GSphereWatchEnded >> 20), appSeconds() - GSphereWatchFrom,
+             (INT)(GSphereWatchLeast >> 20));
+}
+static void SphereWatchStep()
+{
+    if (GSphereWatchUntil <= 0.0)
+        return;
+    const unsigned __int64 Now = SphereSpaceFree();
+    if (Now > 0 && Now < GSphereWatchLeast)
+        GSphereWatchLeast = Now;
+    if (appSeconds() >= GSphereWatchUntil)
+        SphereWatchSay();
 }
 
 // The readout's lines: what the shadows are costing and what the picture is really drawn with. One builder, because
@@ -5830,7 +6066,7 @@ static void SetCaptureLabel(FBackend& Backend)
     // exactly as it did and an old table still compares with a new one.
     if (ReliefRuns())
     {
-        const UBOOL bTess = GRunGeometry == RdxMath::Geometry_Tess;
+        const UBOOL bTess = RdxMath::GeometryRaises(GRunGeometry);
         const char* const Relief = bTess ? "|TESS" : "|POM";
         // The lamps only while they run: they are the shadows' own lights.
         const char* const Lamps  = !GRunShadows                                  ? ""
@@ -6038,12 +6274,18 @@ void URevisionRenderDevice::DrawRendererMenu()
             break;
         }
         case MenuItem_Spherifier:
-            // On or off: the level is rounded again or let go beside the game (EnsureSphere), the shadows' and the rays'
-            // level made again once that is drawn, and the models' shapes as they are next drawn (RoundFrameStart).
-            GRunSpherifier    = GRunSpherifier ? 0 : 1;
+        {
+            // Off, or a level of how finely its curves are cut: the level is rounded again or let go beside the game
+            // (EnsureSphere), the shadows' and the rays' level made again once that is drawn, and the models' shapes as
+            // they are next drawn (RoundFrameStart).
+            GRunSpherifier =
+                (GRunSpherifier + ((Step < 0) ? RdxMath::Spherifier_Count - 1 : 1)) % RdxMath::Spherifier_Count;
             GCustomSpherifier = GRunSpherifier;
-            RDX_LOGF("menu: spherifier %s", GRunSpherifier ? TEXT("on") : TEXT("off"));
+            TCHAR Name[16];
+            RdxMath::SpherifierName(GRunSpherifier, Name, 16);
+            RDX_LOGF("menu: spherifier %s", Name);
             break;
+        }
         case MenuItem_Wind:
             GRunWind    = GRunWind ? 0 : 1;
             GCustomWind = GRunWind;
@@ -6485,7 +6727,7 @@ void URevisionRenderDevice::DrawRendererMenu()
     // offering a switch.
     ReadoutChar(C, L, 0x0A);
     MenuLine(C, L, GMenuPick == MenuItem_Pom, "GEOMETRY",
-             (GRunGeometry == RdxMath::Geometry_Tess && !Dev.Backend.CanTessellate())
+             (RdxMath::GeometryRaises(GRunGeometry) && !Dev.Backend.CanTessellate())
                  ? "DISPLACEMENT N/A: POM" : RdxMath::GeometryMenuText(GRunGeometry));
     // The texture the crosshair is on. With nothing picked, or nothing to pick, the lines say so rather than
     // offering a switch that would change nothing.
@@ -6591,7 +6833,12 @@ void URevisionRenderDevice::DrawRendererMenu()
         static_assert(sizeof(TreesText) / sizeof(TreesText[0]) == RdxMath::Trees_Count, "a text for each trees level");
         MenuLine(C, L, GMenuPick == MenuItem_Trees3D, "3D TREES", TreesText[GRunTrees][Dev.Backend.CanTrees() ? 0 : 1]);
     }
-    MenuLine(C, L, GMenuPick == MenuItem_Spherifier, "SPHERIFIER", GRunSpherifier ? "ON" : "OFF");
+    {
+        static const char* const SpherifierText[RdxMath::Spherifier_Count] = { "OFF", "LOW", "MEDIUM", "HIGH" };
+        MenuLine(C, L, GMenuPick == MenuItem_Spherifier, "SPHERIFIER",
+                 SpherifierText[(GRunSpherifier >= 0 && GRunSpherifier < RdxMath::Spherifier_Count) ? GRunSpherifier
+                                                                                                     : 0]);
+    }
     MenuLine(C, L, GMenuPick == MenuItem_Wind, "WIND", GRunWind ? "ON" : "OFF");
     {
         char Holo[40];
@@ -6778,6 +7025,8 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
     RdxMath::GrassName(GCustomGrass, GrassT, 16);
     char TreesT[16];
     RdxMath::TreesName(GCustomTrees, TreesT, 16);
+    char SpherifierT[16];
+    RdxMath::SpherifierName(GCustomSpherifier, SpherifierT, 16);
     char FieldT[16];
     RdxMath::ForceFieldName(GCustomForceField, FieldT, 16);
     char HoloT[16];
@@ -6859,7 +7108,7 @@ UBOOL URevisionRenderDevice::SaveSettings(UBOOL bWhole)
                                    GCustomFire      ? "On" : "Off",
                                    GrassT,
                                    TreesT,
-                                   GCustomSpherifier ? "On" : "Off",
+                                   SpherifierT,
                                    GCustomWind      ? "On" : "Off",
                                    GCustomFogRooms  ? "Fixed" : "Original",
                                    RdxMath::FlashlightNames()[(INT)GCustomFlashlight],
@@ -6949,6 +7198,8 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         Grass3D       = RdxDefaultGrass3D;
     if (Trees3D.Len() == 0)
         Trees3D       = RdxDefaultTrees3D;
+    if (Spherifier.Len() == 0)
+        Spherifier    = RdxDefaultSpherifier;
     if (ForceField.Len() == 0)
         ForceField    = RdxDefaultForceField;
     if (Flashlight.Len() == 0)
@@ -6984,7 +7235,8 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
             Grass3D = RdxDefaultGrass3D;
         if (!SettingText("Trees3D", Trees3D))
             Trees3D = RdxDefaultTrees3D;
-        Spherifier           = SettingOnOff("Spherifier",            RdxDefaultSpherifier);
+        if (!SettingText("Spherifier", Spherifier))
+            Spherifier = RdxDefaultSpherifier;
         SpherifierDistance   = RdxMath::SpherifierDistanceOf(
             appRound(SettingFloat("SpherifierDistance", (FLOAT)RdxDefaultSpherifierDistance)));
         SpherifierAngle      = RdxMath::SpherifierAngleOf(
@@ -7172,6 +7424,8 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         if (GAddressSpaceMarker >= 0)
             RDX_LOGF("memory (marker): the readout is told %i MB of free address space for this start - "
                      "measurement only", GAddressSpaceMarker);
+        RdxSphere::RoomFor() = SphereRoomFor;
+        RdxLargeRoomFor()    = SphereRoomFor;
         // For now, until the shadow setting has its RT value (docs/terv-rt.md): the RT shadows in place of the maps, for
         // this start - on a card that traces rays; elsewhere the maps as before. The number in it: 3 with the rays shown
         // in place of the shadows (FBackend::RequestRtShadows); empty is 1.
@@ -7201,12 +7455,15 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         // A measurement: the RT water's measuring views (FBackend::RequestRtWaterView), for this start.
         const INT RtWaterView = MarkerNumber(L"SecondRevision-rt-water-view.txt", 0, 1);
         Backend.RequestRtWaterView(RtWaterView);
-        static const TCHAR* const RtWaterViews[8] = { TEXT(""), TEXT("what its mirror rays met"),
-                                                      TEXT("its glints alone"), TEXT("how far its mirror rays went"),
-                                                      TEXT("the surfaces' own colours alone"),
-                                                      TEXT("the sky from the far probe alone"),
-                                                      TEXT("how high above the water its mirror rays met something"),
-                                                      TEXT("the surfaces' own colours alone, without their textures") };
+        static const TCHAR* const RtWaterViews[10] = { TEXT(""), TEXT("what its mirror rays met"),
+                                                       TEXT("its glints alone"), TEXT("how far its mirror rays went"),
+                                                       TEXT("the surfaces' own colours alone"),
+                                                       TEXT("the sky from the far probe alone"),
+                                                       TEXT("how high above the water its mirror rays met something"),
+                                                       TEXT("the surfaces' own colours alone, without their textures"),
+                                                       TEXT("the first see-through surface its mirror rays pass, by how "
+                                                            "the level draws it"),
+                                                       TEXT("which light the actors its mirror rays meet are shown by") };
         if (RtWaterView == 13)
             RDX_LOGF("ray tracing (marker): at RTLow a borrowed answer whose triangle the pixel's own ray passes is "
                      "taken for one that met nothing, for this start - measurement only");
@@ -7221,11 +7478,18 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
                      "alone, not dimmed by the lamps' rays, for this start - measurement only");
         else if (RtWaterView > 0)
             RDX_LOGF("ray tracing (marker): the RT water shows %s for this start - measurement only",
-                     RtWaterViews[Clamp(RtWaterView, 1, 7)]);
+                     RtWaterViews[Clamp(RtWaterView, 1, 9)]);
         // A measurement: the wet floors' measuring views (FBackend::RequestWetView), for this start - 1 the patches and
         // the water, 2 the place in the level as a grid.
         const INT WetView = MarkerNumber(L"SecondRevision-wet-view.txt", 0, 1);
         Backend.RequestWetView(WetView);
+        // A measurement: the pipeline's counts over the world drawn before the shadows, logged with the GPU's times
+        // (FBackend::RequestGpuStats), for this start.
+        const UBOOL bGpuStats = FreshMarker(L"SecondRevision-gpu-stats.txt");
+        Backend.RequestGpuStats(bGpuStats);
+        if (bGpuStats)
+            RDX_LOGF("gpu stats (marker): the pipeline's counts over the world logged with the GPU's times, for this "
+                     "start - measurement only");
         if (WetView == 1)
             RDX_LOGF("wet floors (marker): drawn as their patches - grey the wetter, blue the share under water, a red "
                      "tint on metal - for this start, measurement only");
@@ -7341,9 +7605,6 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         RdxMath::ReadoutName(GRunReadout, Name, 16);
         DebugReadout   = Name;
         GCustomReadout = GRunReadout;
-        // Off in both presets: they are pictures to play, and the readout is for whoever wants the numbers.
-        if (GRunPreset != RdxMath::Preset_Custom)
-            GRunReadout = RdxMath::Readout_Off;
     }
     GRunShadowQ    = WantedShadows;
     GRunAa         = WantedAa;
@@ -7357,7 +7618,8 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         bool bK = false;
         GCustomGeometry = RdxMath::ParseGeometry(*Geometry, bK);
         if (!bK)
-            RDX_LOGF("Geometry: unknown value '%s' - Off (Off, POM, DisplacementMapping)", *Geometry);
+            RDX_LOGF("Geometry: unknown value '%s' - Off (Off, POM, DisplacementMappingLow, DisplacementMappingMedium, "
+                     "DisplacementMappingHigh)", *Geometry);
         TCHAR Name[RdxMath::GeometryNameChars];
         RdxMath::GeometryName(GCustomGeometry, Name, RdxMath::GeometryNameChars);
         Geometry = Name;
@@ -7412,7 +7674,17 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         RdxMath::TreesName(GCustomTrees, Name, 16);
         Trees3D = Name;
     }
-    GCustomSpherifier = Spherifier ? 1 : 0;
+    {
+        char A[32];
+        AsciiOf(*Spherifier, A, 32);
+        const INT Level = RdxMath::ParseSpherifier(A);
+        if (Level < 0)
+            RDX_LOGF("Spherifier: unknown value '%s' - Medium (Off, Low, Medium, High)", *Spherifier);
+        GCustomSpherifier = (Level < 0) ? RdxMath::Spherifier_Medium : Level;
+        TCHAR Name[16];
+        RdxMath::SpherifierName(GCustomSpherifier, Name, 16);
+        Spherifier = Name;
+    }
     // The spherifier's numbers hold under every preset (TakePicture leaves them be).
     GSpherifierDistance = RdxMath::SpherifierDistanceOf(SpherifierDistance);
     GSpherifierAngle    = RdxMath::SpherifierAngleOf(SpherifierAngle);
@@ -7469,6 +7741,10 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         bool bK = false;
         GRunPreset = RdxMath::ParsePreset(*Preset, bK);
     }
+    // The readout off in both presets - asked once the file's preset is read: they are pictures to play, and the
+    // readout is for whoever wants the numbers.
+    if (GRunPreset != RdxMath::Preset_Custom)
+        GRunReadout = RdxMath::Readout_Off;
     // A preset puts its whole picture on, whatever the keys say - and what runs is what the file is written from, so
     // the keys follow it (TakePresetPicture). Custom runs the keys.
     if (GRunPreset != RdxMath::Preset_Custom)
@@ -7527,7 +7803,7 @@ UBOOL URevisionRenderDevice::Init(UViewport* InViewport, INT NewX, INT NewY, INT
         Backend.SetReflections(Vanilla ? 0 : (INT)GRunReflections);
         Backend.SetPaneAll(FreshMarker(L"SecondRevision-pane-all.txt"));
         // And the relief's covers, for the same reason (FBackend::SetReliefCoverWanted).
-        Backend.SetReliefCoverWanted(GRunGeometry == RdxMath::Geometry_Tess);
+        Backend.SetReliefCoverWanted(RdxMath::GeometryRaises(GRunGeometry));
         // And the soft particles' fade, which reads the same copy of the depth (FBackend::SetSoftFade).
         Backend.SetSoftFade(GRunSoft ? RdxMath::SoftFadeWorld : 0.0f);
         // A measurement only: the relief raised through everything for this start, as it was before the covers.
@@ -8266,6 +8542,7 @@ static void ForgetLevelPlantShapes();
 static void ForgetPlantJobs();
 static void ForgetPieceJobs();
 static void StopPieceJobs();
+static void ClosePieceJobs();
 
 static void ReliefLevelForget();
 
@@ -8277,6 +8554,10 @@ static void ForgetShadowLists();
 static void FreeShapeCache();
 
 static void SphereJobWait();
+static DOUBLE SphereKeptMB();
+static void ForgetShadowLevel();
+static void ForgetCoronaTextures();
+static void ForgetFallTextures();
 
 void URevisionRenderDevice::Exit()
 {
@@ -8290,6 +8571,7 @@ void URevisionRenderDevice::Exit()
     RemoveMouseHelper();
     RdxPresentWatchStop();
     RdxStallWatchStop();
+    ClosePieceJobs();
     Backend.Shutdown();
     ForgetPlantJobs();
     ForgetPieceJobs();
@@ -8302,13 +8584,34 @@ void URevisionRenderDevice::Exit()
     RdxWaterForget();
     ForgetRoundModels();
     SpherePieceBlocksForget();
+    // What this side remembers of the card's copy of the level - the trees' buffers, the shadow world - let go as at a
+    // level's change: the engine may make the renderer again on the same level (a fullscreen game's Alt+Tab), and a
+    // new backend's counters start where the old one's did, so they alone would not tell it.
+    ForgetShadowLevel();
+    ForgetCoronaTextures();
+    ForgetFallTextures();
+    GLevelFlushes++;
+    // The height map picked by the crosshair is an entry of the backend's library, which a new one fills again in
+    // another order: until the next pick, the wheel or the menu would change - and write - another texture's depth.
+    GPomPickEntry      = -1;
+    GPomPickShownEntry = -1;
+    GPomPickNode       = -1;
+    // What of ours is still held once everything was let go: a leak shows here. Kept on purpose: the level's roundings,
+    // drawn by a renderer made again on the same level (the engine's own rebuild - Alt+Tab in exclusive fullscreen - or
+    // a lost device's) until it has rounded the level anew.
+    {
+        DOUBLE  UploadMB = 0.0;
+        wchar_t UploadParts[640];
+        RdxUploadCensus::Say(UploadParts, 640, UploadMB);
+        RDX_LOGF("Exit: still held - our lists %.1f MB (the level's roundings kept for a renderer made again %.1f MB), "
+                 "our large blocks %.1f MB, our upload heap %.1f MB%s%s",
+                 (DOUBLE)RdxSphere::ListBytesHeld().load() / (1024.0 * 1024.0), SphereKeptMB(),
+                 (DOUBLE)RdxLargeBytesHeld() / (1024.0 * 1024.0), UploadMB, UploadParts[0] ? TEXT(" - ") : TEXT(""),
+                 UploadParts);
+    }
     RdxCrashLogRemove();
     RdxLogClose();
 }
-
-static void ForgetShadowLevel();
-static void ForgetCoronaTextures();
-static void ForgetFallTextures();
 
 // A fall's sheet - a surface of the level - worked out once, kept until the level goes (the level does not move): how high
 // it reaches and how far down, the level's direction across it and how far it goes that way, so every point of it knows
@@ -8416,7 +8719,6 @@ static INT FallFeet(INT FrameNumber, const INT*& Feet)
     return (GFallFeetFrame == FrameNumber - 1) ? GFallFeetNowCount : 0;
 }
 
-
 void URevisionRenderDevice::Flush(UBOOL /*AllowPrecache*/)
 {
     // The engine calls this when the level changes. Dropping the cache here is not
@@ -8435,6 +8737,7 @@ void URevisionRenderDevice::Flush(UBOOL /*AllowPrecache*/)
     ForgetFallTextures();
     ForgetLevelFires();
     Backend.ForgetClouds();
+    Backend.ForgetVertexPeak();
     // And the relief's record of the level's edges (ReliefLevelRead).
     ReliefLevelForget();
     RdxWaterForget();
@@ -8588,17 +8891,12 @@ void URevisionRenderDevice::RecoverLostDevice(UBOOL bAtOnce)
     const UBOOL bFull = GEngineFullscreen;
     RDX_LOGF("lost device: the renderer is taken down and brought up again, try %i of %i (%ix%i)", Tries, (INT)TRIES,
              X, Y);
-    Exit();
+    Exit();   // which lets go of this side's memory of the card too, as at a level's change
     Backend.~FBackend();
     {
         const FRdxInPlace Here = { &Backend };
         new (Here) FBackend();
     }
-    // What Exit leaves of this side's memory of the card: as at a level's change (Flush).
-    ForgetShadowLevel();
-    ForgetCoronaTextures();
-    ForgetFallTextures();
-    GLevelFlushes++;
     const UBOOL bUp = Init(V, X, Y, Bytes, bFull) && Backend.IsReady() && !Backend.GetDeviceLost();
     FrameCounter = Frames;
     if (!bUp)
@@ -8629,6 +8927,7 @@ static void UndressHolograms();
 // Trees3D with no drawing of the engine's own plants (HideLevelTrees and the rest, with the plants).
 static void  HideLevelTrees(FBackend& Backend, UViewport* V, INT EngineFrame);
 static void  ShowLevelTrees(FBackend& Backend, INT EngineFrame);
+static void  DrawTuftSheets(FBackend& Backend, INT EngineFrame);
 static void  NoteTreeWorldNode(FBackend& Backend, FSceneNode* Frame, INT EngineFrame);
 static void  DrawViewTrees(FBackend& Backend, FSceneNode* Frame, INT EngineFrame);
 static UBOOL TreeHiddenByUs(const AActor* A);
@@ -8677,8 +8976,9 @@ static UBOOL GLoadGameSaid = 0;
 class FLoadGameEar : public FOutputDevice
 {
 public:
-    FOutputDevice* Before = nullptr;
-    UBOOL          bIn    = 0;
+    FOutputDevice* Before  = nullptr;
+    UBOOL          bIn     = 0;
+    UBOOL          bLinked = 0;   // in the log's line, listening or only handing on
     void Serialize(const TCHAR* V, EName Event)
     {
         if (Before)
@@ -8693,11 +8993,14 @@ static void LoadFixListen(UBOOL bOn)
 {
     if (bOn && !GLoadGameEar.bIn)
     {
-        // Not twice in the line: taken out below only while it is the last one in.
-        if (GLogHook != &GLoadGameEar)
+        // Not twice in the line: taken out below only while it is the last one in, and one left in it - somebody
+        // hooked the log after it - listens again where it stands. Put in again in front of that one, the line would
+        // run round through both for ever.
+        if (!GLoadGameEar.bLinked)
         {
-            GLoadGameEar.Before = GLogHook;
-            GLogHook            = &GLoadGameEar;
+            GLoadGameEar.Before  = GLogHook;
+            GLogHook             = &GLoadGameEar;
+            GLoadGameEar.bLinked = 1;
         }
         GLoadGameEar.bIn = 1;
     }
@@ -8708,8 +9011,9 @@ static void LoadFixListen(UBOOL bOn)
         // Somebody who hooked the log after this one hands it on through here: then it stays, and only hands on.
         if (GLogHook == &GLoadGameEar)
         {
-            GLogHook            = GLoadGameEar.Before;
-            GLoadGameEar.Before = nullptr;
+            GLogHook             = GLoadGameEar.Before;
+            GLoadGameEar.Before  = nullptr;
+            GLoadGameEar.bLinked = 0;
         }
     }
 }
@@ -8732,6 +9036,81 @@ static void LoadFixFrame(UViewport* V)
              "level loads beside it, not over it", *Was, Package->GetName());
 }
 
+// The engine's water textures (Fire.dll's wave and wet textures) run an inner loop of code that writes itself: before a
+// call the engine puts the texture's buffer, its tables (inside the texture object) and its size into the loop's
+// instructions - and does so again only where the texture's buffer is not the one it last wrote them for, the one
+// thing it holds as the key. After a level's garbage is collected another texture's buffer can come at that same
+// place: the loop then runs with the freed texture's tables and size, and reads past what is there (a crash in
+// Fire.dll as a level comes). The two loops' keys are cleared at every frame, so that the engine writes its loop
+// afresh for every texture - only where the loaded Fire.dll is the one this was read from: both loops' checks, to the
+// byte, at their places.
+static void FireWaterRepatch()
+{
+    enum
+    {
+        KeyA1   = 0x160FC,   // the loop of every other call: its key, the buffer it was last written for
+        KeyA2   = 0x16104,
+        KeyB1   = 0x16100,   // the loop of the calls between
+        KeyB2   = 0x16108,
+        Current  = 0x160F8,  // the call's buffer, which the keys are held against (it is kept twice)
+        Current2 = 0x160E0,
+        CheckA  = 0x16470,   // where each loop holds its keys against the call's buffer
+        CheckB  = 0x16CE0,
+        Reach   = 0x16D00,   // the module must reach past every place read and written here
+    };
+    static HMODULE Module = nullptr;
+    static UBOOL   bKnown = 0;
+    const HMODULE  Now    = ::GetModuleHandleW(L"Fire.dll");
+    if (Now != Module)
+    {
+        Module = Now;
+        bKnown = 0;
+        if (!Now)
+            return;
+        const BYTE* const Base = (const BYTE*)Now;
+        const auto*       Dos  = (const IMAGE_DOS_HEADER*)Base;
+        const auto*       Nt   = (const IMAGE_NT_HEADERS32*)(Base + Dos->e_lfanew);
+        if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Nt->Signature != IMAGE_NT_SIGNATURE ||
+            Nt->OptionalHeader.SizeOfImage < (DWORD)Reach)
+        {
+            RDX_LOG("fire water: Fire.dll is not the build whose water loops are known - left as it is");
+            return;
+        }
+        // mov eax,[key 1]; cmp eax,[call's buffer]; jne +13; mov eax,[key 2]; cmp eax,[call's buffer]; je +5 -
+        // the addresses where this module lies.
+        auto Check = [&](INT At, INT Key1, INT Key2) -> UBOOL {
+            BYTE Want[24];
+            const DWORD A[4] = { (DWORD)(size_t)(Base + Key1), (DWORD)(size_t)(Base + Current),
+                                 (DWORD)(size_t)(Base + Key2), (DWORD)(size_t)(Base + Current2) };
+            Want[0] = 0xA1;
+            memcpy(Want + 1, &A[0], 4);
+            Want[5] = 0x3B;
+            Want[6] = 0x05;
+            memcpy(Want + 7, &A[1], 4);
+            Want[11] = 0x75;
+            Want[12] = 0x0D;
+            Want[13] = 0xA1;
+            memcpy(Want + 14, &A[2], 4);
+            Want[18] = 0x3B;
+            Want[19] = 0x05;
+            memcpy(Want + 20, &A[3], 4);
+            return memcmp(Base + At, Want, sizeof(Want)) == 0 && Base[At + 24] == 0x74 && Base[At + 25] == 0x05;
+        };
+        bKnown = Check(CheckA, KeyA1, KeyA2) && Check(CheckB, KeyB1, KeyB2);
+        RDX_LOGF("fire water: Fire.dll %s", bKnown ? TEXT("is the known build - its water loops are written afresh "
+                                                          "at every frame")
+                                                    : TEXT("is not the build whose water loops are known - left as "
+                                                           "it is"));
+    }
+    if (!bKnown)
+        return;
+    BYTE* const Base = (BYTE*)Module;
+    *(volatile DWORD*)(Base + KeyA1) = 0;
+    *(volatile DWORD*)(Base + KeyA2) = 0;
+    *(volatile DWORD*)(Base + KeyB1) = 0;
+    *(volatile DWORD*)(Base + KeyB2) = 0;
+}
+
 static void SplashCanvas(UViewport* V)
 {
     if (!SplashFrameNow(V) || !V->Canvas)
@@ -8752,6 +9131,28 @@ void URevisionRenderDevice::Lock(FPlane FlashScale, FPlane FlashFog, FPlane Scre
 {
     // The engine has done the frame's simulation and starts drawing it (FBackend::FrameDrawStarts).
     Backend.FrameDrawStarts();
+    // Before any texture of the frame is brought up to date: the engine's water loops written afresh (FireWaterRepatch).
+    FireWaterRepatch();
+    // A measurement only: kinds of the world's runs left undrawn (FSolidPass::SetWorldSkip) - the marker
+    // SecondRevision-world-skip.txt's number, looked for once a second whatever its age.
+    {
+        static DOUBLE Looked = -1e9;
+        static INT    Skip   = 0;
+        const DOUBLE  Now    = appSeconds();
+        if (Now - Looked >= 1.0 || Now < Looked)
+        {
+            Looked        = Now;
+            const INT Was = Skip;
+            Skip          = LiveMarkerNumber(L"SecondRevision-world-skip.txt", 0, 0);
+            if (Skip != Was)
+                RDX_LOGF("world skip: %i left undrawn - the level's opaque %i, the actors' %i, see-through %i, modulated "
+                         "%i, fog %i, the spherifier's pieces %i, the rounded models %i (the marker "
+                         "SecondRevision-world-skip.txt)", Skip, (Skip & 1) ? 1 : 0, (Skip & 2) ? 1 : 0,
+                         (Skip & 4) ? 1 : 0, (Skip & 8) ? 1 : 0, (Skip & 16) ? 1 : 0, (Skip & 32) ? 1 : 0,
+                         (Skip & 64) ? 1 : 0);
+        }
+        Backend.SetWorldSkip(Skip);
+    }
     if (GLatencyProbe)
     {
         LARGE_INTEGER Q;
@@ -8912,6 +9313,7 @@ void URevisionRenderDevice::Lock(FPlane FlashScale, FPlane FlashFog, FPlane Scre
 }
 
 static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame);
+static void MeshBevelsMake(INT FrameNo);
 static void GatherOwnLamps(FBackend& Backend, UViewport* V, INT EngineFrame);
 static void PrepareMotionFrame(FBackend& Backend, UViewport* V, INT EngineFrame);
 static void LogLightAnimFrame(UViewport* V, INT EngineFrame);
@@ -9000,6 +9402,15 @@ static void DumpReadPixels(FBackend& Backend, UViewport* Viewport)
 // as it was - a preset by its name, the custom set by its values.
 enum { ShotPairSettle = 10 };
 static INT                     GShotPairLeft = 0;   // the frames of Vanilla still to wait; 0: no pair under way
+static DOUBLE                  GShotPairSince = 0.0; // appSeconds when Vanilla was put in for the pair
+// The level's rounding is Vanilla's only once EnsureSphereNow has made it - begun after the spherifier's number has
+// stood still a moment, the rounding before drawn meanwhile - and what draws from it follows over the frames after: the
+// Vanilla picture waits for SphereSettled to hold ShotPairSettle frames in a row, and ShotPairHoldSeconds at the least
+// after Vanilla was put in (five times that moment: a screenshot may wait). ShotPairWaitSeconds is the most, so no pair
+// is held up for good by a job that never ends.
+static const DOUBLE            ShotPairHoldSeconds = 2.0;
+static const DOUBLE            ShotPairWaitSeconds = 10.0;
+static UBOOL SphereSettled();
 static RdxMath::EPreset        GShotPairWas  = RdxMath::Preset_Custom;
 static RdxMath::FPresetPicture GShotPairPicture;
 static WCHAR                   GShotPairStamp[32];
@@ -9080,8 +9491,19 @@ void URevisionRenderDevice::ShotPairFrame()
     if (GShotPairLeft > 0)
     {
         GShotPairAsked = 0;        // a press while a pair is under way is not another pair
-        if (--GShotPairLeft > 0)
+        // The frames are counted from the moment the level's rounding is Vanilla's: a frame where it is not starts
+        // the count again.
+        if (!SphereSettled())
+            GShotPairLeft = ShotPairSettle + 1;
+        const DOUBLE Waited = appSeconds() - GShotPairSince;
+        if ((--GShotPairLeft > 0 || Waited < ShotPairHoldSeconds) && Waited < ShotPairWaitSeconds)
+        {
+            GShotPairLeft = Max(GShotPairLeft, 1);
             return;
+        }
+        if (GShotPairLeft > 0)
+            RDX_LOG("screenshot: the level's rounding is not Vanilla's yet - the Vanilla picture taken as it is");
+        GShotPairLeft = 0;
         TakeShot(Backend, URenderDevice::Viewport, RdxMath::Preset_Vanilla);
         // Back to what ran: a preset by its name, the custom set by its values.
         if (GShotPairWas == RdxMath::Preset_Custom)
@@ -9113,14 +9535,17 @@ void URevisionRenderDevice::ShotPairFrame()
     GShotPairPicture = RunningPicture();
     ApplyPreset(RdxMath::Preset_Vanilla);
     GShotPairLeft    = ShotPairSettle;
+    GShotPairSince   = appSeconds();
 }
 
 void URevisionRenderDevice::Unlock(UBOOL Blit)
 {
     // The pieces made ahead and not yet taken are no longer needed this frame (StartPieceJobs).
     StopPieceJobs();
-    // The plants hidden for the frame shown again, before anything of the frame's end reads the level's actors.
+    // The plants hidden for the frame shown again, before anything of the frame's end reads the level's actors; the
+    // tufts its sheets asked for, where no HUD came to draw them first.
     ShowLevelTrees(Backend, FrameCounter);
+    DrawTuftSheets(Backend, FrameCounter);
     if (GLogDebug)
     {
         DOUBLE Used = 0.0, Budget = 0.0;
@@ -9463,6 +9888,7 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
     }
     // The address space is watched with the readout off as well: the log says where it runs low.
     FreeAddressSpaceMB();
+    SphereWatchStep();
     if (GRunReadout != RdxMath::Readout_Off && !Backend.HasCaption())
     {
         char  C[CAPTION_CHARS];
@@ -9479,6 +9905,8 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         PrepareShadowFrame(Backend, URenderDevice::Viewport, FrameCounter);
     else
         PrepareMotionFrame(Backend, URenderDevice::Viewport, FrameCounter);
+    // The models' bevels the frame's draws asked for, out of every draw of them.
+    MeshBevelsMake(FrameCounter);
     Backend.EndFrame(Blit);
     // The frame is out and the engine reads its input next: where AMD's Anti-Lag 2 or NVIDIA's Reflex is on, the
     // driver holds this thread here until the GPU is nearly through (FBackend::AntiLagFrameEnd).
@@ -9708,7 +10136,7 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
     // depth buffer cannot be copied yet, the targets are made again - here, between frames, as for the water. Asked every
     // frame, as the relief's own switches set no apply; it does something only when the answer changes.
     if (!Backend.GetDeviceLost() &&
-        !Backend.SetReliefCoverWanted(GRunGeometry == RdxMath::Geometry_Tess && Backend.CanTessellate()))
+        !Backend.SetReliefCoverWanted(RdxMath::GeometryRaises(GRunGeometry) && Backend.CanTessellate()))
         RDX_LOG("relief: the targets could not be made again for the covers - the relief is raised through everything");
     // Whatever else wishes to read the depth since the targets were made - a switch above that makes none of its own:
     // the smoke's, the fires', the motion blur's vectors - gets them made again here, between frames.
@@ -9740,6 +10168,14 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
     {
         const DOUBLE Dur = U1 - GTime.PrevEnd;
         static INT Slow = 0;
+        // The frames after a rounding made beside the game came in (GSphereCameFrames): what taking it in cost the game,
+        // said whatever the cap above has come to.
+        if (GSphereCameFrames > 0)
+        {
+            GSphereCameFrames--;
+            RDX_LOGF("spherifier: frame %i, %i after the rounding made beside the game came in, took %.1f ms",
+                     FrameCounter, SphereCameFramesSaid - GSphereCameFrames, Dur * 1000.0);
+        }
         if (Dur > 0.012 && Slow < 400)
         {
             Slow++;
@@ -9778,9 +10214,13 @@ void URevisionRenderDevice::Unlock(UBOOL Blit)
         if (GSphereSurfs > 0.0)
             RDX_LOGF("time per frame, the spherifier (%i frames): %.1f surfaces drawn in its pieces, %.0f pieces, in %.3f ms "
                      "(the whole of those surfaces' drawing; making the pieces, %.0f of them over all the passes, %.3f of it); "
-                     "the turned-away polygons' bulges %.3f ms", GTime.Frames, GSphereSurfs / N, GSpherePieces / N,
-                     GSphereSurfSec * K, GSphereMade / N, GSpherePieceSec * K, GSphereBackSec * K);
+                     "the turned-away polygons' bulges %.3f ms; drawn from the card %.1f nodes, %.0f triangles, %.0f "
+                     "corners turned there, their records laid on this thread in %.3f ms",
+                     GTime.Frames, GSphereSurfs / N, GSpherePieces / N, GSphereSurfSec * K, GSphereMade / N,
+                     GSpherePieceSec * K, GSphereBackSec * K, GSphereCardNodes / N, GSphereCardTris / N,
+                     GSphereCardCorners / N, GSphereCardSec * K);
         GSphereSurfSec = GSphereBackSec = GSpherePieceSec = GSphereMade = GSphereSurfs = GSpherePieces = 0.0;
+        GSphereCardNodes = GSphereCardTris = GSphereCardSec = GSphereCardCorners = 0.0;
         GTime.SumRefreshes = GTime.SumMapRefreshes = 0.0;
         GTime.SumRefreshSec = GTime.SumMapRefreshSec = 0.0;
         GTime.SumRefreshesKept = 0.0;
@@ -11569,7 +12009,6 @@ static const INT GShadowReachSegments = 8;
 // line below). Zero would mean the test never fires and the draws are not going anywhere.
 static INT GShadowUnseenCulled = 0;
 
-
 // A caster a light does not see: the light's own mesh (a lamp that is itself the light), and one around the light - a
 // lamp's shade, the post whose head it is. Without the rule every ray from a burning barrel's light runs straight into
 // the barrel's own side and the light gives nothing. The light's PICK uses the same rule, so that a lamp standing on
@@ -12010,11 +12449,24 @@ struct FSphereLevel
     INT                Flushes = -1;        // GLevelFlushes when it was made
     INT                Cap     = -1;        // SpherifierCap() when it was made
     INT                Angle   = -1;        // and GSpherifierAngle
+    INT                Level   = -1;        // and the spherifier's level, how finely its curves are cut (Sag)
     INT                Nodes   = 0;         // the model's nodes then
     // Each node's first corner then: a node the engine has given to something else since - a mover's polygons come and
     // go among the model's nodes - is not the one that was rounded.
     TArray<FVector>    First;
     UBOOL              bOn     = 0;         // something moved
+    // The fine bevel on it (LevelBevel.h): whether it was asked for (SphereBevelWanted then), and whether there was no
+    // memory for it; the edges found, what was made of them, and how long it took.
+    INT                        Bevel        = -1;
+    INT                        PieceCube    = -1;   // SpherePieceCubeWanted then
+    UBOOL                      bBevelMissed = 0;
+    INT                        BevelMovers  = 0;   // the movers' polygons it was given (SphereMoversInput)
+    RdxLevelRound::FBevelStats BevelEdges;
+    RdxLevelRound::FBevelMade  Bevelled;
+    double                     BevelMs = 0.0;
+    // What was left out for what is made of it after it to have its room (SphereBevelOn): 1 the fine bevel, 2 the whole
+    // rounding; nought nothing.
+    INT AfterDropped = 0;
 };
 // Two of them: the one drawn, and the one a new number is rounded into meanwhile (FSphereJob).
 static FSphereLevel  GSphereSlots[2];
@@ -12032,10 +12484,23 @@ static const FLOAT SphereNear = 1.0f;
 // The spherifier's clock, for the parts of its time in the log line.
 static double SphereSeconds() { return (double)appSeconds(); }
 
-// A rounding made beside the game, on a thread of its own, when the number moves in the menu: a large level takes the
-// good part of a second, and the game would stand still for it - and lose the menu's key presses meanwhile. The level's
-// polygons are copied for it on the game's thread; it rounds them into the slot not drawn, which is drawn from the
-// frame it is done in. Nothing else of the renderer's is touched by it.
+// A rounding's nodes as the card draws them (SphereCardPack): each node's triangles in the level's field, three words
+// each, after what PackRound laid there - the word they start at, -1 where the node has none; its corners there,
+// FSolidPass::SPHERE_CORNER_WORDS each, and how many; the ball round its corners in the level's space (x, y, z, radius),
+// by which the CPU tells a node under the readout's pick. And the lists the packing works in.
+struct FSphereCardLists
+{
+    RdxSphere::TList<INT>    Tri, Corner, Count;
+    RdxSphere::TList<FLOAT>  Ball;
+    RdxSphere::TList<DOUBLE> Sum, Flat;
+    RdxSphere::TList<INT>    Slots, CornerOf, CornerAt;
+};
+
+// A rounding made beside the game, on a thread of its own: one made again from the menu, and a new level's - a large
+// level takes seconds, and the game would stand still for it. The level's polygons are copied for it on the game's
+// thread; it rounds them into the slot not drawn, which is drawn from the frame it is done in, and lays out the card's
+// field of what it made (Field, Card) for the game's thread only to hand over then. Nothing else of the renderer's is
+// touched by it.
 struct FSphereJob
 {
     HANDLE                               Thread = nullptr;
@@ -12043,11 +12508,171 @@ struct FSphereJob
     FSphereLevel*                        Into   = nullptr;
     RdxSphere::TList<RdxSphere::FV3>     Pts;
     RdxSphere::TList<RdxSphere::FPolyIn> Polys;
-    bool                                 bMade = false;     // false: there was no memory for it
-    double                               Ms    = 0.0;
+    // The movers' polygons, for the fine bevel to leave the edges they touch sharp (SphereMoversInput), and whether it
+    // is made.
+    RdxSphere::TList<RdxSphere::FV3>     MorePts;
+    RdxSphere::TList<RdxSphere::FPolyIn> MorePolys;
+    bool                                 bBevel = false;
+    bool                                 bMade  = false;     // false: there was no memory for it
+    double                               Ms     = 0.0;
+    // The relief's field of the rounding it made and the nodes' triangles the card draws after it (PackRound,
+    // SphereCardPackOf), where the level is drawn rounded: bField, made for the slot Into; bCard, the nodes' too.
+    RdxSphere::TList<unsigned int>       Field;
+    FSphereCardLists                     Card;
+    bool                                 bField = false;
+    bool                                 bCard  = false;
 };
 static FSphereJob GSphereJob;
 
+// The fine bevel's ball (LevelBevel.h): a unit, about two centimetres - a hard edge's band a unit wide on its faces.
+static const double SphereBevelRadius = 1.0;
+
+static unsigned __int64 SphereAfterBytes(const RdxSphere::FResult& R, const RdxSphere::TList<RdxSphere::FPolyIn>& Polys);
+
+// The rings the rounding kept for the fine bevel let go, and the places kept as they are drawn from here on.
+static void SphereKeep(RdxSphere::FResult& R)
+{
+    R.Ring.Free();
+    R.RingFirst.Free();
+    R.RingCount.Free();
+    R.RingOwn.Free();
+    R.Compact();
+}
+
+// The fine bevel on the rounding just made into L, when bBevel: of the level's polygons Pts and Polys, and the movers'
+// MorePts and MorePolys. The polygons' rings the rounding kept for it are let go after it either way. Where there was no
+// memory for it the rounding is drawn as it was made, and the log says so. What is made of the level after it
+// (SphereAfterBytes) must leave the game its room as well (SphereRoomFor): where it would not, the level is rounded again
+// without the fine bevel, which multiplies its triangles, and where even that is too much, drawn as it is
+// (L.AfterDropped) - the shadows and the relief, made of what is drawn, keep the whole level.
+static void SphereBevelOn(FSphereLevel& L, bool bBevel, const RdxSphere::TList<RdxSphere::FV3>& Pts,
+                          const RdxSphere::TList<RdxSphere::FPolyIn>& Polys,
+                          const RdxSphere::TList<RdxSphere::FV3>& MorePts,
+                          const RdxSphere::TList<RdxSphere::FPolyIn>& MorePolys)
+{
+    L.BevelEdges   = RdxLevelRound::FBevelStats();
+    L.Bevelled     = RdxLevelRound::FBevelMade();
+    L.BevelMs      = 0.0;
+    L.bBevelMissed = 0;
+    L.BevelMovers  = MorePolys.Num;
+    L.AfterDropped = 0;
+    if (bBevel)
+    {
+        const double T0 = SphereSeconds();
+        L.bBevelMissed  = RdxLevelRound::Bevel(Pts.Data, Pts.Num, Polys.Data, Polys.Num, MorePts.Data, MorePolys.Data,
+                                               MorePolys.Num, (double)L.Angle, SphereBevelRadius, L.R, L.BevelEdges,
+                                               L.Bevelled) ? 0 : 1;
+        // The relief's outlines read off the triangles again (LevelRound.h's ChordsOf, made with the rounding): the
+        // bevel cuts the walls the relief is drawn on too, and a cut one's patches end on its pieces' sides, on the
+        // round's middle, as a rounded one's do (DSRelief's SphereChordAt) - not on the corner the bevel took away.
+        if (!L.bBevelMissed && L.Bevelled.Polygons > 0)
+            RdxLevelRound::ChordsOf(Pts.Data, Pts.Num, Polys.Data, Polys.Num, L.R);
+        L.BevelMs       = (SphereSeconds() - T0) * 1000.0;
+    }
+    SphereKeep(L.R);
+    // The lists it was made of go right after it: their room counts as free.
+    const unsigned __int64 Keep = (unsigned __int64)RdxMath::AddressSpaceLowMB << 20;
+    const unsigned __int64 Input =
+        (unsigned __int64)Pts.Room * sizeof(RdxSphere::FV3) + (unsigned __int64)Polys.Room * sizeof(RdxSphere::FPolyIn) +
+        (unsigned __int64)MorePts.Room * sizeof(RdxSphere::FV3) +
+        (unsigned __int64)MorePolys.Room * sizeof(RdxSphere::FPolyIn);
+    if (SphereRoomLeaves(Input, Keep + SphereAfterBytes(L.R, Polys)))
+        return;
+    const UBOOL bBevelled = bBevel && !L.bBevelMissed && L.Bevelled.Polygons > 0;
+    L.R.Free();
+    if (bBevelled &&
+        RdxLevelRound::Round(Pts.Data, Pts.Num, Polys.Data, Polys.Num, (double)L.Cap, (double)L.Angle, L.R))
+    {
+        SphereKeep(L.R);
+        L.Bevelled = RdxLevelRound::FBevelMade();
+        if (SphereRoomLeaves(Input, Keep + SphereAfterBytes(L.R, Polys)))
+        {
+            L.AfterDropped = 1;
+            return;
+        }
+        L.R.Free();
+    }
+    L.R.Touched    = 0;
+    L.AfterDropped = 2;
+}
+
+// The log's line where what is made of L after it had the fine bevel or the rounding left out (SphereBevelOn).
+static void SphereAfterSay(const FSphereLevel& L)
+{
+    if (L.AfterDropped == 0)
+        return;
+    const unsigned __int64 Free = SphereRoomFree();
+    RDX_LOGF("spherifier: %s - what is made of the level after it (the shadows' and the rays' lists, the card's copy) "
+             "would have left under the %i MB of the address space the game keeps for itself (%i MB free now)",
+             (L.AfterDropped == 1) ? TEXT("the fine bevel left out") : TEXT("the level is drawn as it is"),
+             (INT)RdxMath::AddressSpaceLowMB, (Free == ~(unsigned __int64)0) ? -1 : (INT)(Free >> 20));
+}
+
+// A measurement only: the marker SecondRevision-bevel-off.txt, written within a day, has the level rounded without the
+// fine bevel - looked for once a second, the rounding made again beside the game when it comes or goes (the same view
+// both ways in one start). One a run left behind, its time set back, turns nothing off in the player's game.
+static UBOOL SphereBevelWanted()
+{
+    static DOUBLE Looked = -1e9;
+    static UBOOL  bOff   = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked = Now;
+        bOff   = MarkerWrittenWithin(L"SecondRevision-bevel-off.txt", 24ull * 60 * 60);
+    }
+    return !bOff;
+}
+
+// A measurement only: the marker SecondRevision-piece-cube.txt, holding a number of units and written less than ten
+// minutes ago (FreshMarker: one left behind changes nothing for long), has the level rounded with its wide flat
+// polygons' pieces kept within cubes of that size (Spherify.h's PieceCube) - how a rounding made a cube at a time would
+// look; read once a second, the rounding made again beside the game when it comes, goes or changes. None: 0, the level
+// rounded as it is drawn.
+static INT SpherePieceCubeWanted()
+{
+    static DOUBLE Looked = -1e9;
+    static INT    Cube   = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked = Now;
+        Cube   = 0;
+        WCHAR       Path[MAX_PATH + 64];
+        const DWORD N = ::GetTempPathW(MAX_PATH, Path);
+        if (N > 0 && N < MAX_PATH)
+        {
+            ::lstrcatW(Path, L"SecondRevision-piece-cube.txt");
+            FILE* const F = FreshMarker(L"SecondRevision-piece-cube.txt") ? _wfopen(Path, L"r") : nullptr;
+            if (F)
+            {
+                int Units = 0;
+                if (fscanf(F, "%d", &Units) == 1 && Units > 0)
+                    Cube = Units;
+                fclose(F);
+            }
+        }
+    }
+    return Cube;
+}
+
+static void SphereJobField();
+// What the job laid out for the card let go: handed over, or of a rounding not drawn.
+static void SphereJobFieldForget()
+{
+    FSphereJob& J = GSphereJob;
+    J.Field.Free();
+    J.Card.Tri.Free();
+    J.Card.Corner.Free();
+    J.Card.Count.Free();
+    J.Card.Ball.Free();
+    J.Card.Sum.Free();
+    J.Card.Flat.Free();
+    J.Card.Slots.Free();
+    J.Card.CornerOf.Free();
+    J.Card.CornerAt.Free();
+    J.bField = J.bCard = false;
+}
 static DWORD WINAPI SphereJobMain(LPVOID)
 {
     FSphereJob&  J  = GSphereJob;
@@ -12055,17 +12680,39 @@ static DWORD WINAPI SphereJobMain(LPVOID)
     J.bMade = RdxLevelRound::Round(J.Pts.Data, J.Pts.Num, J.Polys.Data, J.Polys.Num, (double)J.Into->Cap,
                                    (double)J.Into->Angle, J.Into->R);
     J.Ms    = (SphereSeconds() - T0) * 1000.0;
+    if (J.bMade && !RdxSphere::Abandoned())
+    {
+        SphereBevelOn(*J.Into, J.bBevel, J.Pts, J.Polys, J.MorePts, J.MorePolys);
+        if (!RdxSphere::Abandoned())
+            SphereJobField();
+    }
     ::InterlockedExchange(&J.bDone, 1);
     return 0;
 }
 
-// The job's end waited for, if one is running.
-static void SphereJobJoin()
+// The job's end waited for, if one is running. Answer: the window answers Windows meanwhile (AnswerWhileCompiling) - a
+// large level's fine bevel takes seconds, and a level changed within them would have the window greyed out as hung;
+// only where the game waits for it at a level's change, not at the renderer's end. Abandon: what it makes is thrown
+// away after it - it gives up at its next part's end (RdxSphere::Abandoned) instead of making it whole.
+static void SphereJobJoin(UBOOL bAnswer = 0, UBOOL bAbandon = 0)
 {
     FSphereJob& J = GSphereJob;
     if (!J.Thread)
         return;
+    const UBOOL  bRunning = ::WaitForSingleObject(J.Thread, 0) == WAIT_TIMEOUT;
+    const double T0       = SphereSeconds();
+    if (bAbandon && bRunning)
+        RdxSphere::Abandoned() = true;
+    if (bAnswer && bRunning)
+        AnswerWhileCompiling(GMouseWnd, J.Thread);
     ::WaitForSingleObject(J.Thread, INFINITE);
+    if (bAbandon && bRunning)
+        RDX_LOGF("spherifier: the rounding being made given up - %.0f ms until it stopped",
+                 (SphereSeconds() - T0) * 1000.0);
+    // What it made before it gave up is no rounding: the slot is empty for whatever is made in it next.
+    if (RdxSphere::Abandoned() && J.Into)
+        J.Into->R.Free();
+    RdxSphere::Abandoned() = false;
     ::CloseHandle(J.Thread);
     J.Thread = nullptr;
 }
@@ -12073,9 +12720,12 @@ static void SphereJobJoin()
 // At the renderer's end: a job still running is waited for - it runs this module's code.
 static void SphereJobWait()
 {
-    SphereJobJoin();
+    SphereJobJoin(0, 1);
+    SphereJobFieldForget();
     GSphereJob.Pts.Free();
     GSphereJob.Polys.Free();
+    GSphereJob.MorePts.Free();
+    GSphereJob.MorePolys.Free();
 }
 
 // The log's line of a rounding made: Ms how long it took, Where where it was made.
@@ -12096,6 +12746,27 @@ static void SphereLog(const FSphereLevel& L, double Ms, const TCHAR* Where)
              R.ChordT.Num, R.ChordMissed);
     RDX_LOGF("spherifier: held behind what stands in front of the walls - %i places stopped short of it, %i eased "
              "round those", R.HeldStopped, R.HeldEased);
+    if (L.PieceCube > 0)
+        RDX_LOGF("spherifier: the wide flat polygons' pieces kept within cubes of %i units (the marker "
+                 "SecondRevision-piece-cube.txt) - a measurement, not as it is drawn", L.PieceCube);
+    if (L.Bevel <= 0)
+    {
+        RDX_LOG("spherifier: the fine bevel not made (the marker SecondRevision-bevel-off.txt)");
+        return;
+    }
+    const RdxLevelRound::FBevelStats& E = L.BevelEdges;
+    const RdxLevelRound::FBevelMade&  B = L.Bevelled;
+    RDX_LOGF("spherifier: the fine bevel, a ball of %.1f - %i outward hard sides between faces it may cut, %i edges; left "
+             "sharp: a free end %i, thin %i, touching %i (%i of them a mover's - %i of the movers' "
+             "polygons, where they stand and at their keys), no worn solid %i; %i polygons cut (%i triangles before, %i "
+             "after), %i places put in, made %i times, ring sides missed %i, flat pieces %i, pieces turned %i (cut "
+             "again where they moved %i); %.1f ms (shared %.1f, edges "
+             "%.1f, lists %.1f, lines %.1f, moves %.1f, cuts %.1f, the cuts' points %.1f; %i times as far as the cuts)%s",
+             SphereBevelRadius, E.Sides, E.Edges, E.LeftFree, E.LeftThin, B.LeftTouching, B.LeftMovers,
+             L.BevelMovers, B.LeftWorn, B.Polygons, B.TrisBefore, B.TrisAfter, B.Points, B.Rounds, B.SidesMissed,
+             B.PiecesFlat, B.PiecesTurned, B.PiecesCutMoved, L.BevelMs, B.PartMs[0], B.PartMs[1], B.PartMs[2], B.PartMs[3], B.PartMs[4], B.PartMs[5],
+             B.PartMs[6], B.CutRounds,
+             L.bBevelMissed ? TEXT(" - no memory for it: the rounding drawn as it was made") : TEXT(""));
 }
 
 // A slot let go: nothing in it, and made of no model.
@@ -12106,21 +12777,29 @@ static void SphereSlotForget(FSphereLevel& L)
     L.Flushes = -1;
     L.Cap     = -1;
     L.Angle   = -1;
+    L.Level   = -1;
     L.Nodes   = 0;
     L.First.Empty();
-    L.bOn     = 0;
+    L.bOn       = 0;
+    L.Bevel     = -1;
+    L.PieceCube = -1;
 }
 
 // The roundings let go at a level's change (Flush) - both slots, and the polygons the last was made of: the level left
 // is not drawn again, and the next one is rounded anew whatever it is. A large level's rounding is tens of megabytes,
 // and the slot not drawn held the one before it through the whole of the next level.
+static void MoverRoundsForget();
 static void SphereLevelsForget()
 {
-    SphereJobJoin();
+    SphereJobJoin(1, 1);
+    MoverRoundsForget();
     SphereSlotForget(GSphereSlots[0]);
     SphereSlotForget(GSphereSlots[1]);
     GSphereJob.Pts.Free();
     GSphereJob.Polys.Free();
+    GSphereJob.MorePts.Free();
+    GSphereJob.MorePolys.Free();
+    SphereJobFieldForget();
 }
 
 // The level's polygons as the spherifier takes them, into Pts and Polys, and what the slot L keeps of the model: its
@@ -12143,6 +12822,19 @@ static UBOOL SphereInput(FBackend& Backend, UModel* M, FSphereLevel& L, RdxSpher
         return 0;
     for (INT s = 0; s < M->Surfs.Num(); s++)
         SurfRelief[s] = 0;
+    // The surfaces the water's own run draws (RdxWaterSheet): 1 one with a node where a liquid meets the air - the run
+    // takes such a surface whole -, 2 a fountain's pool or chute, the run's where it is see-through.
+    RdxSphere::TList<unsigned char> SurfWater;
+    if (!SurfWater.Resize(M->Surfs.Num() > 0 ? M->Surfs.Num() : 1))
+        return 0;
+    for (INT s = 0; s < SurfWater.Num; s++)
+        SurfWater[s] = (s < M->Surfs.Num() && RdxWaterFountainSurf(s)) ? 2 : 0;
+    for (INT n = 0; n < N; n++)
+    {
+        const INT s = M->Nodes(n).iSurf;
+        if (s >= 0 && s < M->Surfs.Num() && SurfWater[s] != 1 && RdxWaterBorderNode(M, n))
+            SurfWater[s] = 1;
+    }
     for (INT n = 0; n < N; n++)
     {
         const FBspNode&     Node = M->Nodes(n);
@@ -12173,6 +12865,11 @@ static UBOOL SphereInput(FBackend& Backend, UModel* M, FSphereLevel& L, RdxSpher
         const DWORD     Flags   = Sf.PolyFlags | (Sf.Texture ? Sf.Texture->PolyFlags : 0) | (bMarker ? PF_FakeBackdrop : 0);
         const bool      bMover  = Sf.Actor && Sf.Actor->IsA(AMover::StaticClass());
         P.Use = RdxSphere::UseFor((unsigned int)Flags, bMover);
+        // A surface the water's own run draws, with its waves and what it mirrors: a node of it drawn as the
+        // spherifier's pieces would be a flat sheet over it. Neither rounded nor bevelled.
+        if (P.Use && Node.iSurf >= 0 && Node.iSurf < SurfWater.Num &&
+            (SurfWater[Node.iSurf] == 1 || (SurfWater[Node.iSurf] == 2 && (Flags & PF_Translucent))))
+            P.Use = 0;
         if ((P.Use & RdxSphere::Use_Wall) && Sf.Texture && !(Flags & (PF_Translucent | PF_Modulated)))
         {
             unsigned char& Known = SurfRelief[Node.iSurf];
@@ -12208,6 +12905,65 @@ static UBOOL SphereInput(FBackend& Backend, UModel* M, FSphereLevel& L, RdxSpher
         ReliefTextures += (AskedRelief[i] == 2) ? 1 : 0;
     RDX_LOGF("spherifier: %i of the level's %i polygons may carry the relief - %i of the %i textures asked have a height "
              "map switched on", ReliefPolys, N, ReliefTextures, AskedTex.Num);
+    return 1;
+}
+
+// The level's movers' polygons for the fine bevel (LevelBevel.h's MorePolys): each mover's brush where it stands now and
+// where each of its keys puts it - a door shut now may stand open later, and a secret door's outline must stay sharp
+// wherever it stops. Their planes by their corners there (Newell's). False when there was no memory for them.
+static UBOOL SphereMoversInput(ULevel* Level, RdxSphere::TList<RdxSphere::FV3>& Pts,
+                               RdxSphere::TList<RdxSphere::FPolyIn>& Polys)
+{
+    Pts.Clear();
+    Polys.Clear();
+    if (!Level)
+        return 1;
+    for (INT i = 0; i < Level->Actors.Num(); i++)
+    {
+        AActor* const Actor = Level->Actors(i);
+        if (!Actor || Actor->bDeleteMe || !Actor->IsA(AMover::StaticClass()) || !Actor->Brush || !Actor->Brush->Polys)
+            continue;
+        AMover* const A    = (AMover*)Actor;
+        const INT     Keys = Min((INT)A->NumKeys, (INT)ARRAY_COUNT(A->KeyPos));
+        for (INT k = -1; k < Keys; k++)
+        {
+            const FCoords W = (k < 0) ? A->ToWorld()
+                                      : GMath.UnitCoords * (A->BasePos + A->KeyPos[k]) * A->PostScale *
+                                            (A->BaseRot + A->KeyRot[k]) * A->MainScale * -A->PrePivot;
+            for (INT p = 0; p < A->Brush->Polys->Element.Num(); p++)
+            {
+                const FPoly& Poly = A->Brush->Polys->Element(p);
+                if (Poly.NumVertices < 3 || Poly.NumVertices > FPoly::MAX_VERTICES)
+                    continue;
+                RdxSphere::FPolyIn P;
+                P.First = Pts.Num;
+                P.Count = Poly.NumVertices;
+                P.Use   = 0;
+                for (INT v = 0; v < Poly.NumVertices; v++)
+                {
+                    const FVector Q = Poly.Vertex[v].TransformPointBy(W);
+                    if (!Pts.Add(RdxSphere::V3(Q.X, Q.Y, Q.Z)))
+                        return 0;
+                }
+                double Nx = 0.0, Ny = 0.0, Nz = 0.0;
+                for (INT v = 0; v < P.Count; v++)
+                {
+                    const RdxSphere::FV3& Qa = Pts[P.First + v];
+                    const RdxSphere::FV3& Qb = Pts[P.First + (v + 1) % P.Count];
+                    Nx += (Qa.Y - Qb.Y) * (Qa.Z + Qb.Z);
+                    Ny += (Qa.Z - Qb.Z) * (Qa.X + Qb.X);
+                    Nz += (Qa.X - Qb.X) * (Qa.Y + Qb.Y);
+                }
+                const double Len = sqrt(Nx * Nx + Ny * Ny + Nz * Nz);
+                P.Nx = (Len > 0.0) ? Nx / Len : 0.0;
+                P.Ny = (Len > 0.0) ? Ny / Len : 0.0;
+                P.Nz = (Len > 0.0) ? Nz / Len : 0.0;
+                P.W  = P.Nx * Pts[P.First].X + P.Ny * Pts[P.First].Y + P.Nz * Pts[P.First].Z;
+                if (!Polys.Add(P))
+                    return 0;
+            }
+        }
+    }
     return 1;
 }
 
@@ -12252,54 +13008,102 @@ static void SphereInputDump(ULevel* Level, double Cap, const RdxSphere::TList<Rd
              NumPolys);
 }
 
+// The level's rounding drawn is the one of the spherifier's number now, and no job is making another (ShotPairFrame).
+static UBOOL SphereSettled()
+{
+    return !GSphereJob.Thread && GSphere->Cap == SpherifierCap() && GSphere->Angle == GSpherifierAngle &&
+           GSphere->Level == GRunSpherifier && GSphere->Bevel == (SphereBevelWanted() ? 1 : 0) &&
+           GSphere->PieceCube == SpherePieceCubeWanted();
+}
+
 // The level's rounding, made again when the level, the setting or the engine's flush is new. True when what is drawn
 // changed now (EnsureSphere counts it).
 static UBOOL EnsureSphereNow(FBackend& Backend, ULevel* Level)
 {
-    UModel* const M = Level ? Level->Model : nullptr;
-    FSphereJob&   J = GSphereJob;
+    UModel* const M      = Level ? Level->Model : nullptr;
+    FSphereJob&   J      = GSphereJob;
+    const INT     Bevel  = SphereBevelWanted() ? 1 : 0;
+    const INT     Cube   = SpherePieceCubeWanted();
     // A job done: drawn from now on, if it is still the level's and the number's.
     if (J.Thread && J.bDone)
     {
         SphereJobJoin();
         FSphereLevel& Made = *J.Into;
-        if (J.bMade && Made.Model == M && Made.Flushes == GLevelFlushes && Made.Cap == SpherifierCap() &&
-            Made.Angle == GSpherifierAngle)
+        if (Made.Model == M && Made.Flushes == GLevelFlushes && Made.Cap == SpherifierCap() &&
+            Made.Angle == GSpherifierAngle && Made.Level == GRunSpherifier && Made.Bevel == Bevel &&
+            Made.PieceCube == Cube)
         {
-            Made.Nodes = J.Polys.Num;
-            Made.bOn   = Made.R.Touched > 0;
-            GSphere    = &Made;
-            SphereLog(Made, J.Ms, TEXT(" beside the game"));
+            if (J.bMade)
+            {
+                Made.Nodes = J.Polys.Num;
+                Made.bOn   = Made.AfterDropped != 2 && Made.R.Touched > 0;
+                SphereLog(Made, J.Ms, TEXT(" beside the game"));
+                if (Made.bBevelMissed)
+                    SphereRoomSay(TEXT("the fine bevel left out"));
+                SphereAfterSay(Made);
+            }
+            else
+            {
+                // No room for it: the level drawn as it is, and not made again with the same numbers at every frame.
+                RDX_LOG("spherifier: no memory for the level - it is drawn as it is");
+                SphereRoomSay(TEXT("the level is drawn as it is"));
+                Made.R.Free();
+                Made.bOn   = 0;
+                Made.Nodes = 0;
+            }
+            // What it was made of is made again for the next rounding (SphereInput).
+            J.Pts.Free();
+            J.Polys.Free();
+            J.MorePts.Free();
+            J.MorePolys.Free();
+            GSphere = &Made;
             // The rounding before it, of the number before, is drawn no more.
             SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
+            GSphereWatchEnded = GSphereWatchLeast = SphereSpaceFree();
+            GSphereWatchFrom  = appSeconds();
+            GSphereWatchUntil = GSphereWatchFrom + SphereWatchSeconds;
+            GSphereCameFrames = SphereCameFramesSaid;
             return 1;
         }
+        // Not drawn after all - the level or the number moved on meanwhile: what it laid out for the card goes too.
+        SphereJobFieldForget();
     }
     if (M == GSphere->Model && GSphere->Flushes == GLevelFlushes && GSphere->Cap == SpherifierCap() &&
-        GSphere->Angle == GSpherifierAngle)
+        GSphere->Angle == GSpherifierAngle && GSphere->Level == GRunSpherifier && GSphere->Bevel == Bevel &&
+        GSphere->PieceCube == Cube)
         return 0;
-    // The same level with a new number from the menu: made beside the game once the number has stood still a moment,
-    // not at every step, the rounding before drawn meanwhile.
-    static INT    SeenCap = -1, SeenAngle = -1;
+    // The same level with a new number from the menu (or a measurement's marker come or gone): made beside the game once
+    // the number has stood still a moment, not at every step, the rounding before drawn meanwhile.
+    static INT    SeenCap = -1, SeenAngle = -1, SeenLevel = -1, SeenBevel = -1, SeenCube = -1;
     static DOUBLE SeenAt  = 0.0;
-    if (SpherifierCap() != SeenCap || GSpherifierAngle != SeenAngle)
+    if (SpherifierCap() != SeenCap || GSpherifierAngle != SeenAngle || GRunSpherifier != SeenLevel ||
+        Bevel != SeenBevel || Cube != SeenCube)
     {
         SeenCap   = SpherifierCap();
         SeenAngle = GSpherifierAngle;
+        SeenLevel = GRunSpherifier;
+        SeenBevel = Bevel;
+        SeenCube  = Cube;
         SeenAt    = appSeconds();
     }
     const UBOOL bSameLevel = M && M == GSphere->Model && GSphere->Flushes == GLevelFlushes;
     if (bSameLevel && (J.Thread || appSeconds() - SeenAt < 0.4))
         return 0;
-    // A new level: a job still running for the one before is let go.
-    SphereJobJoin();
+    // A new level: a job still running for the one before is let go - and what it laid out for the card with it,
+    // whether it gave up or came to its end meanwhile: that was the level before's, and it would be held through the
+    // new level's rounding, or handed to it where no thread can be had for the next job.
+    SphereJobJoin(0, 1);
+    SphereJobFieldForget();
     FSphereLevel& L = (GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0];
-    L.Model   = M;
-    L.Flushes = GLevelFlushes;
-    L.Cap     = SpherifierCap();
-    L.Angle   = GSpherifierAngle;
-    L.bOn     = 0;
-    L.Nodes   = 0;
+    L.Model     = M;
+    L.Flushes   = GLevelFlushes;
+    L.Cap       = SpherifierCap();
+    L.Angle     = GSpherifierAngle;
+    L.Level     = GRunSpherifier;
+    L.Bevel     = Bevel;
+    L.PieceCube = Cube;
+    L.bOn       = 0;
+    L.Nodes     = 0;
     if (!M || L.Cap <= 0)
     {
         L.First.Empty();
@@ -12309,43 +13113,96 @@ static UBOOL EnsureSphereNow(FBackend& Backend, ULevel* Level)
         return 1;
     }
     const double T0 = SphereSeconds();
+    SphereRoomBegin();
+    SphereWatchSay();
+    GSphereWatchBegan = SphereSpaceFree();
     if (!SphereInput(Backend, M, L, J.Pts, J.Polys))
     {
         RDX_LOG("spherifier: no memory for the level - it is drawn as it is");
+        SphereRoomSay(TEXT("the level is drawn as it is"));
+        J.Pts.Free();
+        J.Polys.Free();
         GSphere = &L;
+        SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
         return 1;
     }
     static const UBOOL bInputDump = FreshMarker(L"SecondRevision-level-round-dump.txt");
     if (bInputDump)
         SphereInputDump(Level, (double)L.Cap, J.Pts, J.Polys);
-    L.R.Seconds = SphereSeconds;
-    // A new level's is waited for: on every thread it may take. One made beside the game, on its thread alone - the
-    // frames go on meanwhile.
+    J.bBevel = Bevel != 0;
+    if (J.bBevel && !SphereMoversInput(Level, J.MorePts, J.MorePolys))
+    {
+        RDX_LOG("spherifier: no memory for the movers' polygons - the fine bevel left out");
+        SphereRoomSay(TEXT("the fine bevel left out"));
+        J.bBevel = false;
+        J.MorePts.Free();
+        J.MorePolys.Free();
+    }
+    L.R.Seconds   = SphereSeconds;
+    L.R.Sag       = RdxMath::SpherifierSagOf(L.Level);
+    L.R.PieceCube = (double)L.PieceCube;
+    // Made beside the game, the frames going on meanwhile: one made again for the same level from the menu on its thread
+    // alone, the rounding before drawn until it is done; a new level's on every thread it may take, below the game's
+    // own threads, the level drawn as it is until it is done - a large level's rounding takes seconds, and the save is
+    // played at once. The level is rounded from the frame the job is done on, and its shadows and rays are made again
+    // then (EnsureSphere's change).
     L.R.Workers = bSameLevel ? 1 : RdxSphere::WorkersAvailable();
     J.Into      = &L;
     J.bDone     = 0;
     J.bMade     = false;
-    if (bSameLevel)
+    J.Thread    = ::CreateThread(nullptr, 0, &SphereJobMain, nullptr, CREATE_SUSPENDED, nullptr);
+    if (J.Thread)
     {
-        J.Thread = ::CreateThread(nullptr, 0, &SphereJobMain, nullptr, 0, nullptr);
-        if (J.Thread)
-            return 0;
+        if (!bSameLevel)
+        {
+            ::SetThreadPriority(J.Thread, THREAD_PRIORITY_BELOW_NORMAL);
+            // The slot drawn now is the new level's until the job is done, with nothing rounded in it: the level before's
+            // rounding is let go, and the same numbers do not start the job again at the next frame.
+            FSphereLevel& Now = *GSphere;
+            SphereSlotForget(Now);
+            Now.Model     = M;
+            Now.Flushes   = GLevelFlushes;
+            Now.Cap       = L.Cap;
+            Now.Angle     = L.Angle;
+            Now.Level     = L.Level;
+            Now.Bevel     = L.Bevel;
+            Now.PieceCube = L.PieceCube;
+        }
+        ::ResumeThread(J.Thread);
+        return bSameLevel ? 0 : 1;
     }
-    // A new level - only just showing, and its shadows and rays are made of it - or no thread to be had: made here.
-    if (!RdxLevelRound::Round(J.Pts.Data, J.Pts.Num, J.Polys.Data, J.Polys.Num, (double)L.Cap, (double)L.Angle, L.R))
+    // No thread to be had: made here, before the level is drawn.
+    const bool   bMade = RdxLevelRound::Round(J.Pts.Data, J.Pts.Num, J.Polys.Data, J.Polys.Num, (double)L.Cap,
+                                              (double)L.Angle, L.R);
+    const double Ms    = (SphereSeconds() - T0) * 1000.0;
+    if (bMade)
+        SphereBevelOn(L, J.bBevel, J.Pts, J.Polys, J.MorePts, J.MorePolys);
+    if (!bMade)
+    {
         RDX_LOG("spherifier: no memory for the level - it is drawn as it is");
+        SphereRoomSay(TEXT("the level is drawn as it is"));
+        L.R.Free();
+    }
     else
     {
         L.Nodes = J.Polys.Num;
-        L.bOn   = L.R.Touched > 0;
-        SphereLog(L, (SphereSeconds() - T0) * 1000.0, TEXT(""));
+        L.bOn   = L.AfterDropped != 2 && L.R.Touched > 0;
+        SphereLog(L, Ms, TEXT(""));
+        if (L.bBevelMissed)
+            SphereRoomSay(TEXT("the fine bevel left out"));
+        SphereAfterSay(L);
     }
     // What it was made of is made again for the next rounding (SphereInput); and the rounding drawn before is drawn no
     // more.
     J.Pts.Free();
     J.Polys.Free();
+    J.MorePts.Free();
+    J.MorePolys.Free();
     GSphere = &L;
     SphereSlotForget((GSphere == &GSphereSlots[0]) ? GSphereSlots[1] : GSphereSlots[0]);
+    GSphereWatchEnded = GSphereWatchLeast = SphereSpaceFree();
+    GSphereWatchFrom  = appSeconds();
+    GSphereWatchUntil = GSphereWatchFrom + SphereWatchSeconds;
     return 1;
 }
 static UBOOL EnsureSphere(FBackend& Backend, ULevel* Level)
@@ -12424,9 +13281,9 @@ static void SphereTriangle(INT n, INT t, FVector& A, FVector& B, FVector& C)
 {
     const RdxSphere::FResult& R  = GSphere->R;
     const INT                 At = (R.PolyFirst[n] + t) * 3;
-    const RdxSphere::FV3&     a  = R.Moved[R.Tri[At]];
-    const RdxSphere::FV3&     b  = R.Moved[R.Tri[At + 1]];
-    const RdxSphere::FV3&     c  = R.Moved[R.Tri[At + 2]];
+    const RdxSphere::FV3      a  = R.MovedAt(R.Tri[At]);
+    const RdxSphere::FV3      b  = R.MovedAt(R.Tri[At + 1]);
+    const RdxSphere::FV3      c  = R.MovedAt(R.Tri[At + 2]);
     A = FVector((FLOAT)a.X, (FLOAT)a.Y, (FLOAT)a.Z);
     B = FVector((FLOAT)b.X, (FLOAT)b.Y, (FLOAT)b.Z);
     C = FVector((FLOAT)c.X, (FLOAT)c.Y, (FLOAT)c.Z);
@@ -12505,6 +13362,32 @@ static INT                           GSpherePieceSerial = 0;
 // pairs of the rounding's number and the node's), and each triangle corner's.
 static RdxSphere::TList<INT>          GPieceSlots, GPieceCornerOf, GPieceCornerAt;
 
+// What is made of a level's rounding R after it in the CPU's memory, bytes, at the most (SphereBevelOn): the shadow
+// maps' and the rays' lists of the level's triangles (BuildShadowWorld: nine floats, a byte and a word a triangle, a
+// polygon not rounded its fan's), the card's copy of the rounded polygons' triangles (SphereCardPack: three words a
+// triangle and SPHERE_CORNER_WORDS a corner - a polygon's triangles have two corners more than triangles at the most)
+// and the relief's field before it (PackRound: SphereFieldPerTri bytes a triangle), and the piece blocks' budget.
+// Polys: the level's polygons as the rounding took them, one a node.
+static const double SphereFieldPerTri = 16.0;   // bytes: the most the field took a triangle on the game's levels, and more
+static unsigned __int64 SphereAfterBytes(const RdxSphere::FResult& R, const RdxSphere::TList<RdxSphere::FPolyIn>& Polys)
+{
+    unsigned __int64 Shadow = 0, Card = 0, Tris = 0;
+    for (INT n = 0; n < Polys.Num; n++)
+    {
+        const INT Own = (n < R.PolyTris.Num) ? R.PolyTris[n] : 0;
+        if (Own > 0)
+        {
+            Tris += Own;
+            Shadow += Own;
+            Card += (unsigned __int64)Own * 3 + (unsigned __int64)(Own + 2) * FSolidPass::SPHERE_CORNER_WORDS;
+        }
+        else if (Polys[n].Count > 2)
+            Shadow += Polys[n].Count - 2;
+    }
+    return Shadow * (9 * sizeof(FLOAT) + sizeof(BYTE) + sizeof(DWORD)) + Card * sizeof(DWORD) +
+           (unsigned __int64)(SphereFieldPerTri * (double)Tris) + SpherePieceBudget;
+}
+
 // The pieces made ahead (StartPieceJobs) read the blocks: their helpers are called off and waited for before a block
 // goes, and where the blocks all go, the jobs and what they made go with them.
 static void ClosePieceJobs();
@@ -12535,6 +13418,45 @@ static void SpherePieceBlocksTrim(SIZE_T Need)
         }
 }
 
+// Node n's triangles' corners in rounding R, each once, numbered in the order its triangles first name them:
+// CornerAt[c] the rounding's number of corner c, CornerOf[i] the corner of the triangles' i-th - the numbering of the
+// node's block (SpherePieceBlock) and of its triangles on the card (SphereCardPack); Slots the table it is found by. How
+// many corners; -1: no memory.
+static INT PieceCornerOrderOf(const RdxSphere::FResult& R, INT n, RdxSphere::TList<INT>& Slots,
+                              RdxSphere::TList<INT>& CornerOf, RdxSphere::TList<INT>& CornerAt)
+{
+    const INT Tris  = R.PolyTris[n];
+    const INT First = R.PolyFirst[n] * 3;
+    INT Size = 64;
+    while (Size < Tris * 6)
+        Size *= 2;
+    if (!Slots.Resize(Size * 2) || !CornerOf.Resize(Tris * 3) || !CornerAt.Resize(Tris * 3))
+        return -1;
+    for (INT s = 0; s < Size; s++)
+        Slots[s * 2] = -1;
+    INT Corners = 0;
+    for (INT i = 0; i < Tris * 3; i++)
+    {
+        const INT G = R.Tri[First + i];
+        INT       s = (INT)(((DWORD)G * 2654435761u) & (DWORD)(Size - 1));
+        while (Slots[s * 2] >= 0 && Slots[s * 2] != G)
+            s = (s + 1) & (Size - 1);
+        if (Slots[s * 2] < 0)
+        {
+            Slots[s * 2]        = G;
+            Slots[s * 2 + 1]    = Corners;
+            CornerAt[Corners++] = G;
+        }
+        CornerOf[i] = Slots[s * 2 + 1];
+    }
+    return Corners;
+}
+// The rounding drawn's, into the lists a block is made with (GPieceCornerAt, GPieceCornerOf).
+static INT PieceCornerOrder(INT n)
+{
+    return PieceCornerOrderOf(GSphere->R, n, GPieceSlots, GPieceCornerOf, GPieceCornerAt);
+}
+
 // Node n's block (SphereNodeTris of it says it is rounded), made the first time it is asked for; null where there was no
 // memory for it.
 static const FPieceBlock* SpherePieceBlock(const FSceneNode* Frame, INT n)
@@ -12555,32 +13477,12 @@ static const FPieceBlock* SpherePieceBlock(const FSceneNode* Frame, INT n)
     FPieceBlock*& Block = GSpherePieceBlocks[n];
     if (Block)
         return Block;
-    const RdxSphere::FResult& R     = GSphere->R;
-    const INT                 Tris  = R.PolyTris[n];
-    const INT                 First = R.PolyFirst[n] * 3;
+    const RdxSphere::FResult& R       = GSphere->R;
+    const INT                 Tris    = R.PolyTris[n];
     // Each corner once: the rounding's numbers of the triangles' corners, through the table.
-    INT Size = 64;
-    while (Size < Tris * 6)
-        Size *= 2;
-    if (!GPieceSlots.Resize(Size * 2) || !GPieceCornerOf.Resize(Tris * 3) || !GPieceCornerAt.Resize(Tris * 3))
+    const INT                 Corners = PieceCornerOrder(n);
+    if (Corners < 0)
         return nullptr;
-    for (INT s = 0; s < Size; s++)
-        GPieceSlots[s * 2] = -1;
-    INT Corners = 0;
-    for (INT i = 0; i < Tris * 3; i++)
-    {
-        const INT G = R.Tri[First + i];
-        INT       s = (INT)(((DWORD)G * 2654435761u) & (DWORD)(Size - 1));
-        while (GPieceSlots[s * 2] >= 0 && GPieceSlots[s * 2] != G)
-            s = (s + 1) & (Size - 1);
-        if (GPieceSlots[s * 2] < 0)
-        {
-            GPieceSlots[s * 2]        = G;
-            GPieceSlots[s * 2 + 1]    = Corners;
-            GPieceCornerAt[Corners++] = G;
-        }
-        GPieceCornerOf[i] = GPieceSlots[s * 2 + 1];
-    }
     const SIZE_T Bytes = sizeof(FPieceBlock) + sizeof(FLOAT) * 6 * (SIZE_T)Corners + sizeof(FPieceTri) * (SIZE_T)Tris;
     if (GSpherePieceBytes + Bytes > SpherePieceBudget)
         SpherePieceBlocksTrim(Bytes);
@@ -12596,8 +13498,8 @@ static const FPieceBlock* SpherePieceBlock(const FSceneNode* Frame, INT n)
     FLOAT* const  Cs = (FLOAT*)PieceCorners(Block);
     for (INT c = 0; c < Corners; c++)
     {
-        const RdxSphere::FV3& W    = R.Moved[GPieceCornerAt[c]];
-        const RdxSphere::FV3& O    = R.Orig[GPieceCornerAt[c]];
+        const RdxSphere::FV3  W    = R.MovedAt(GPieceCornerAt[c]);
+        const RdxSphere::FV3  O    = R.OrigAt(GPieceCornerAt[c]);
         const FVector         Now((FLOAT)W.X, (FLOAT)W.Y, (FLOAT)W.Z);
         const FVector         Read = SphereReadAt(FVector((FLOAT)O.X, (FLOAT)O.Y, (FLOAT)O.Z), Now, N);
         FLOAT* const          C    = Cs + 6 * c;
@@ -12650,6 +13552,456 @@ static UBOOL PieceCornersInView(const FSceneNode* Frame, const FPieceBlock* Bloc
     GPieceViewSerial = Block->Serial;
     appMemcpy(GPieceViewCoords, &Frame->Coords, sizeof(FCoords));
     return 1;
+}
+
+// The spherifier's pieces drawn from the card (FSolidPass::AddSphereRun): the drawn rounding's nodes there
+// (FSphereCardLists); GSphereCardWords: the field's size; for the rounding GSphereCardGen.
+static FSphereCardLists GSphereCard;
+static INT              GSphereCardWords = 0;
+static INT              GSphereCardGen   = -1;
+
+// A normal of length one in a word, for the card (SolidPass.hlsl's SphereNormalOf): each of its numbers in ten bits.
+static DWORD PackNormal(DOUBLE X, DOUBLE Y, DOUBLE Z)
+{
+    auto Ten = [](DOUBLE V) -> DWORD
+    {
+        const INT Q = (INT)floor((V + 1.0) * 511.5 + 0.5);
+        return (DWORD)((Q < 0) ? 0 : (Q > 1023) ? 1023 : Q);
+    };
+    return Ten(X) | (Ten(Y) << 10) | (Ten(Z) << 20);
+}
+
+// After PackRound's words, each rounded node's triangles as its block numbers its corners (PieceCornerOrder), three
+// words each, then its corners, FSolidPass::SPHERE_CORNER_WORDS each: where the corner is now, in the level's space;
+// how far it moved along the node's plane's normal - its pictures are read that much less far along the normal
+// (SphereReadAt); and the drawn surface's normal there, packed (PackNormal): the fine bevel's round's own where it
+// moved the corner (FResult's BevelNormal) - the same on both of an edge's faces -, else its triangles' round it added
+// up each by its area, those the bevel moved no corner of where there are such: a face's flat beside the round is not
+// tilted towards it. And the ball round each node's corners. PlaneOf(n): node n's plane's normal. False: no memory -
+// then the card draws none of them.
+template <typename FPlaneOf>
+static UBOOL SphereCardPackOf(const RdxSphere::FResult& R, INT Nodes, const FPlaneOf& PlaneOf,
+                              RdxSphere::TList<unsigned int>& Words, FSphereCardLists& Card)
+{
+    if (!Card.Tri.Resize(Nodes) || !Card.Corner.Resize(Nodes) || !Card.Count.Resize(Nodes) || !Card.Ball.Resize(Nodes * 4))
+        return 0;
+    // Counted first, so that the field is laid out in one block.
+    INT All = 0;
+    for (INT n = 0; n < Nodes; n++)
+    {
+        Card.Tri[n] = Card.Corner[n] = -1;
+        Card.Count[n] = 0;
+        if (R.PolyTris[n] <= 0)
+            continue;
+        const INT Corners = PieceCornerOrderOf(R, n, Card.Slots, Card.CornerOf, Card.CornerAt);
+        if (Corners < 0)
+            return 0;
+        Card.Count[n] = Corners;
+        All += R.PolyTris[n] * 3 + Corners * FSolidPass::SPHERE_CORNER_WORDS;
+    }
+    if (!Words.ReserveExact(Words.Num + All))
+        return 0;
+    RdxSphere::TList<DOUBLE>& Sum  = Card.Sum;
+    RdxSphere::TList<DOUBLE>& Flat = Card.Flat;
+    // The round's own normal at a corner, 0 where the bevel did not move it.
+    auto RoundNormal = [&](INT Corner) {
+        const INT w = Card.CornerAt[Corner];
+        return (w < R.BevelNormal.Num) ? R.BevelNormal[w] : 0u;
+    };
+    for (INT n = 0; n < Nodes; n++)
+    {
+        const INT Tris = R.PolyTris[n];
+        if (Tris <= 0)
+            continue;
+        const INT Corners = PieceCornerOrderOf(R, n, Card.Slots, Card.CornerOf, Card.CornerAt);
+        if (Corners != Card.Count[n] || !Sum.Resize(Corners * 3) || !Flat.Resize(Corners * 3))
+            return 0;
+        const INT At = Words.Num;
+        Words.Num += Tris * 3;
+        for (INT i = 0; i < Tris * 3; i++)
+            Words[At + i] = (unsigned int)Card.CornerOf[i];
+        Card.Tri[n] = At;
+        // Each triangle's normal, twice its area long, on the side of the node's plane, onto its three corners: every
+        // triangle's (Sum), and of those the bevel moved no corner of alone (Flat).
+        const RdxSphere::FV3 Plane = PlaneOf(n);
+        for (INT i = 0; i < Corners * 3; i++)
+            Sum[i] = Flat[i] = 0.0;
+        for (INT t = 0; t < Tris; t++)
+        {
+            const INT             Cs[3] = { Card.CornerOf[t * 3], Card.CornerOf[t * 3 + 1], Card.CornerOf[t * 3 + 2] };
+            const RdxSphere::FV3  A     = R.MovedAt(Card.CornerAt[Cs[0]]);
+            const RdxSphere::FV3  B     = R.MovedAt(Card.CornerAt[Cs[1]]);
+            const RdxSphere::FV3  C     = R.MovedAt(Card.CornerAt[Cs[2]]);
+            const RdxSphere::FV3  N     = RdxSphere::Cross(B - A, C - A);
+            const DOUBLE          Side  = (N.X * Plane.X + N.Y * Plane.Y + N.Z * Plane.Z < 0.0) ? -1.0 : 1.0;
+            const UBOOL           bFlat = !RoundNormal(Cs[0]) && !RoundNormal(Cs[1]) && !RoundNormal(Cs[2]);
+            for (INT k = 0; k < 3; k++)
+            {
+                Sum[Cs[k] * 3]     += N.X * Side;
+                Sum[Cs[k] * 3 + 1] += N.Y * Side;
+                Sum[Cs[k] * 3 + 2] += N.Z * Side;
+                if (bFlat)
+                {
+                    Flat[Cs[k] * 3]     += N.X * Side;
+                    Flat[Cs[k] * 3 + 1] += N.Y * Side;
+                    Flat[Cs[k] * 3 + 2] += N.Z * Side;
+                }
+            }
+        }
+        const INT CornerAt = Words.Num;
+        Words.Num += Corners * FSolidPass::SPHERE_CORNER_WORDS;
+        DOUBLE Lo[3] = { 1e30, 1e30, 1e30 }, Hi[3] = { -1e30, -1e30, -1e30 };
+        for (INT c = 0; c < Corners; c++)
+        {
+            const RdxSphere::FV3  W   = R.MovedAt(Card.CornerAt[c]);
+            const RdxSphere::FV3  O   = R.OrigAt(Card.CornerAt[c]);
+            const DOUBLE          Off = (W.X - O.X) * Plane.X + (W.Y - O.Y) * Plane.Y + (W.Z - O.Z) * Plane.Z;
+            const DOUBLE* const   S   = (Flat[c * 3] != 0.0 || Flat[c * 3 + 1] != 0.0 || Flat[c * 3 + 2] != 0.0)
+                                            ? &Flat[c * 3]
+                                            : &Sum[c * 3];
+            DOUBLE       Nx = S[0], Ny = S[1], Nz = S[2];
+            const DOUBLE L  = sqrt(Nx * Nx + Ny * Ny + Nz * Nz);
+            if (L > 1e-12)
+            {
+                Nx /= L;
+                Ny /= L;
+                Nz /= L;
+            }
+            else
+            {
+                Nx = Plane.X;
+                Ny = Plane.Y;
+                Nz = Plane.Z;
+            }
+            const FLOAT        Fs[4] = { (FLOAT)W.X, (FLOAT)W.Y, (FLOAT)W.Z, (FLOAT)Off };
+            unsigned int* const Out  = &Words[CornerAt + c * FSolidPass::SPHERE_CORNER_WORDS];
+            memcpy(Out, Fs, sizeof(Fs));
+            Out[4] = RoundNormal(c) ? RoundNormal(c) : (unsigned int)PackNormal(Nx, Ny, Nz);
+            const DOUBLE Ps[3] = { W.X, W.Y, W.Z };
+            for (INT a = 0; a < 3; a++)
+            {
+                Lo[a] = (Ps[a] < Lo[a]) ? Ps[a] : Lo[a];
+                Hi[a] = (Ps[a] > Hi[a]) ? Ps[a] : Hi[a];
+            }
+        }
+        Card.Corner[n] = CornerAt;
+        const DOUBLE Mid[3] = { (Lo[0] + Hi[0]) * 0.5, (Lo[1] + Hi[1]) * 0.5, (Lo[2] + Hi[2]) * 0.5 };
+        DOUBLE       Far    = 0.0;
+        for (INT c = 0; c < Corners; c++)
+        {
+            const RdxSphere::FV3  W  = R.MovedAt(Card.CornerAt[c]);
+            const DOUBLE          Dx = W.X - Mid[0], Dy = W.Y - Mid[1], Dz = W.Z - Mid[2];
+            const DOUBLE          D2 = Dx * Dx + Dy * Dy + Dz * Dz;
+            Far = (D2 > Far) ? D2 : Far;
+        }
+        FLOAT* const Ball = &Card.Ball[n * 4];
+        Ball[0] = (FLOAT)Mid[0];
+        Ball[1] = (FLOAT)Mid[1];
+        Ball[2] = (FLOAT)Mid[2];
+        Ball[3] = (FLOAT)sqrt(Far) + 0.01f;
+    }
+    return 1;
+}
+// The card's field of the rounding the job made, on the job's thread, where the level is to be drawn rounded: the
+// relief's words (PackRound) into its Field, and the nodes' triangles after them into its Card (bCard), the nodes'
+// planes the polygons' it was made of - for the game's thread only to hand over when the rounding comes in.
+static void SphereJobField()
+{
+    FSphereJob&         J = GSphereJob;
+    const FSphereLevel& L = *J.Into;
+    SphereJobFieldForget();
+    if (L.AfterDropped == 2 || L.R.Touched <= 0 || !RdxLevelRound::PackRound(L.R, J.Field))
+        return;
+    J.bField     = true;
+    auto PlaneOf = [&](INT n) {
+        const RdxSphere::FPolyIn& P = J.Polys[n];
+        return RdxSphere::V3(P.Nx, P.Ny, P.Nz);
+    };
+    J.bCard = SphereCardPackOf(L.R, J.Polys.Num, PlaneOf, J.Field, J.Card) != 0;
+}
+
+// The rounding drawn's, into GSphereCard - its nodes' planes the level's model's (Model).
+static UBOOL SphereCardPack(RdxSphere::TList<unsigned int>& Words, const UModel* Model)
+{
+    GSphereCardGen = -1;
+    if (!Model || Model->Nodes.Num() < GSphere->Nodes)
+        return 0;
+    auto PlaneOf = [&](INT n) {
+        const FPlane& P = Model->Nodes(n).Plane;
+        return RdxSphere::V3(P.X, P.Y, P.Z);
+    };
+    if (!SphereCardPackOf(GSphere->R, GSphere->Nodes, PlaneOf, Words, GSphereCard))
+        return 0;
+    GSphereCardWords = Words.Num;
+    GSphereCardGen   = GSphereGen;
+    return 1;
+}
+
+// The nodes the main drawing's walk drew from the card in this surface's drawing, each with how far behind the relief's
+// patches it was drawn and its depth's scale, the floats' bits, in threes (SphereCardOf): the walks after it - the
+// detail texture's, the fog map's - draw the same nodes from the card with records of their own (SphereCardAgainOf), at
+// the same depth.
+static RdxSphere::TList<INT> GCardMade;
+
+// A measurement only: the marker SecondRevision-sphere-cpu.txt, written within a day, sends every node the CPU's way -
+// looked for once a second of frames, so that a run can lay it down and take it away while the game plays (the same
+// view drawn both ways in one start); one left behind with its time set back sends none.
+static UBOOL SphereCardWanted(INT EngineFrame)
+{
+    static INT   Looked = -1000;
+    static UBOOL bOff   = 0;
+    if (EngineFrame - Looked >= 60 || EngineFrame < Looked)
+    {
+        Looked = EngineFrame;
+        bOff   = MarkerWrittenWithin(L"SecondRevision-sphere-cpu.txt", 24ull * 60 * 60);
+    }
+    return !bOff;
+}
+
+// Measurements only: the marker SecondRevision-relief-measure.txt leaves parts of Geometry=Tessellation's work out, to
+// see what each costs - its number the sum of: 1 the pixels' relief shading, 2 the covers' walk (ReliefClear), 4 the
+// detail texture's pass over the patches, 8 the patches' cuts (each patch drawn whole), 16 the held edges
+// (ReliefHeldAt), 32 the pixel shader past the texture, 64 the spherifier's move of the patches' points, 128 all of
+// the points' lift (the patches drawn flat, cut as ever), 256 the spherifier's drawn triangles' lookup in that move,
+// 512 its curve's faces' lookup; and a check, 1024: the held edges walked with the patch's mask and with every edge,
+// the relief drawn black, blue where the two differ in their last bits, magenta where by more - with 2048 its control,
+// every edge on both sides. Looked for once a second, whatever its age, so that a run can change it while the game
+// plays - the same view drawn every way in one start.
+enum
+{
+    ReliefMeasure_NoShade     = 1,
+    ReliefMeasure_NoClear     = 2,
+    ReliefMeasure_NoDetail    = 4,
+    ReliefMeasure_CutOnce     = 8,
+    ReliefMeasure_NoHeld      = 16,
+    ReliefMeasure_TextureOnly = 32,
+    ReliefMeasure_NoSphere    = 64,
+    ReliefMeasure_Flat        = 128,
+    ReliefMeasure_NoPieces    = 256,
+    ReliefMeasure_NoFaces     = 512,
+    ReliefMeasure_CheckHeld   = 1024,
+    ReliefMeasure_CheckSame   = 2048
+};
+static INT ReliefMeasure()
+{
+    static DOUBLE Looked = -1e9;
+    static INT    Parts  = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked = Now;
+        Parts  = LiveMarkerNumber(L"SecondRevision-relief-measure.txt", 0, 0);
+        static INT Said = 0;
+        if (Said != Parts)
+        {
+            RDX_LOGF("relief measure: %i left out - the pixels' shading %i, the covers %i, the detail pass %i, the cuts "
+                     "%i, the held edges %i, past the texture %i, the spherifier's move %i, all of the lift %i, the "
+                     "drawn triangles' lookup %i, the faces' lookup %i, the held edges checked %i (the marker "
+                     "SecondRevision-relief-measure.txt)",
+                     Parts, (Parts & ReliefMeasure_NoShade) ? 1 : 0, (Parts & ReliefMeasure_NoClear) ? 1 : 0,
+                     (Parts & ReliefMeasure_NoDetail) ? 1 : 0, (Parts & ReliefMeasure_CutOnce) ? 1 : 0,
+                     (Parts & ReliefMeasure_NoHeld) ? 1 : 0, (Parts & ReliefMeasure_TextureOnly) ? 1 : 0,
+                     (Parts & ReliefMeasure_NoSphere) ? 1 : 0, (Parts & ReliefMeasure_Flat) ? 1 : 0,
+                     (Parts & ReliefMeasure_NoPieces) ? 1 : 0, (Parts & ReliefMeasure_NoFaces) ? 1 : 0,
+                     (Parts & ReliefMeasure_CheckHeld) ? 1 : 0);
+            Said = Parts;
+        }
+    }
+    return Parts;
+}
+
+// A measurement only: the marker SecondRevision-relief-edge.txt's number in place of the 960th a cut edge is of the view's
+// width (DrawComplexSurface's Edge, which the CPU's split and the GPU's cuts both take) - looked for once a second, so
+// that one start draws the same view at every density.
+static INT ReliefEdgeParts()
+{
+    static DOUBLE Looked = -1e9;
+    static INT    Parts  = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked        = Now;
+        const INT Was = Parts;
+        Parts         = LiveMarkerNumber(L"SecondRevision-relief-edge.txt", 0, 0);
+        if (Parts != Was)
+            RDX_LOGF("relief edge: a cut edge is a %ith of the view's width (the marker SecondRevision-relief-edge.txt; "
+                     "0 the 960th)", Parts);
+    }
+    return Parts;
+}
+
+// What a node drawn from the card takes of its surface (FPolyWalk::CardOn): the frame's offset on the screen
+// (FrameOffsetX, FrameOffsetY), how far the pieces go under the relief's patches and the depth's scale there (the
+// main drawing's Under and its factor), and whether the readout's pick is made in this view.
+struct FSphereCardAt
+{
+    FLOAT OffX, OffY;
+    FLOAT Under, DepthScale;
+    UBOOL bPick;
+    // The surface's relief walked by the pixel shader (POM), null none: its frame in the view, which the card turns at
+    // each corner as the surface turned from its plane there (SolidPass.hlsl's SphereCornerInto).
+    const RdxMath::FPomFrame* Pom;
+};
+
+static UBOOL SpherePiece(const FSceneNode* Frame, const FSavedPoly* Engine, INT Piece, FSpherePiece& Out);
+static RdxMath::FPomFrame TurnedPomFrameOf(const RdxMath::FPomFrame& F, const FSceneNode* Frame, const FVector* World,
+                                           FLOAT Turn, const FLOAT* Trig);
+
+// This frame's view in the room for the nodes drawn from the card (SolidPass.hlsl's SphereVertexOutOf): the eye in the
+// level's space with the engine's projection's scale, then the view's three axes, the first two each with the middle
+// of the screen it projects round (the engine's, with the world view's offset) - FSolidPass::SPHERE_VIEW_WORDS, laid
+// once for each surface the card draws pieces of, its word kept for the walks after its main drawing (GCardView); -1
+// where the room is full.
+static INT GCardView = -1;
+static INT SphereCardView(FBackend& Backend, const FSceneNode* Frame, FLOAT OffX, FLOAT OffY)
+{
+    INT          First = -1;
+    FLOAT* const Out   = Backend.SphereRoom(FSolidPass::SPHERE_VIEW_WORDS, First);
+    GCardView = -1;
+    if (!Out)
+        return -1;
+    const FCoords& C = Frame->Coords;
+    const FLOAT    View[FSolidPass::SPHERE_VIEW_WORDS] = {
+        C.Origin.X, C.Origin.Y, C.Origin.Z, Frame->Proj.Z,
+        C.XAxis.X,  C.XAxis.Y,  C.XAxis.Z,  Frame->FX15 + OffX,
+        C.YAxis.X,  C.YAxis.Y,  C.YAxis.Z,  Frame->FY15 + OffY,
+        C.ZAxis.X,  C.ZAxis.Y,  C.ZAxis.Z,  0.0f };
+    memcpy(Out, View, sizeof(View));
+    GCardView = First;
+    return First;
+}
+
+// Node n's record for a run of its pieces drawn from the card (SolidPass.hlsl's SphereVertexOutOf), from the surface's
+// numbers Tpl as DrawComplexSurface lays them (the gain; the texture's axes in the view with their dots with the
+// origin, the pans, the scales, the tiling, the light map's): its triangles' and its corners' words in the field and
+// how many of each; whether the pixel shader walks a relief; the node's plane's normal in the view; how far behind the
+// relief's patches it is drawn (Under) and the depth's scale; the relief's axes in the view, each with the texture's
+// units a unit of the level along it, where Pom has them; the view's word in the room and the field's size.
+static void SphereCardRecordOf(const FSceneNode* Frame, INT n, FLOAT Under, FLOAT DepthScale,
+                               const RdxMath::FPomFrame* Pom, const FLOAT* Tpl, INT View, FLOAT* Record)
+{
+    memcpy(Record, Tpl, sizeof(FLOAT) * FSolidPass::SPHERE_RECORD_WORDS);
+    DWORD* const W = (DWORD*)Record;
+    W[0]  = (DWORD)GSphereCard.Tri[n];
+    W[1]  = (DWORD)GSphereCard.Corner[n];
+    W[3]  = Pom ? 1u : 0u;
+    W[22] = (DWORD)GSphere->R.PolyTris[n];
+    W[23] = (DWORD)GSphereCard.Count[n];
+    const FPlane&  P = Frame->Level->Model->Nodes(n).Plane;
+    const FCoords& C = Frame->Coords;
+    const FVector  N(P.X, P.Y, P.Z);
+    Record[24] = N | C.XAxis;
+    Record[25] = N | C.YAxis;
+    Record[26] = N | C.ZAxis;
+    Record[27] = Under;
+    if (Pom)
+    {
+        Record[28] = Pom->T.X;
+        Record[29] = Pom->T.Y;
+        Record[30] = Pom->T.Z;
+        Record[31] = Pom->Du;
+        Record[32] = Pom->B.X;
+        Record[33] = Pom->B.Y;
+        Record[34] = Pom->B.Z;
+        Record[35] = Pom->Dv;
+        Record[40] = Pom->N.X;
+        Record[41] = Pom->N.Y;
+        Record[42] = Pom->N.Z;
+    }
+    W[36]      = (DWORD)View;
+    W[37]      = (DWORD)GSphereCardWords;
+    Record[38] = DepthScale;
+}
+
+// The world's view's node n drawn from the card (FPolyWalk::Enter): the card turns, projects and maps its corners
+// (SolidPass.hlsl's SphereVertexOutOf) and clips them at the eye like any other. Only where the readout's pick is made -
+// the readout or the menu on the screen - a node whose ball reaches the screen's middle goes the CPU's way: the pick is
+// made on the CPU's pieces. Its run's record (SphereCardRecordOf) into this frame's room, with View, the surface's view
+// there (SphereCardView); the record's word, or -1: the node goes the CPU's way.
+static INT SphereCardOf(FBackend& Backend, const FSceneNode* Frame, INT n, const FSphereCardAt& At, const FLOAT* Tpl,
+                        INT View)
+{
+    if (View < 0 || GSphereCardGen != GSphereGen || n < 0 || n >= GSphereCard.Tri.Num || GSphereCard.Tri[n] < 0 ||
+        GSphereCard.Corner[n] < 0)
+        return -1;
+    struct FTimed
+    {
+        DOUBLE T0;
+        ~FTimed() { GSphereCardSec += appSeconds() - T0; }
+    } Timed = { appSeconds() };
+    const FPlane& Clip = Frame->NearClip;
+    if (Clip.X * Clip.X + Clip.Y * Clip.Y + Clip.Z * Clip.Z >= 0.25f)
+        return -1;
+    if (At.bPick && (GMenuShown || GRunReadout != RdxMath::Readout_Off))
+    {
+        const FCoords& C    = Frame->Coords;
+        const FLOAT*   Ball = &GSphereCard.Ball[n * 4];
+        const FVector  D(Ball[0] - C.Origin.X, Ball[1] - C.Origin.Y, Ball[2] - C.Origin.Z);
+        const FLOAT    Z    = D | C.ZAxis;
+        const FLOAT    Near = Z - Ball[3];
+        if (Near <= SphereNear)
+            return -1;
+        const FLOAT RZ    = Frame->Proj.Z / Z;
+        const FLOAT SX    = (D | C.XAxis) * RZ + Frame->FX15 + At.OffX;
+        const FLOAT SY    = (D | C.YAxis) * RZ + Frame->FY15 + At.OffY;
+        const FLOAT Reach = Ball[3] * Frame->Proj.Z / Near + 1.0f;
+        const FLOAT PX = (FLOAT)Frame->X * 0.5f + At.OffX, PY = (FLOAT)Frame->Y * 0.5f + At.OffY;
+        if ((PX - SX) * (PX - SX) + (PY - SY) * (PY - SY) <= Reach * Reach)
+            return -1;
+    }
+    INT          First = -1;
+    FLOAT* const Out   = Backend.SphereRoom(FSolidPass::SPHERE_RECORD_WORDS, First);
+    if (!Out)
+        return -1;
+    FLOAT Record[FSolidPass::SPHERE_RECORD_WORDS];
+    SphereCardRecordOf(Frame, n, At.Under, At.DepthScale, At.Pom, Tpl, View, Record);
+    memcpy(Out, Record, sizeof(Record));
+    GSphereCardCorners += (DOUBLE)GSphereCard.Count[n];
+    // The walks after the main drawing's - the detail texture's, the fog map's - draw the node at the same depth.
+    INT Depth[2];
+    memcpy(&Depth[0], &At.Under, sizeof(FLOAT));
+    memcpy(&Depth[1], &At.DepthScale, sizeof(FLOAT));
+    GCardMade.Add(n);
+    GCardMade.Add(Depth[0]);
+    GCardMade.Add(Depth[1]);
+    return First;
+}
+
+// Node n drawn from the card again by a walk after the main drawing's (FPolyWalk::CardAgain): the detail texture's and
+// the fog map's pieces are the main drawing's, at the same places and depths (GCardMade: the node, its Under and its
+// depth's scale), with a record of the walk's own numbers. The record's word; -1: the node goes the CPU's way.
+static INT SphereCardAgainOf(FBackend& Backend, const FSceneNode* Frame, INT n, const FLOAT* Tpl, INT View)
+{
+    INT Made = -1;
+    for (INT k = 0; k + 2 < GCardMade.Num && Made < 0; k += 3)
+        if (GCardMade[k] == n)
+            Made = k;
+    if (Made < 0 || View < 0 || GSphereCardGen != GSphereGen || n < 0 || n >= GSphereCard.Tri.Num ||
+        GSphereCard.Tri[n] < 0)
+        return -1;
+    FLOAT Under, DepthScale;
+    memcpy(&Under, &GCardMade[Made + 1], sizeof(FLOAT));
+    memcpy(&DepthScale, &GCardMade[Made + 2], sizeof(FLOAT));
+    INT          First = -1;
+    FLOAT* const Out   = Backend.SphereRoom(FSolidPass::SPHERE_RECORD_WORDS, First);
+    if (!Out)
+        return -1;
+    FLOAT Record[FSolidPass::SPHERE_RECORD_WORDS];
+    SphereCardRecordOf(Frame, n, Under, DepthScale, nullptr, Tpl, View, Record);
+    memcpy(Out, Record, sizeof(Record));
+    return First;
+}
+
+// What a walk hands over for a node drawn from the card (FPolyWalk::CardNode): a polygon of no points, the node's.
+alignas(8) static BYTE GCardMarkBlock[sizeof(FSavedPoly) + sizeof(FTransform*)];
+static const FSavedPoly* CardMarkOf(const FSavedPoly* Engine)
+{
+    FSavedPoly& P = *(FSavedPoly*)GCardMarkBlock;
+    P.Next   = nullptr;
+    P.iNode  = Engine->iNode;
+    P.User   = Engine->User;
+    P.NumPts = 0;
+    return &P;
 }
 
 static UBOOL SpherePiece(const FSceneNode* Frame, const FSavedPoly* Engine, INT Piece, FSpherePiece& Out)
@@ -12912,7 +14264,7 @@ static void NotePieceDrawn(INT n, INT EngineFrame)
 
 // At a root view's start: where it is the world view's - the screen the world view had - the nodes the world view drew
 // last are made ahead, in this view.
-static void StartPieceJobs(const FSceneNode* Frame, INT EngineFrame)
+static void StartPieceJobs(FBackend& Backend, const FSceneNode* Frame, INT EngineFrame)
 {
     if (!Frame || Frame->Parent || GWorldCoordsFrame == EngineFrame || GPieceJobLaid == EngineFrame ||
         Frame->XB != GWorldView.XB || Frame->YB != GWorldView.YB || Frame->X != GWorldView.X ||
@@ -12960,9 +14312,10 @@ static void StartPieceJobs(const FSceneNode* Frame, INT EngineFrame)
         const FPieceBlock* const B = SpherePieceBlock(Frame, n);
         if (!B || GSpherePieceGen != GSphereGen)
             break;
+        // No more pieces made ahead than their list holds.
         if (Pieces + B->Tris > PieceAheadMost)
             break;
-        const FPieceJob J = { B, n, Pieces, 0 };
+        FPieceJob J = { B, n, Pieces, 0 };
         if (!GPieceJobs.Add(J))
             break;
         GPieceJobAt[n] = GPieceJobs.Num - 1;
@@ -12987,6 +14340,12 @@ static void StartPieceJobs(const FSceneNode* Frame, INT EngineFrame)
     WORD X87       = 0;
     __asm fnstcw X87
     GPieceX87         = X87;
+    static UBOOL bWordsSaid = 0;
+    if (!bWordsSaid)
+    {
+        bWordsSaid = 1;
+        RDX_LOGF("spherifier: the game thread's float control words - x87 %04X, SSE %08X", (INT)X87, (INT)GPieceCsr);
+    }
     GPieceJobNext     = 0;
     GPieceHelperNext  = 0;
     GPieceJobsOpen    = 1;
@@ -13028,9 +14387,9 @@ static void WaitJobDone(volatile LONG& State)
     }
 }
 
-// Node n's job with its pieces made - waited for while a helper makes them, made here where none has started - or
-// null: it has none.
-static const FPieceJob* TakePieceJob(INT n)
+// Node n's pieces made ahead - waited for while a helper makes them, made here where none has started - or null: it has
+// no job.
+static FPieceJob* TakePieceJob(INT n)
 {
     if (n < 0 || n >= GPieceJobAt.Num || GPieceJobAt[n] < 0)
         return nullptr;
@@ -13074,6 +14433,17 @@ static UBOOL SpherePieceOf(const FSceneNode* Frame, const FSavedPoly* Engine, co
         }
     }
     return SpherePieceInView(Frame, Engine, P, O, Turn, Out);
+}
+
+// A view narrower than the screen: a security camera's picture in a computer's window, the spy drone's window. The
+// engine cuts its own polygons to such a view's picture, and what lies past the picture's sides is the window round it,
+// drawn before or after - so the spherifier's pieces are cut there as well (SpherePieceInView), none of its nodes is
+// drawn from the card, whose triangles nothing but the screen's edges cuts, and no model is rounded there (its patch is
+// the whole triangle). A view as wide as the screen has the screen's sides for its own.
+static inline UBOOL SphereViewNarrow(const FSceneNode* Frame)
+{
+    const UViewport* const V = Frame ? Frame->Viewport : nullptr;
+    return (V && (Frame->XB > 0 || Frame->XB + Frame->X < V->SizeX)) ? 1 : 0;
 }
 
 // SpherePieceOf's part in the view's space: the triangle's corners there (P) and where its pictures are read (O), on
@@ -13165,6 +14535,27 @@ static UBOOL SpherePieceInView(const FSceneNode* Frame, const FSavedPoly* Engine
         }
         if (bLeft || bRight || bAbove || bBelow)
             return 0;
+        // A view narrower than the screen (SphereViewNarrow): cut at those of the picture's four sides it reaches past,
+        // each a plane through the eye - most pieces lie wholly inside and are cut nowhere. A corner a cut makes lies
+        // between two that were inside every other side, so it is inside them too. Each cut adds a corner at the most:
+        // the near plane's leaves four, the sides eight - a piece's room; in a mirror's view seen in such a window, cut
+        // along the mirror too, Cut keeps the first eight.
+        if (SphereViewNarrow(Frame))
+        {
+            const FLOAT L = -Frame->FX15, R = Frame->FX - Frame->FX15;
+            const FLOAT T = -Frame->FY15, B = Frame->FY - Frame->FY15;
+            UBOOL bPastL = 0, bPastR = 0, bPastT = 0, bPastB = 0;
+            for (INT i = 0; i < Num; i++)
+            {
+                bPastL = bPastL || P[i].X * F < L * P[i].Z;
+                bPastR = bPastR || P[i].X * F > R * P[i].Z;
+                bPastT = bPastT || P[i].Y * F < T * P[i].Z;
+                bPastB = bPastB || P[i].Y * F > B * P[i].Z;
+            }
+            if ((bPastL && !Cut(F, 0.0f, -L, 0.0f)) || (bPastR && !Cut(-F, 0.0f, R, 0.0f)) ||
+                (bPastT && !Cut(0.0f, F, -T, 0.0f)) || (bPastB && !Cut(0.0f, -F, B, 0.0f)))
+                return 0;
+        }
     }
     FSavedPoly& Poly = Out.Poly();
     Poly.Next   = nullptr;
@@ -13293,6 +14684,276 @@ static void SphereDecalOf(const FSceneNode* Frame, const FSavedPoly* Engine, FSp
     }
 }
 
+// The movers rounded - a door, a lift, a secret wall: each mover's brush by itself, as the level is (LevelRound.h's
+// rounding and LevelBevel.h's fine bevel), once, where the mover stood when it was first drawn; and drawn in its
+// polygons' place where it is now, as the decals on the rounded walls are (SpherePieceOf). A mover goes its own way:
+// none is rounded to another, or to the level.
+struct FMoverRound
+{
+    const AMover*      Mover   = nullptr;
+    const UModel*      Brush   = nullptr;   // the brush it was made of
+    INT                Flushes = -1;        // GLevelFlushes when it was made
+    INT                Cap = -1, Angle = -1, Level = -1, Bevel = -1;   // the spherifier's numbers then
+    FCoords            Back;                // the world where it was made into the brush's own space (ToLocal then)
+    RdxSphere::FResult R;                   // per polygon of the brush, where the mover stood then
+    UBOOL              bOn = 0;             // something of it moved
+    RdxSphere::TList<INT> DrawnIn;          // per polygon of the brush and walk (EWalkPass): the view it was drawn
+                                            // whole in last (WalkViewNumber; 0 none yet) - FPolyWalk::Enter
+};
+
+// The walks over a surface's polygons in one draw of it (FPolyWalk::Begin): the surface itself, then its detail texture
+// over the same pieces, then its fog map - each lays its own layer, and each draws a rounded mover's polygon once.
+enum EWalkPass
+{
+    WalkPass_Surface = 0,
+    WalkPass_Detail,
+    WalkPass_Fog,
+    WalkPass_Count
+};
+
+// The view the polygon walk draws in now, by number (FPolyWalk::InView): the engine's frame, and where the view looks
+// from and how it is clipped - a mirror's, a portal's or the sky zone's view of the same frame is another, as the
+// spherifier's pieces made ahead tell views apart (PieceJobsFor). 0 is no view.
+static INT     GWalkViewFrame  = -1;
+static INT     GWalkViewNumber = 0;
+static FCoords GWalkViewCoords;
+static FPlane  GWalkViewClip;
+static INT WalkViewNumber(const FSceneNode* Frame, INT EngineFrame)
+{
+    if (!Frame)
+        return 0;
+    if (EngineFrame != GWalkViewFrame || memcmp(&Frame->Coords, &GWalkViewCoords, sizeof(FCoords)) != 0 ||
+        memcmp(&Frame->NearClip, &GWalkViewClip, sizeof(FPlane)) != 0)
+    {
+        GWalkViewFrame  = EngineFrame;
+        GWalkViewCoords = Frame->Coords;
+        GWalkViewClip   = Frame->NearClip;
+        GWalkViewNumber = (GWalkViewNumber >= MAXINT - 1) ? 1 : GWalkViewNumber + 1;
+    }
+    return GWalkViewNumber;
+}
+
+// Whether a rounded mover's polygon was drawn whole by walk Pass in view View already (NoteMoverDrawn).
+static UBOOL MoverDrawnIn(const FMoverRound& Mv, INT Poly, INT Pass, INT View)
+{
+    // The polygon's number as the engine gives it, checked before it is multiplied: a wild one is no polygon noted.
+    if (View <= 0 || Poly < 0 || Poly >= Mv.DrawnIn.Num / WalkPass_Count)
+        return 0;
+    return Mv.DrawnIn[Poly * WalkPass_Count + Pass] == View;
+}
+
+// A rounded mover's polygon drawn whole by walk Pass in view View. Where there is no room to note it, it is drawn again
+// at its next facet in the view - as many times as the engine hands its pieces over.
+static void NoteMoverDrawn(FMoverRound& Mv, INT Poly, INT Pass, INT View)
+{
+    if (View <= 0 || Poly < 0 || Poly >= Mv.R.PolyTris.Num)
+        return;
+    const INT At = Poly * WalkPass_Count + Pass;
+    if (At >= Mv.DrawnIn.Num)
+    {
+        const INT Was  = Mv.DrawnIn.Num;
+        const INT Want = (INT)Mv.R.PolyTris.Num * WalkPass_Count;
+        if (!Mv.DrawnIn.Resize(Want))
+            return;
+        for (INT i = Was; i < Want; i++)
+            Mv.DrawnIn[i] = 0;
+    }
+    Mv.DrawnIn[At] = View;
+}
+static RdxSphere::TList<FMoverRound*> GMoverRounds;
+
+// How many movers' roundings the log has told of this level (MoverRoundOf).
+static INT GMoverRoundsSaid = 0;
+
+// The megabytes the level's roundings hold - both slots' and the movers' -, kept past the renderer's Exit for one made
+// again on the same level (Exit's line of what is still held).
+static DOUBLE SphereKeptMB()
+{
+    size_t Bytes = GSphereSlots[0].R.Bytes() + GSphereSlots[1].R.Bytes() + (size_t)GMoverRounds.Room * sizeof(FMoverRound*);
+    for (INT i = 0; i < GMoverRounds.Num; i++)
+        if (GMoverRounds[i])
+            Bytes += GMoverRounds[i]->R.Bytes();
+    return (DOUBLE)Bytes / (1024.0 * 1024.0);
+}
+
+// Every mover's rounding let go: the level is over (SphereLevelsForget).
+static void MoverRoundsForget()
+{
+    for (INT i = 0; i < GMoverRounds.Num; i++)
+        delete GMoverRounds[i];
+    GMoverRounds.Free();
+    GMoverRoundsSaid = 0;
+}
+
+// Mover A's rounding: made now where there is none yet, or none by the spherifier's numbers now. Null where none is
+// drawn - the spherifier off, no memory for it, or nothing of it moved.
+static FMoverRound* MoverRoundOf(const AMover* A)
+{
+    if (!A || !A->Brush || !A->Brush->Polys || !GSphere->bOn || SpherifierCap() <= 0)
+        return nullptr;
+    const INT    Bevel = SphereBevelWanted() ? 1 : 0;
+    FMoverRound* E     = nullptr;
+    for (INT i = 0; i < GMoverRounds.Num && !E; i++)
+        if (GMoverRounds[i]->Mover == A)
+            E = GMoverRounds[i];
+    if (E && E->Brush == A->Brush && E->Flushes == GLevelFlushes && E->Cap == SpherifierCap() &&
+        E->Angle == GSpherifierAngle && E->Level == GRunSpherifier && E->Bevel == Bevel)
+        return E->bOn ? E : nullptr;
+    if (!E)
+    {
+        E = new FMoverRound;
+        if (!GMoverRounds.Add(E))
+        {
+            delete E;
+            return nullptr;
+        }
+        E->Mover = A;
+    }
+    E->Brush   = A->Brush;
+    E->Flushes = GLevelFlushes;
+    E->Cap     = SpherifierCap();
+    E->Angle   = GSpherifierAngle;
+    E->Level   = GRunSpherifier;
+    E->Bevel   = Bevel;
+    E->bOn     = 0;
+    E->R.Free();
+    E->Back = A->ToLocal();
+    // Its polygons where it stands, as the level's are taken (SphereInput): a wall by its flags, its plane by its corners
+    // (Newell's) - each polygon of the brush by its own number, the one its surfaces name (FBspSurf::iBrushPoly).
+    const FCoords                        W  = A->ToWorld();
+    UPolys* const                        Ps = A->Brush->Polys;
+    RdxSphere::TList<RdxSphere::FV3>     Pts;
+    RdxSphere::TList<RdxSphere::FPolyIn> Polys;
+    for (INT i = 0; i < Ps->Element.Num(); i++)
+    {
+        const FPoly&        Poly = Ps->Element(i);
+        RdxSphere::FPolyIn P;
+        P.First = Pts.Num;
+        P.Count = 0;
+        P.Use   = 0;
+        P.Nx = P.Ny = P.Nz = P.W = 0.0;
+        if (Poly.NumVertices >= 3 && Poly.NumVertices <= FPoly::MAX_VERTICES)
+        {
+            const DWORD Flags = Poly.PolyFlags | (Poly.Texture ? Poly.Texture->PolyFlags : 0);
+            P.Use             = RdxSphere::UseFor((unsigned int)Flags, false);
+            P.Count           = Poly.NumVertices;
+            for (INT v = 0; v < Poly.NumVertices; v++)
+            {
+                const FVector Q = Poly.Vertex[v].TransformPointBy(W);
+                if (!Pts.Add(RdxSphere::V3(Q.X, Q.Y, Q.Z)))
+                    return nullptr;
+            }
+            double Nx = 0.0, Ny = 0.0, Nz = 0.0;
+            for (INT v = 0; v < P.Count; v++)
+            {
+                const RdxSphere::FV3& Qa = Pts[P.First + v];
+                const RdxSphere::FV3& Qb = Pts[P.First + (v + 1) % P.Count];
+                Nx += (Qa.Y - Qb.Y) * (Qa.Z + Qb.Z);
+                Ny += (Qa.Z - Qb.Z) * (Qa.X + Qb.X);
+                Nz += (Qa.X - Qb.X) * (Qa.Y + Qb.Y);
+            }
+            // Facing the way the polygon's own normal does: its outward side, as the level's planes face theirs.
+            const FVector Own  = Poly.Normal.TransformVectorBy(W);
+            const double  Len  = sqrt(Nx * Nx + Ny * Ny + Nz * Nz);
+            const double  Way  = (Nx * Own.X + Ny * Own.Y + Nz * Own.Z < 0.0) ? -1.0 : 1.0;
+            P.Nx               = (Len > 0.0) ? Way * Nx / Len : 0.0;
+            P.Ny               = (Len > 0.0) ? Way * Ny / Len : 0.0;
+            P.Nz               = (Len > 0.0) ? Way * Nz / Len : 0.0;
+            P.W                = P.Nx * Pts[P.First].X + P.Ny * Pts[P.First].Y + P.Nz * Pts[P.First].Z;
+        }
+        if (!Polys.Add(P))
+            return nullptr;
+    }
+    E->R.Workers = 1;
+    E->R.Sag     = RdxMath::SpherifierSagOf(GRunSpherifier);
+    E->R.Seconds = nullptr;
+    if (!RdxLevelRound::Round(Pts.Data, Pts.Num, Polys.Data, Polys.Num, (double)E->Cap, (double)E->Angle, E->R))
+    {
+        E->R.Free();
+        return nullptr;
+    }
+    RdxLevelRound::FBevelStats Edges;
+    RdxLevelRound::FBevelMade  Made;
+    if (Bevel)
+        RdxLevelRound::Bevel(Pts.Data, Pts.Num, Polys.Data, Polys.Num, nullptr, nullptr, 0, (double)E->Angle,
+                             SphereBevelRadius, E->R, Edges, Made);
+    E->R.Ring.Free();
+    E->R.RingFirst.Free();
+    E->R.RingCount.Free();
+    E->R.RingOwn.Free();
+    INT Moved = 0, Tris = 0;
+    for (INT p = 0; p < E->R.PolyTris.Num; p++)
+    {
+        Moved += (E->R.PolyTris[p] > 0) ? 1 : 0;
+        Tris += E->R.PolyTris[p];
+    }
+    E->bOn = Moved > 0;
+    // The first few of a level's, to tell from the log that the movers are rounded - and, of one the bevel found no edge
+    // on, each polygon's flags, use and plane.
+    if (GMoverRoundsSaid < 12)
+    {
+        GMoverRoundsSaid++;
+        RDX_LOGF("spherifier: mover %s rounded - %i of its %i polygons moved, into %i triangles; the fine bevel %s, %i "
+                 "hard sides, %i edges (left sharp: a free end %i, thin %i), %i polygons cut",
+                 A->GetName(), Moved, Polys.Num, Tris, Bevel ? TEXT("made") : TEXT("not asked for"), Edges.Sides,
+                 Edges.Edges, Edges.LeftFree, Edges.LeftThin, Made.Polygons);
+        for (INT i = 0; Bevel && Edges.Edges == 0 && i < Polys.Num && i < 12; i++)
+        {
+            const FPoly& Poly = A->Brush->Polys->Element(i);
+            RDX_LOGF("spherifier:   its polygon %i: %i corners, flags 0x%08x (texture's 0x%08x), use %i, normal %.2f %.2f "
+                     "%.2f", i, Poly.NumVertices, Poly.PolyFlags, Poly.Texture ? Poly.Texture->PolyFlags : 0,
+                     Polys[i].Use, Polys[i].Nx, Polys[i].Ny, Polys[i].Nz);
+        }
+    }
+    return E->bOn ? E : nullptr;
+}
+
+// Polygon Poly of mover rounding E where the mover is now, into Tri and Was (SphereDecalOf's way: where each corner is
+// drawn, and where its pictures are read): its triangles, three corners each. How many triangles; 0 where it has none.
+static RdxSphere::TList<FVector> GMoverTri, GMoverWas;
+static INT MoverPolygonNow(const FMoverRound& E, INT Poly)
+{
+    const RdxSphere::FResult& R = E.R;
+    if (Poly < 0 || Poly >= R.PolyTris.Num || R.PolyTris[Poly] <= 0)
+        return 0;
+    const AMover* const A     = E.Mover;
+    const FCoords       Now   = A->ToWorld();
+    const INT           Count = R.PolyTris[Poly];
+    if (!GMoverTri.Resize(Count * 3) || !GMoverWas.Resize(Count * 3))
+        return 0;
+    // The polygon's plane where the mover is now, for where the pictures are read.
+    const FPoly&  Own    = A->Brush->Polys->Element(Poly);
+    const FVector Normal = Own.Normal.TransformVectorBy(Now).SafeNormal();
+    for (INT c = 0; c < Count * 3; c++)
+    {
+        const INT             w  = R.Tri[R.PolyFirst[Poly] * 3 + c];
+        const RdxSphere::FV3  Mv = R.MovedAt(w);
+        const RdxSphere::FV3  Og = R.OrigAt(w);
+        const FVector Moved = FVector((FLOAT)Mv.X, (FLOAT)Mv.Y, (FLOAT)Mv.Z).TransformPointBy(E.Back).TransformPointBy(Now);
+        const FVector Was   = FVector((FLOAT)Og.X, (FLOAT)Og.Y, (FLOAT)Og.Z).TransformPointBy(E.Back).TransformPointBy(Now);
+        GMoverTri[c]        = Moved;
+        GMoverWas[c]        = SphereReadAt(Was, Moved, Normal);
+    }
+    return Count;
+}
+
+// The rounding of the mover whose polygon the engine's Poly is a piece of, and that polygon's number in its brush
+// (FBspSurf::iBrushPoly); null where it is none of a rounded mover's.
+static FMoverRound* MoverOfPoly(const FSceneNode* Frame, const FSavedPoly* Poly, INT& BrushPoly)
+{
+    const UModel* const M = (Frame && Frame->Level) ? Frame->Level->Model : nullptr;
+    if (!M || !Poly || Poly->iNode < 0 || Poly->iNode >= M->Nodes.Num())
+        return nullptr;
+    const INT s = M->Nodes(Poly->iNode).iSurf;
+    if (s < 0 || s >= M->Surfs.Num())
+        return nullptr;
+    const FBspSurf& S = M->Surfs(s);
+    if (!S.Actor || !S.Actor->IsA(AMover::StaticClass()))
+        return nullptr;
+    BrushPoly = S.iBrushPoly;
+    return MoverRoundOf((const AMover*)S.Actor);
+}
+
 // A measurement only (the marker SecondRevision-sphere-tint.txt): each piece of the spherifier's drawn in the world's
 // view tinted by its node - eight hues, by the node's number - and every 300th frame the nodes so drawn near the eye
 // listed with their hue, so that a piece in a picture can be told for the level's polygon it is of. Node numbers in
@@ -13345,8 +15006,8 @@ static void SphereTintSay(const FSceneNode* Frame)
             for (INT c = 0; c < 3; c++)
             {
                 const INT             Ix = R.Tri[(R.PolyFirst[n] + t) * 3 + c];
-                const RdxSphere::FV3& Mv = R.Moved[Ix];
-                const RdxSphere::FV3& Og = R.Orig[Ix];
+                const RdxSphere::FV3  Mv = R.MovedAt(Ix);
+                const RdxSphere::FV3  Og = R.OrigAt(Ix);
                 ZLo  = (Mv.Z < ZLo) ? Mv.Z : ZLo;
                 ZHi  = (Mv.Z > ZHi) ? Mv.Z : ZHi;
                 const double D = sqrt((Mv.X - Og.X) * (Mv.X - Og.X) + (Mv.Y - Og.Y) * (Mv.Y - Og.Y) +
@@ -14049,6 +15710,7 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
         else
             Skipped[Why]++;
     }
+    const DOUBLE TCounted = appSeconds();
     // The lists as long as the level's triangles come from RdxAllocLarge: refused, the level goes without them - no
     // walls in the shadow maps, no level for the rays - where the engine's allocator would end the game.
     FLOAT* const Xyz = (Tris > 0) ? (FLOAT*)RdxAllocLarge((SIZE_T)Tris * 9 * sizeof(FLOAT)) : nullptr;
@@ -14094,9 +15756,28 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
     // And the see-through surfaces the level draws - a pane, a grating, a force field's sheet - with each triangle's
     // surface, for the mirror rays alone (FRtPass::SetThin): a ray passes them and takes their colour along.
     // And after them the grass for the mirror rays alone (MakeMirrorGrass), its triangles a surface's of their own:
-    // one more than the level's.
-    TArray<FLOAT> Blades;
-    const INT     BladeTris = MakeMirrorGrass(Level, Blades);
+    // one more than the level's. Its blades are the level's and the grass setting's alone - the rounding changes none -
+    // so they are made once for those and kept (a few MB: MirrorGrassBlades caps them), and taken again when the shadows'
+    // level is made again for the rounding come in, a frame that has enough to do.
+    static RdxSphere::TList<FLOAT> MirrorBlades;
+    static const void*             MirrorBladesOf    = nullptr;
+    static INT                     MirrorBladesFlush = -1, MirrorBladesGrass = -1;
+    const DOUBLE                   TGrass            = appSeconds();
+    if (MirrorBladesOf != (const void*)M || MirrorBladesFlush != GLevelFlushes || MirrorBladesGrass != (INT)GRunGrass)
+    {
+        TArray<FLOAT> Made;
+        const INT     Made9 = MakeMirrorGrass(Level, Made) * 9;
+        MirrorBlades.Free();
+        if (Made9 > 0 && MirrorBlades.Resize(Made9))
+            appMemcpy(MirrorBlades.Data, &Made(0), Made9 * (INT)sizeof(FLOAT));
+        else
+            MirrorBlades.Free();
+        MirrorBladesOf    = M;
+        MirrorBladesFlush = GLevelFlushes;
+        MirrorBladesGrass = (INT)GRunGrass;
+    }
+    const INT    BladeTris = MirrorBlades.Num / 9;
+    const DOUBLE GrassMs   = (appSeconds() - TGrass) * 1000.0;
     FLOAT* RtThin      = nullptr;
     DWORD* RtThinSurf  = nullptr;
     INT    ThinWritten = 0, ThinRoom = 0;
@@ -14133,85 +15814,188 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
                       M->Zones[z].ZoneActor->IsA(ASkyZoneInfo::StaticClass())) ? 1 : 0;
         SkyZones += SkyZone[z];
     }
-    INT  Written = 0, RtWritten = 0;
-    FBox Box(0);
+    INT    Written = 0, RtWritten = 0;
+    FBox   Box(0);
+    DOUBLE TKinds = 0.0, TLaid = 0.0, TLists = 0.0;   // the lists' parts' ends, for the log line below
+    const DOUBLE TNodes = appSeconds();
     if (Xyz)
     {
-        for (INT n = 0; n < M->Nodes.Num(); n++)
-        {
-            const FBspNode& Node = M->Nodes(n);
-            if (!ShadowNodeUsable(M, Node, Why))
-                continue;
-            const UBOOL bSky     = SkyZone[Node.iZone[0]] || SkyZone[Node.iZone[1]];
-            // The ray tracing scene goes by the flags the surface is drawn with: its own and its texture's (UTexture::PolyFlags,
-            // "to be applied to Bsp polys with texture"). And a surface with the editor's sky marker on it (the texture
-            // Marker_sky) is a sky wall whatever its flags: the engine does not draw it, and its place is the sky's -
-            // measured on Liberty Island, where such walls a few thousand units out stood between the water and the city.
-            const FBspSurf& Sf       = M->Surfs(Node.iSurf);
-            const UBOOL     bMarker  = Sf.Texture && appStricmp(Sf.Texture->GetName(), TEXT("Marker_sky")) == 0;
-            const DWORD     RtFlags  = Sf.PolyFlags | (Sf.Texture ? Sf.Texture->PolyFlags : 0) | (bMarker ? PF_FakeBackdrop : 0);
-            const UBOOL     bRtKeeps = RtKeep && !bSky && RdxMath::BspBlocksLightSeeThrough((unsigned int)RtFlags);
-            if (bSky)
+        // Where each node's triangles go, from where the nodes before it end in each list, and what they are to the rays
+        // - worked out in the nodes' order first, the engine's names asked of here alone; then the triangles laid over
+        // the threads in runs of nodes, each run's box its own, so that the lists come out as one thread lays them; then
+        // the sky walls' and the see-through surfaces' lists, which grow as they come, from the triangles laid, in the
+        // nodes' order. A node's kind: 0 none of it drawn, 1 the rays', 2 a sky wall, 3 see-through, 4 the maps' alone;
+        // and NodeRounded where its triangles are the spherifier's.
+        enum { NodeRounded = 0x80 };
+        const INT                       Nodes = M->Nodes.Num();
+        RdxSphere::TList<INT>           NodeAt, NodeRtAt, NodeTris;
+        RdxSphere::TList<unsigned char> NodeKind;
+        // Each surface's flags for the rays, once a surface rather than once a node: the ray tracing scene goes by the
+        // flags the surface is drawn with, its own and its texture's (UTexture::PolyFlags, "to be applied to Bsp polys
+        // with texture"); and a drawn surface with the editor's sky marker on it (the texture Marker_sky) is a sky wall
+        // whatever its other flags - its place is the sky's: such walls a few thousand units out stand between Liberty
+        // Island's water and the city. An invisible one is no sky wall (RdxMath::RtSurfaceFlags): a blocker the eye
+        // looks through, in front of a window too.
+        RdxSphere::TList<DWORD>         SurfRtFlags;
+        if (SurfRtFlags.Resize(Max(Surfs, 1)))
+            for (INT i = 0; i < Surfs; i++)
             {
-                const INT Rounded = SphereNodeTris(M, n);
-                SkyTris += Rounded ? Rounded : Node.NumVertices - 2;
-                SkyBox  += M->Points(M->Verts(Node.iVertPool).pVertex);
+                const FBspSurf& Sf      = M->Surfs(i);
+                const UBOOL     bMarker = Sf.Texture && appStricmp(Sf.Texture->GetName(), TEXT("Marker_sky")) == 0;
+                SurfRtFlags[i] = RdxMath::RtSurfaceFlags(Sf.PolyFlags | (Sf.Texture ? Sf.Texture->PolyFlags : 0), bMarker != 0);
             }
-            // The spherifier's triangles where the node moved, the fan over its own corners where it did not.
-            const INT Rounded  = SphereNodeTris(M, n);
-            const INT NodeTris = Rounded ? Rounded : Node.NumVertices - 2;
-            for (INT k = 0; k < NodeTris && Written < Tris; k++)
+        if (!SurfRtFlags.Num || !NodeAt.Resize(Nodes) || !NodeRtAt.Resize(Nodes) || !NodeTris.Resize(Nodes) ||
+            !NodeKind.Resize(Nodes))
+            RDX_LOGF("shadow level: no room for the lists of the level's %i nodes - the shadow maps have no walls and the "
+                     "rays no level here", Nodes);
+        else
+        {
+            for (INT n = 0; n < Nodes; n++)
             {
-                FVector P0, P1, P2;
-                if (Rounded)
-                    SphereTriangle(n, k, P0, P1, P2);
-                else
+                NodeAt[n]   = Written;
+                NodeRtAt[n] = RtWritten;
+                NodeTris[n] = 0;
+                NodeKind[n] = 0;
+                const FBspNode& Node = M->Nodes(n);
+                if (!ShadowNodeUsable(M, Node, Why))
+                    continue;
+                const UBOOL bSky = SkyZone[Node.iZone[0]] || SkyZone[Node.iZone[1]];
+                const DWORD RtFlags  = SurfRtFlags[Node.iSurf];
+                const UBOOL bRtKeeps = RtKeep && !bSky && RdxMath::BspBlocksLightSeeThrough((unsigned int)RtFlags);
+                // The spherifier's triangles where the node moved, the fan over its own corners where it did not.
+                const INT Rounded  = SphereNodeTris(M, n);
+                const INT NodeOwn  = Rounded ? Rounded : Node.NumVertices - 2;
+                if (bSky)
                 {
-                    P0 = M->Points(M->Verts(Node.iVertPool).pVertex);
-                    P1 = M->Points(M->Verts(Node.iVertPool + k + 1).pVertex);
-                    P2 = M->Points(M->Verts(Node.iVertPool + k + 2).pVertex);
+                    SkyTris += NodeOwn;
+                    SkyBox  += M->Points(M->Verts(Node.iVertPool).pVertex);
                 }
-                Box += P0;
-                FLOAT* const W = Xyz + Written * 9;
-                W[0] = P0.X; W[1] = P0.Y; W[2] = P0.Z;
-                W[3] = P1.X; W[4] = P1.Y; W[5] = P1.Z;
-                W[6] = P2.X; W[7] = P2.Y; W[8] = P2.Z;
-                if (RtKeep)
-                    RtKeep[Written] = bRtKeeps ? 1 : 0;
+                const INT Count = Max(0, Min(NodeOwn, Tris - Written));
+                NodeTris[n]     = Count;
+                NodeKind[n]     = (unsigned char)((bRtKeeps                                                 ? 1
+                                                   : (!bSky && (RtFlags & PF_FakeBackdrop))                 ? 2
+                                                   : (!bSky && (RtFlags & (PF_Translucent | PF_Modulated | PF_Masked)) &&
+                                                      !(RtFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal))) ? 3
+                                                                                                             : 4) |
+                                                  (Rounded ? NodeRounded : 0));
+                Written += Count;
                 if (bRtKeeps)
+                    RtWritten += Count;
+            }
+            TKinds = appSeconds();
+            // The runs of nodes, a run's triangles about as many as another's.
+            const INT Chunks = Max(1, Min(RdxSphere::WorkersAvailable(), (Written + 4095) / 4096));
+            INT       Edge[RdxSphere::WorkersMost + 1];
+            Edge[0]      = 0;
+            Edge[Chunks] = Nodes;
+            for (INT i = 1; i < Chunks; i++)
+            {
+                const INT Target = (INT)((SQWORD)Written * i / Chunks);
+                INT       Lo = Edge[i - 1], Hi = Nodes;
+                while (Lo < Hi)
                 {
-                    if (RtSurf)
-                        RtSurf[RtWritten] = (DWORD)Node.iSurf;
-                    RtWritten++;
+                    const INT Mid = (Lo + Hi) / 2;
+                    if (NodeAt[Mid] < Target)
+                        Lo = Mid + 1;
+                    else
+                        Hi = Mid;
                 }
-                else if (!bSky && (RtFlags & PF_FakeBackdrop))
+                Edge[i] = Lo;
+            }
+            FLOAT ChunkBox[RdxSphere::WorkersMost][6];
+            RdxSphere::OnThreads(Chunks, 1, Chunks, [&](int i, int) {
+                FLOAT* const B = ChunkBox[i];
+                for (INT a = 0; a < 3; a++)
                 {
-                    if (RoomFor(RtSky, nullptr, SkyWritten, SkyRoom, TEXT("RdxShadowWorldRtSky")))
-                        appMemcpy(RtSky + SkyWritten++ * 9, W, 9 * sizeof(FLOAT));
+                    B[a]     = 1.0e30f;
+                    B[a + 3] = -1.0e30f;
                 }
-                else if (!bSky && (RtFlags & (PF_Translucent | PF_Modulated | PF_Masked)) &&
-                         !(RtFlags & (PF_Invisible | PF_FakeBackdrop | PF_Portal)))
+                for (INT n = Edge[i]; n < Edge[i + 1]; n++)
                 {
-                    if (RoomFor(RtThin, &RtThinSurf, ThinWritten, ThinRoom, TEXT("RdxWorldRtThin")))
+                    const INT Count = NodeTris[n];
+                    if (Count <= 0)
+                        continue;
+                    const FBspNode&   Node     = M->Nodes(n);
+                    const UBOOL       bRounded = (NodeKind[n] & NodeRounded) != 0;
+                    const UBOOL       bRays    = (NodeKind[n] & ~NodeRounded) == 1;
+                    for (INT k = 0; k < Count; k++)
                     {
-                        RtThinSurf[ThinWritten] = (DWORD)Node.iSurf;
+                        // Three of them, not an array: an FVector array is made through calls into Core.dll.
+                        FVector P0, P1, P2;
+                        if (bRounded)
+                            SphereTriangle(n, k, P0, P1, P2);
+                        else
+                        {
+                            P0 = M->Points(M->Verts(Node.iVertPool).pVertex);
+                            P1 = M->Points(M->Verts(Node.iVertPool + k + 1).pVertex);
+                            P2 = M->Points(M->Verts(Node.iVertPool + k + 2).pVertex);
+                        }
+                        const INT    t = NodeAt[n] + k;
+                        FLOAT* const W = Xyz + (SIZE_T)t * 9;
+                        auto Put = [&](INT c, const FVector& V) {
+                            W[c * 3]     = V.X;
+                            W[c * 3 + 1] = V.Y;
+                            W[c * 3 + 2] = V.Z;
+                            B[0]         = Min(B[0], V.X);
+                            B[1]         = Min(B[1], V.Y);
+                            B[2]         = Min(B[2], V.Z);
+                            B[3]         = Max(B[3], V.X);
+                            B[4]         = Max(B[4], V.Y);
+                            B[5]         = Max(B[5], V.Z);
+                        };
+                        Put(0, P0);
+                        Put(1, P1);
+                        Put(2, P2);
+                        if (RtKeep)
+                            RtKeep[t] = bRays ? 1 : 0;
+                        if (bRays && RtSurf)
+                            RtSurf[NodeRtAt[n] + k] = (DWORD)Node.iSurf;
+                    }
+                }
+            });
+            TLaid = appSeconds();
+            for (INT i = 0; i < Chunks; i++)
+                if (ChunkBox[i][0] <= ChunkBox[i][3])
+                {
+                    Box += FVector(ChunkBox[i][0], ChunkBox[i][1], ChunkBox[i][2]);
+                    Box += FVector(ChunkBox[i][3], ChunkBox[i][4], ChunkBox[i][5]);
+                }
+            for (INT n = 0; n < Nodes; n++)
+            {
+                const INT Kind = NodeKind[n] & ~NodeRounded;
+                for (INT k = 0; k < NodeTris[n] && (Kind == 2 || Kind == 3); k++)
+                {
+                    const FLOAT* const W = Xyz + (SIZE_T)(NodeAt[n] + k) * 9;
+                    if (Kind == 2)
+                    {
+                        if (RoomFor(RtSky, nullptr, SkyWritten, SkyRoom, TEXT("RdxShadowWorldRtSky")))
+                            appMemcpy(RtSky + SkyWritten++ * 9, W, 9 * sizeof(FLOAT));
+                    }
+                    else if (RoomFor(RtThin, &RtThinSurf, ThinWritten, ThinRoom, TEXT("RdxWorldRtThin")))
+                    {
+                        RtThinSurf[ThinWritten] = (DWORD)M->Nodes(n).iSurf;
                         appMemcpy(RtThin + ThinWritten++ * 9, W, 9 * sizeof(FLOAT));
                     }
                 }
-                Box += P1;
-                Box += P2;
-                Written++;
             }
         }
     }
     // The mirror grass after the see-through surfaces, all its triangles the one surface's after the level's.
     for (INT t = 0; t < BladeTris && RoomFor(RtThin, &RtThinSurf, ThinWritten, ThinRoom, TEXT("RdxWorldRtThin")); t++)
     {
-        appMemcpy(RtThin + ThinWritten * 9, &Blades(t * 9), 9 * sizeof(FLOAT));
+        appMemcpy(RtThin + ThinWritten * 9, MirrorBlades.Data + (SIZE_T)t * 9, 9 * sizeof(FLOAT));
         RtThinSurf[ThinWritten++] = (DWORD)Surfs;
     }
+    TLists = appSeconds();
+    if (TKinds > 0.0 && TLaid > 0.0)
+        RDX_LOGF("shadow level: the lists' parts, ms - the movers and the nodes counted %.1f, the mirror grass %.1f, the "
+                 "surfaces and the nodes' kinds %.1f, the triangles laid %.1f, the sky's and the see-through lists %.1f",
+                 (TCounted - T0) * 1000.0, GrassMs, (TKinds - TNodes) * 1000.0, (TLaid - TKinds) * 1000.0,
+                 (TLists - TLaid) * 1000.0);
     // The maps' list first, then the same memory pressed down to the rays' triangles, in their order.
+    const DOUBLE TMaps = appSeconds();
     const UBOOL bSent = Backend.SetShadowMapsWorld(Xyz, Written * 3);
+    const DOUBLE TMapsDone = appSeconds();
     FLOAT* const RtXyz = (Xyz && RtKeep) ? Xyz : nullptr;
     if (RtXyz)
     {
@@ -14273,9 +16057,11 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
         }
         RDX_LOGF("shadow level (marker): the ray tracing level written out - %i triangles, %i surfaces", RtWritten, Surfs);
     }
+    const DOUBLE TRays = appSeconds();
     Backend.SetShadowRtWorld(RtXyz, RtXyz ? RtWritten * 3 : 0, (RtSurf && SurfAlbedo) ? RtSurf : nullptr, SurfAlbedo,
                              SurfAlbedo ? RaySurfs : 0, RtSky, SkyWritten * 3,
                              (RtThin && RtThinSurf && SurfAlbedo) ? RtThin : nullptr, ThinWritten * 3, RtThinSurf);
+    const DOUBLE TRaysDone = appSeconds();
     // Each surface's own face for the light the mirror rays work out on it (FBackend::SetRtSurfaceStatic): its
     // normal, the light all round the zone before it - its first node's - and whether it is lit specially.
     if (bSent && SurfAlbedo)
@@ -14324,8 +16110,8 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
             const FLOAT Rows[8] = { 0.0f, 0.0f, 0.0f, 0.55f, 0.0f, 0.0f, 0.0f, 1.5f / (FLOAT)RdxMath::GrassPictureRows };
             Backend.SetRtSurfaceTexture(Surfs, Srv, Rows, 1.0f, 1);
         }
-        RDX_LOGF("grass: the mirror rays' own - %i blades, still, where a surface that mirrors stands within %.0f units",
-                 BladeTris, MirrorGrassReach);
+        RDX_LOGF("grass: the mirror rays' own - %i blades, still, where a surface that mirrors stands within %.0f units; "
+                 "laid in %.1f ms", BladeTris, MirrorGrassReach, GrassMs);
     }
     RdxFreeLarge(Xyz);
     RdxFreeLarge(RtKeep);
@@ -14344,12 +16130,13 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
              RtWritten, Written, SkyTris, SkyZones, (INT)SkyBox.Min.X, (INT)SkyBox.Min.Y, (INT)SkyBox.Min.Z,
              (INT)SkyBox.Max.X, (INT)SkyBox.Max.Y, (INT)SkyBox.Max.Z, SkyWritten, Surfs, NoAverage);
     RDX_LOGF("shadow level: %s - %i triangles from %i nodes (%.1f MB)%s; skipped: %i empty, %i by rule (%s), "
-             "%i with a bad index; box (%i, %i, %i)..(%i, %i, %i); %.1f ms",
+             "%i with a bad index; box (%i, %i, %i)..(%i, %i, %i); %.1f ms (the lists %.1f, the maps' %.1f, the rays' %.1f)",
              Level->GetOuter() ? Level->GetOuter()->GetName() : TEXT("?"), Written, M->Nodes.Num(),
              (DOUBLE)Written * 9.0 * sizeof(FLOAT) / (1024.0 * 1024.0), bSent ? TEXT("") : TEXT(" - did NOT reach the card"),
              Skipped[1], Skipped[2], GShadowSeeThrough ? TEXT("translucents and the sky too - marker") : TEXT("portals only"),
              Skipped[3], (INT)Box.Min.X, (INT)Box.Min.Y, (INT)Box.Min.Z, (INT)Box.Max.X, (INT)Box.Max.Y, (INT)Box.Max.Z,
-             (appSeconds() - T0) * 1000.0);
+             (appSeconds() - T0) * 1000.0, (TMaps - T0) * 1000.0, (TMapsDone - TMaps) * 1000.0,
+             (TRaysDone - TRays) * 1000.0);
     RDX_LOGF("shadow level surfaces (nodes): masked %i, translucent %i, modulated %i, invisible %i, non-solid %i, "
              "semi-solid %i, sky %i, PF_Occlude %i",
              Kinds[0], Kinds[1], Kinds[2], Kinds[3], Kinds[4], Kinds[5], Kinds[6], Kinds[7]);
@@ -14368,13 +16155,38 @@ static void BuildShadowWorld(FBackend& Backend, ULevel* Level)
         const UBOOL bMs = ::GlobalMemoryStatusEx(&Ms) != 0;
         static INT Loads = 0;
         Loads++;
+        // The process heap - the C runtime's malloc, our lists' blocks among them: what it holds committed against what
+        // is in use in it - the gap its pieces left between them.
+        HEAP_SUMMARY Hs;
+        appMemzero(&Hs, sizeof(Hs));
+        Hs.cb            = sizeof(Hs);
+        const UBOOL bHeap = ::HeapSummary(::GetProcessHeap(), 0, &Hs) ? 1 : 0;
+        // The address space walked (AddressSpaceWalk): the longest free stretch - a 32-bit process runs out where no
+        // stretch is long enough for a block, however much is free in all.
+        SIZE_T       Private = 0, Mapped = 0, By[4] = { 0, 0, 0, 0 };
+        const SIZE_T Longest = AddressSpaceWalk(&Private, &Mapped, By);
         RDX_LOGF("memory (level load %i): working set %i MB (peak %i MB), committed %i MB; "
-                 "%i MB free in the process address space",
+                 "%i MB free in the process address space; our lists hold %i MB, our large blocks %i MB; the process "
+                 "heap %i MB committed, %i MB in use; private %i MB (in allocations under 1 MB %i, to 16 MB %i, to 64 "
+                 "MB %i, larger %i), mapped %i MB; the longest free stretch %i MB; the card's resources in the system's "
+                 "memory %i MB",
                  Loads,
                  bPm ? (INT)(Pm.WorkingSetSize / (1024 * 1024)) : -1,
                  bPm ? (INT)(Pm.PeakWorkingSetSize / (1024 * 1024)) : -1,
                  bPm ? (INT)(Pm.PrivateUsage / (1024 * 1024)) : -1,
-                 bMs ? (INT)(Ms.ullAvailVirtual / (1024 * 1024)) : -1);
+                 bMs ? (INT)(Ms.ullAvailVirtual / (1024 * 1024)) : -1,
+                 (INT)(RdxSphere::ListBytesHeld().load() / (1024 * 1024)),
+                 (INT)(RdxLargeBytesHeld() / (1024 * 1024)),
+                 bHeap ? (INT)(Hs.cbCommitted / (1024 * 1024)) : -1, bHeap ? (INT)(Hs.cbAllocated / (1024 * 1024)) : -1,
+                 (INT)(Private / (1024 * 1024)), (INT)(By[0] / (1024 * 1024)), (INT)(By[1] / (1024 * 1024)),
+                 (INT)(By[2] / (1024 * 1024)), (INT)(By[3] / (1024 * 1024)), (INT)(Mapped / (1024 * 1024)),
+                 (INT)(Longest / (1024 * 1024)), Backend.SystemVideoMemoryMB());
+        // And which of ours hold the upload heap - part of the card's resources in the system's memory - by part.
+        DOUBLE  UploadMB = 0.0;
+        wchar_t UploadParts[640];
+        RdxUploadCensus::Say(UploadParts, 640, UploadMB);
+        RDX_LOGF("memory (level load %i): our upload heap %.0f MB, by part (MB, buffers): %s", Loads, UploadMB,
+                 UploadParts);
     }
     PlantCensus(Level);
     // The movers (GatherShadowMovers): how many, what the level's BSP held of them, and for the first ones where their
@@ -14932,7 +16744,7 @@ static UBOOL PrepareCasterShape(FBackend& Backend, AActor* A, FCasterShape& S, I
                 ShadowFaceMask(Backend, A, S, T.TextureIndex, T.TextureIndex, T.PolyFlags) >= 0)
             {
                 S.Faces++;
-                if (T.TextureIndex < SHAPE_MASK_KEYS)
+                if (T.TextureIndex >= 0 && T.TextureIndex < SHAPE_MASK_KEYS)
                 {
                     KeyFaces[T.TextureIndex]++;
                     KeyTexture[T.TextureIndex] = T.TextureIndex;
@@ -17751,17 +19563,26 @@ static void PrepareShadowFrame(FBackend& Backend, UViewport* V, INT EngineFrame)
     // shadows' textures, no light chosen before. Once for each - an upload that failed is not tried again every frame.
     static ULevel* WorldLevel      = nullptr;
     static FName   WorldName       = NAME_None;
+    static UModel* WorldModel      = nullptr;
+    static INT     WorldNodes      = -1;
     static INT     WorldGeneration = -1;
     static AActor* Chosen[RdxMath::ShadowMaxLights];
     static FLOAT   ChosenWeight[RdxMath::ShadowMaxLights];   // the weight each was SHOWN with last frame - see the fade
     static DOUBLE  ChosenTime      = 0.0;                    // when that was; 0 on a new level, so the fade starts at Dt 0
     static INT     ChosenCount     = 0;
-    const UBOOL bNewLevel = (Level != WorldLevel || Name != WorldName || GShadowLevelForgotten);
+    // The level's package renamed under it while it is still drawn - as the engine begins to load a save, the map that
+    // is left handed a name of its own - is the same level, its model and nodes the same: its shadows' level stands. A
+    // level that is new comes with the engine's Flush (ForgetShadowLevel), at the same address too.
+    const UBOOL bRenamed  = Name != WorldName && Level == WorldLevel && Level->Model && Level->Model == WorldModel &&
+                           Level->Model->Nodes.Num() == WorldNodes;
+    const UBOOL bNewLevel = (Level != WorldLevel || (Name != WorldName && !bRenamed) || GShadowLevelForgotten);
     if (bNewLevel || Backend.GetShadowGeneration() != WorldGeneration)
     {
         WorldLevel            = Level;
         WorldName             = Name;
         WorldGeneration       = Backend.GetShadowGeneration();
+        WorldModel            = Level->Model;
+        WorldNodes            = Level->Model ? Level->Model->Nodes.Num() : -1;
         GShadowLevelForgotten = 0;
         GPickChanges          = 0;
         GShadowTanMismatch    = 0;
@@ -18806,7 +20627,8 @@ static void FindLampBodies(ULevel* Level)
                     continue;
                 TCHAR Name[RdxMath::WetNameChars + 1];
                 PackageDotName(T, Name, RdxMath::WetNameChars + 1);
-                if (!RdxMath::LampListed(GLampSurfaces, GLampSurfaceCount, Name, RdxMath::Lamp_Texture))
+                const INT Entry = RdxMath::LampEntryOf(GLampSurfaces, GLampSurfaceCount, Name, RdxMath::Lamp_Texture);
+                if (Entry < 0)
                     continue;
                 Surfaces++;
                 // Each listed texture's surfaces, and how many of them carry their own light (PF_Unlit) - a lamp's
@@ -18833,13 +20655,15 @@ static void FindLampBodies(ULevel* Level)
                     RdxMath::FLampBody& L = GLampBodies[B];
                     L.X = L.Y = L.Z = 0.0f;
                     L.Extent = -1.0f;     // no point yet
-                    // Its glass's own colour, the texture's average (the engine's MipZero), its strongest 1. How
-                    // bright it shines is its own light's: a glass with its own light (PF_Unlit) whole, one lit by
-                    // the light map by that map or the light it holds (LightAtLamp, NoteLampMapLight).
+                    // Its glass's own colour, the texture's average (the engine's MipZero), its strongest 1 - times
+                    // the list's strength for it. How bright it shines is its own light's: a glass with its own light
+                    // (PF_Unlit) whole, one lit by the light map by that map or the light it holds (LightAtLamp,
+                    // NoteLampMapLight).
                     const FLOAT Most = (FLOAT)Max((INT)T->MipZero.R, Max((INT)T->MipZero.G, (INT)T->MipZero.B));
-                    L.TR = (Most > 0.0f) ? T->MipZero.R / Most : 0.0f;
-                    L.TG = (Most > 0.0f) ? T->MipZero.G / Most : 0.0f;
-                    L.TB = (Most > 0.0f) ? T->MipZero.B / Most : 0.0f;
+                    const FLOAT Gain = GLampSurfaces[Entry].Strength;
+                    L.TR = (Most > 0.0f) ? T->MipZero.R / Most * Gain : 0.0f;
+                    L.TG = (Most > 0.0f) ? T->MipZero.G / Most * Gain : 0.0f;
+                    L.TB = (Most > 0.0f) ? T->MipZero.B / Most * Gain : 0.0f;
                 }
                 BodyOf[s] = B;
             }
@@ -18899,6 +20723,12 @@ static void FindLampBodies(ULevel* Level)
                 L.Y      = Mid.Y;
                 L.Z      = Mid.Z;
                 L.Extent = (Hi - Lo).Size() * 0.5f;
+                L.LoX    = Lo.X;
+                L.LoY    = Lo.Y;
+                L.LoZ    = Lo.Z;
+                L.HiX    = Hi.X;
+                L.HiY    = Hi.Y;
+                L.HiZ    = Hi.Z;
                 L.R = L.G = L.B = 0.0f;
                 const FLOAT Tex[3] = { L.TR, L.TG, L.TB };
                 if (GLampBodyLit[b])
@@ -18932,14 +20762,18 @@ static void FindLampBodies(ULevel* Level)
     for (INT i = 0; i < Level->Actors.Num() && GLampBodyCount < LAMP_BODIES; i++)
     {
         AActor* const A = Level->Actors(i);
-        if (!A || A->bDeleteMe ||
-            !RdxMath::LampListed(GLampSurfaces, GLampSurfaceCount, A->GetClass()->GetName(), RdxMath::Lamp_Class))
+        const INT Entry = (A && !A->bDeleteMe) ? RdxMath::LampEntryOf(GLampSurfaces, GLampSurfaceCount,
+                                                                       A->GetClass()->GetName(), RdxMath::Lamp_Class)
+                                               : -1;
+        if (Entry < 0)
             continue;
         RdxMath::FLampBody& L = GLampBodies[GLampBodyCount++];
         L.X      = A->Location.X;
         L.Y      = A->Location.Y;
         L.Z      = A->Location.Z;
         L.Extent = Max(8.0f, Max(A->CollisionRadius, A->CollisionHeight));
+        // A model's glass is not known apart from its collision: a ball, as before.
+        RdxMath::LampBoxAbout(L, L.Extent);
         L.R = L.G = L.B = 0.0f;
         // A model's lamp: its own light's colour where it is a light, as bright as that light is (LightBrightness, 255
         // the full); with no light of its own, white where the game draws it as giving its own light (bUnlit) - and
@@ -18957,6 +20791,10 @@ static void FindLampBodies(ULevel* Level)
                 L.TB = C.Z / Most * Bright;
             }
         }
+        // The list's strength for the class.
+        L.TR *= GLampSurfaces[Entry].Strength;
+        L.TG *= GLampSurfaces[Entry].Strength;
+        L.TB *= GLampSurfaces[Entry].Strength;
         Actors++;
     }
     const INT Merged = RdxMath::MergeLampBodies(GLampBodies, GLampBodyCount, LampBodyGap, LampMostRadius);
@@ -18984,11 +20822,13 @@ static void FindLampBodies(ULevel* Level)
     }
     // Each lamp's streak its own: its glass's colour and brightness (a model's, its own light's where it is one, else
     // white) - a lamp like another gives the streak the other does, whatever light the level put near it, a darker one a
-    // dimmer one, and a larger lamp a stronger one.
+    // dimmer one, and a larger lamp a stronger one; and its glass's shape as it is seen (LampShapeOf), the streak as wide
+    // as the lamp shows.
     for (INT b = 0; b < Merged; b++)
     {
         RdxMath::FLampBody& L = GLampBodies[b];
         L.Extent  = Max(L.Extent, LampLeastRadius);
+        RdxMath::LampShapeOf(L, LampLeastRadius);
         L.R       = L.TR * LampGlassBright;
         L.G       = L.TG * LampGlassBright;
         L.B       = L.TB * LampGlassBright;
@@ -19016,6 +20856,8 @@ static void FindLampBodies(ULevel* Level)
         const FLOAT Half  = 0.5f * A->WorldLightRadius();
         const FLOAT Glow  = B * Half * Half / (PI * FireRadius * FireRadius);
         L.Extent  = FireRadius;
+        RdxMath::LampBoxAbout(L, FireRadius);
+        RdxMath::LampShapeOf(L, LampLeastRadius);
         L.R       = C.X * Glow;
         L.G       = C.Y * Glow;
         L.B       = C.Z * Glow;
@@ -19035,11 +20877,30 @@ static void FindLampBodies(ULevel* Level)
         RdxMath::LampsByDistance(Sizes, Merged, BySize);
         RDX_LOGF("wet floors:   the lamps' radii - the least %.1f, the middle one %.1f, the largest %.1f", Sizes[BySize[0]],
                  Sizes[BySize[Merged / 2]], Sizes[BySize[Merged - 1]]);
+        // The glass as it is seen (LampShapeOf): how many are tubes, and each one's area seen from the side against the
+        // ball about it - the area its streak's light came from while every glass was that ball.
+        INT   Tubes   = 0;
+        FLOAT Longest = 0.0f;
+        for (INT b = 0; b < Merged; b++)
+        {
+            const RdxMath::FLampBody& L    = GLampBodies[b];
+            const FLOAT               Half = Max(Abs(L.AxisX), Max(Abs(L.AxisY), Abs(L.AxisZ)));
+            Tubes += (Half > 0.0f) ? 1 : 0;
+            Longest  = Max(Longest, 2.0f * (Half + L.Tube));
+            Sizes[b] = (PI * L.Tube * L.Tube + 4.0f * L.Tube * Half) / (PI * L.Extent * L.Extent);
+        }
+        RdxMath::LampsByDistance(Sizes, Merged, BySize);
+        RDX_LOGF("wet floors:   the glass as it is seen - %i of the %i lamps tubes (the longest %.0f), the rest balls; "
+                 "the area seen from the side against the ball about it: the least %.2f, the middle one %.2f, the largest "
+                 "%.2f", Tubes, Merged, Longest, Sizes[BySize[0]], Sizes[BySize[Merged / 2]], Sizes[BySize[Merged - 1]]);
     }
     for (INT t = 0; t < GLampSurfaceCount; t++)
         if (AllOf[t] > 0)
-            RDX_LOGF("wet floors:   %s - %i surfaces, %i of them unlit", appFromAnsi(GLampSurfaces[t].Name), AllOf[t],
-                     UnlitOf[t]);
+            RDX_LOGF("wet floors:   %s - %i surfaces, %i of them unlit%s", appFromAnsi(GLampSurfaces[t].Name), AllOf[t],
+                     UnlitOf[t],
+                     (GLampSurfaces[t].Strength != 1.0f)
+                         ? *FString::Printf(TEXT("; the list's strength %.2f"), GLampSurfaces[t].Strength)
+                         : TEXT(""));
 }
 
 // The frame's lamps for the puddles' streaks (FBackend::SetWetLamps): every body of the level before the eye whose light
@@ -19240,20 +21101,25 @@ static void NoteWetLamps(FBackend& Backend, const FSceneNode* Frame)
         const RdxMath::FLampBody& L = GLampBodies[i];
         if (GLampWeight[i] <= 0.0f)
             continue;
-        const FVector V    = FVector(L.X, L.Y, L.Z).TransformPointBy(Frame->Coords);
+        // A rod stands about its box's middle, a ball where it always stood (its body's, the bodies made one about it).
+        const FLOAT   Kind = RdxMath::WetLampKind(L);
+        const FVector At   = (Kind < 0.0f) ? FVector(0.5f * (L.LoX + L.HiX), 0.5f * (L.LoY + L.HiY), 0.5f * (L.LoZ + L.HiZ))
+                                           : FVector(L.X, L.Y, L.Z);
+        const FVector V    = At.TransformPointBy(Frame->Coords);
         const FLOAT   Glow = GLampWeight[i] * ((L.Flicker > 0.0f) ? RdxMath::LampFlicker(Now, (FLOAT)i) : 1.0f);
         FLOAT* const  Out  = Lamps + N * 8;
         Out[0] = V.X;
         Out[1] = V.Y;
         Out[2] = V.Z;
-        Out[3] = L.Extent;
+        Out[3] = L.Tube;
         // A glass lit by the light map, once drawn: its own colour by the light the game drew it with.
         const UBOOL bDrawn = GLampMapLight[i] >= 0.0f;
         const FLOAT Map    = bDrawn ? GLampMapLight[i] * LampGlassBright : 0.0f;
         Out[4] = (bDrawn ? GLampMapTex[i][0] * Map : L.R) * Glow;
         Out[5] = (bDrawn ? GLampMapTex[i][1] * Map : L.G) * Glow;
         Out[6] = (bDrawn ? GLampMapTex[i][2] * Map : L.B) * Glow;
-        Out[7] = (L.Flicker > 0.0f) ? 1.0f : 0.0f;    // a fire: its glow is its flame's (WetReflect.hlsl's PSWetFlames)
+        // Its kind: a fire, its glow its flame's (WetReflect.hlsl's PSWetFlames); a ball; or a rod and its axis.
+        Out[7] = Kind;
         N++;
     }
     Backend.SetWetLamps(Lamps, N);
@@ -19278,13 +21144,12 @@ static void NoteWetLamps(FBackend& Backend, const FSceneNode* Frame)
     }
 }
 
-
 void URevisionRenderDevice::SetSceneNode(FSceneNode* Frame)
 {
     SplashCanvas(URenderDevice::Viewport);
     NoteTreeWorldNode(Backend, Frame, FrameCounter);
     // The spherifier's pieces the world view drew last, made ahead in its view now (StartPieceJobs).
-    StartPieceJobs(Frame, FrameCounter);
+    StartPieceJobs(Backend, Frame, FrameCounter);
     FDrawTimer Timer(3);
     RoundRelease(Backend);
     FlushMeshFog(Backend);       // drawn in the node it was gathered in
@@ -19589,6 +21454,10 @@ void URevisionRenderDevice::ClearZ(FSceneNode* Frame)
     // and the 2D overlay must not be occluded by it.
     if (GHud.bSwitched)
         GHud.bClearAfter = 1;
+    // The world's view is over before its depth is cleared (for the weapon): the tufts its sheets asked for drawn now,
+    // against the world's depth - a kerb or a stair's rail before one hides it.
+    if (Frame && !Frame->Parent && !GHud.bSwitched)
+        DrawTuftSheets(Backend, FrameCounter);
     RoundRelease(Backend);
     FlushMeshFog(Backend);       // the fog needs the depth it was gathered against
     EndMirrorView(Backend, FrameCounter);
@@ -19732,7 +21601,7 @@ static UBOOL ReliefFlushBatch(FBackend& Backend, INT Srv, INT LightSrv, EBlendMo
     FSolidVertex* const Out = Backend.BeginTriangles(N, Srv, LightSrv, Mode, bNoSmooth);
     if (!Out)
         return 0;
-    appMemcpy(Out, GReliefBatch, N * 3 * sizeof(FSolidVertex));
+    memcpy(Out, GReliefBatch, N * 3 * sizeof(FSolidVertex));
     return 1;
 }
 
@@ -24192,8 +26061,18 @@ static INT         GGrassSurfSlots = 0;        // how many surfaces the level ha
 static FLOAT*      GTuftRows       = nullptr;  // the tufts, by the grass node they stand on, RdxMath::GrassTuftRows
                                                // float4s each: foot (xyz) and height (w), then the reach of its
                                                // blades out from its middle (x)
-static BYTE*       GTuftSheet      = nullptr;  // each of the level's nodes: 1 for a foliage sheet grown as a tuft
+static INT*        GTuftSheet      = nullptr;  // each of the level's nodes: for a foliage sheet grown as a tuft, that
+                                               // tuft's row in GTuftRows and one more; 0 for none
 static INT         GTuftSheetSlots = 0;
+// Each tuft (a row of GTuftRows): the grass node it stands on; the frame and the view its ground last grew it in
+// (GrowGrass); the frame its sheets last asked for it (NoteTuftSheets). A tuft whose sheets the engine draws while its
+// ground stays hidden - a bed behind a kerb, the tufts' tops in view - is drawn by its sheets, so that no tuft comes and
+// goes with its ground.
+static INT*         GTuftGround     = nullptr;
+static INT*         GTuftGrewFrame  = nullptr;
+static const void** GTuftGrewView   = nullptr;
+static INT*         GTuftSheetFrame = nullptr;
+static INT          GTuftCount      = 0;
 static FGrassNode* GGrassNodes     = nullptr;
 static INT         GGrassNodeCount = 0;
 static FLOAT*      GGrassTris      = nullptr;  // RdxMath::GrassTriangle's nine numbers a triangle
@@ -24239,9 +26118,22 @@ static void ForgetLevelGrass()
         appFree(GTuftRows);
     if (GTuftSheet)
         appFree(GTuftSheet);
+    if (GTuftGround)
+        appFree(GTuftGround);
+    if (GTuftGrewFrame)
+        appFree(GTuftGrewFrame);
+    if (GTuftGrewView)
+        appFree(GTuftGrewView);
+    if (GTuftSheetFrame)
+        appFree(GTuftSheetFrame);
     GTuftRows       = nullptr;
     GTuftSheet      = nullptr;
     GTuftSheetSlots = 0;
+    GTuftGround     = nullptr;
+    GTuftGrewFrame  = nullptr;
+    GTuftGrewView   = nullptr;
+    GTuftSheetFrame = nullptr;
+    GTuftCount      = 0;
     GGrassSurfFirst = nullptr;
     GGrassSurfSlots = 0;
     GGrassNodeAt    = nullptr;
@@ -24436,20 +26328,37 @@ static void ReadLevelTufts(UModel* M)
         }
     }
     const INT Floats = 4 * RdxMath::GrassTuftRows;
-    if (Grounded > 0)
+    // Each clump's row, as the rows are written below.
+    INT* const RowOfClump = (Count > 0) ? (INT*)appMalloc(Count * sizeof(INT), TEXT("RdxTuftRowOf")) : nullptr;
+    if (Grounded > 0 && RowOfClump)
     {
         GTuftRows       = (FLOAT*)appMalloc(Grounded * Floats * sizeof(FLOAT), TEXT("RdxTufts"));
-        GTuftSheet      = (BYTE*)appMalloc(M->Nodes.Num(), TEXT("RdxTuftSheets"));
+        GTuftSheet      = (INT*)appMalloc(M->Nodes.Num() * sizeof(INT), TEXT("RdxTuftSheets"));
         GTuftSheetSlots = GTuftSheet ? M->Nodes.Num() : 0;
+        GTuftGround     = (INT*)appMalloc(Grounded * sizeof(INT), TEXT("RdxTuftGround"));
+        GTuftGrewFrame  = (INT*)appMalloc(Grounded * sizeof(INT), TEXT("RdxTuftGrew"));
+        GTuftGrewView   = (const void**)appMalloc(Grounded * sizeof(void*), TEXT("RdxTuftGrew"));
+        GTuftSheetFrame = (INT*)appMalloc(Grounded * sizeof(INT), TEXT("RdxTuftAsked"));
     }
-    if (!GTuftRows || !GTuftSheet)
+    if (!GTuftRows || !GTuftSheet || !GTuftGround || !GTuftGrewFrame || !GTuftGrewView || !GTuftSheetFrame)
     {
         RDX_LOGF("grass: the level's tufts - %i pieces of %i foliage sheets in %i tufts, none grown", Pieces, SheetCount,
                  Count);
+        if (RowOfClump)
+            appFree(RowOfClump);
         Done();
         return;
     }
-    appMemzero(GTuftSheet, GTuftSheetSlots);
+    appMemzero(GTuftSheet, GTuftSheetSlots * sizeof(INT));
+    for (INT u = 0; u < Grounded; u++)
+    {
+        GTuftGround[u]     = -1;
+        GTuftGrewFrame[u]  = -1;
+        GTuftGrewView[u]   = nullptr;
+        GTuftSheetFrame[u] = -1;
+    }
+    for (INT c = 0; c < Count; c++)
+        RowOfClump[c] = -1;
     INT Row = 0;
     for (INT g = 0; g < GGrassNodeCount; g++)
     {
@@ -24463,7 +26372,9 @@ static void ReadLevelTufts(UModel* M)
         for (INT c = 0; c < Count; c++)
             if (Clumps[c].Ground == g)
             {
-                FLOAT* const Q = GTuftRows + Floats * Row++;
+                RowOfClump[c]    = Row;
+                GTuftGround[Row] = g;
+                FLOAT* const Q   = GTuftRows + Floats * Row++;
                 Q[0] = 0.5f * (Clumps[c].X0 + Clumps[c].X1);
                 Q[1] = 0.5f * (Clumps[c].Y0 + Clumps[c].Y1);
                 Q[2] = Clumps[c].Foot;
@@ -24479,9 +26390,11 @@ static void ReadLevelTufts(UModel* M)
     for (INT p = 0; p < Pieces; p++)
     {
         const INT c = Sheets[PieceSheet[p]].Clump;
-        if (c >= 0 && Clumps[c].Ground >= 0)
-            GTuftSheet[PieceNode[p]] = 1;
+        if (c >= 0 && Clumps[c].Ground >= 0 && RowOfClump[c] >= 0)
+            GTuftSheet[PieceNode[p]] = RowOfClump[c] + 1;
     }
+    GTuftCount = Row;
+    appFree(RowOfClump);
     RDX_LOGF("grass: the level's tufts - %i pieces of %i foliage sheets (%i of them unlit) in %i tufts, %i of them on its "
              "grass and grown (their blades reach %.0f units out and %.0f up, on average), %i left as the level has them",
              Pieces, SheetCount, Unlit, Count, Grounded, WideSum / (FLOAT)Max(Row, 1), TallSum / (FLOAT)Max(Row, 1),
@@ -24917,6 +26830,7 @@ static struct FGrassFrame
     INT            Pushes = 0;
     FLOAT          Push[RdxMath::GrassPushMax * 4];
     INT            Grown = 0, Tiles = 0, Roots = 0, Blocks = 0, Refused = 0, Frames = 0;
+    INT            BySheets = 0;    // the tufts drawn by their sheets, their ground hidden (DrawTuftSheets)
     DOUBLE         Cpu = 0.0;       // the seconds GrowGrass took over the frames counted (FGrassCpuTimer)
 } GGrassFrame;
 
@@ -24938,10 +26852,11 @@ static void PrepareGrassFrame(FSceneNode* Frame, INT EngineFrame)
     if (F.Frames > 0 && (EngineFrame % 600) == 0)
     {
         RDX_LOGF("grass: the last %i frames grew %.1f nodes, %.1f tiles with %.0f roots in %.1f blocks a frame, %.3f ms "
-                 "of the CPU's a frame; %i tiles found no room", F.Frames, (FLOAT)F.Grown / F.Frames,
+                 "of the CPU's a frame; %i tiles found no room; %.1f tufts a frame drawn by their sheets, their ground "
+                 "hidden", F.Frames, (FLOAT)F.Grown / F.Frames,
                  (FLOAT)F.Tiles / F.Frames, (FLOAT)F.Roots / F.Frames, (FLOAT)F.Blocks / F.Frames,
-                 F.Cpu * 1000.0 / F.Frames, F.Refused);
-        F.Grown = F.Tiles = F.Roots = F.Blocks = F.Refused = F.Frames = 0;
+                 F.Cpu * 1000.0 / F.Frames, F.Refused, (FLOAT)F.BySheets / F.Frames);
+        F.Grown = F.Tiles = F.Roots = F.Blocks = F.Refused = F.Frames = F.BySheets = 0;
         F.Cpu = 0.0;
     }
     const INT   WasFrame = F.Frame;
@@ -25309,10 +27224,11 @@ static INT MakeMirrorGrass(ULevel* Level, TArray<FLOAT>& Out)
     // A blade: its foot (X, Y, Z) a little across the way it turns, its tip out by Lean along it and up by Tall.
     const auto Blade = [&](FLOAT X, FLOAT Y, FLOAT Z, FLOAT Way, FLOAT Lean, FLOAT Tall)
     {
-        const FLOAT C = appCos(Way), S = appSin(Way), W = 0.45f;
-        const FLOAT T[9] = { X - S * W, Y + C * W, Z, X + S * W, Y - C * W, Z, X + C * Lean, Y + S * Lean, Z + Tall };
+        const FLOAT  C = appCos(Way), S = appSin(Way), W = 0.45f;
+        const FLOAT  T[9] = { X - S * W, Y + C * W, Z, X + S * W, Y - C * W, Z, X + C * Lean, Y + S * Lean, Z + Tall };
+        FLOAT* const To   = &Out(Out.Add(9));
         for (INT k = 0; k < 9; k++)
-            Out.AddItem(T[k]);
+            To[k] = T[k];
     };
     // The lawn's clumps at a step: counted (bLay false), or laid.
     const auto Lawn = [&](FLOAT Step, UBOOL bLay)
@@ -25362,6 +27278,8 @@ static INT MakeMirrorGrass(ULevel* Level, TArray<FLOAT>& Out)
     const FLOAT Step    = (Counted * 3 > MirrorGrassBlades)
                               ? MirrorGrassStep * appSqrt((FLOAT)(Counted * 3) / (FLOAT)MirrorGrassBlades)
                               : MirrorGrassStep;
+    // Room for about as many blades as the lawn will have, at once rather than as they come.
+    Out.Empty(Min(Counted * 3, MirrorGrassBlades + MirrorGrassBlades / 8) * 9);
     Lawn(Step, 1);
     // The tufts (ReadLevelTufts): each a fan of ten blades from its foot, out to its reach and up to its top.
     const INT Floats = 4 * RdxMath::GrassTuftRows;
@@ -25465,9 +27383,15 @@ static void GrowGrass(FBackend& Backend, FSceneNode* Frame, FSurfaceFacet& Facet
         F.Grown++;
         Kind      = Max(Kind, Gn.Kind);
         bOutdoors = bOutdoors || Gn.bOutdoors;
-        // Its tufts, those in view (ReadLevelTufts).
+        // Its tufts, those in view (ReadLevelTufts) - each one grown by its ground this frame, in this view, whatever its
+        // sheets ask for (DrawTuftSheets).
         for (INT u = Gn.TuftFirst; u < Gn.TuftFirst + Gn.TuftCount; u++)
         {
+            if (GTuftGrewFrame && u < GTuftCount)
+            {
+                GTuftGrewFrame[u] = EngineFrame;
+                GTuftGrewView[u]  = Frame;
+            }
             const FLOAT* const Q = GTuftRows + 4 * RdxMath::GrassTuftRows * u;
             const FVector      V = PointBy(FVector(Q[0], Q[1], Q[2] + 0.5f * Q[3]), Cs);
             if (!RdxMath::SphereTouchesView(V.X, V.Y, V.Z, Max(Q[3], Q[4]), TanX, TanY))
@@ -25696,6 +27620,160 @@ static void GrowGrass(FBackend& Backend, FSceneNode* Frame, FSurfaceFacet& Facet
         F.Blocks++;
         Records[Band] -= Written;
     }
+}
+
+// The tufts the world view's sheets asked for while no ground had grown them (NoteTuftSheets): each a block of its own,
+// written when its sheets were handed over, drawn at the world's end only where its ground had not grown it by then
+// (DrawTuftSheets) - where the ground is drawn as well, the tuft stays its ground's, whichever came first.
+struct FTuftSheetDraw
+{
+    D3D12_GPU_VIRTUAL_ADDRESS Block;
+    INT                       Tuft, GrassSrv, LightSrv;
+    UBOOL                     bNoSmooth;
+    const void*               View;     // compared, never followed
+};
+static FTuftSheetDraw* GTuftSheetDraws     = nullptr;
+static INT             GTuftSheetDrawCount = 0, GTuftSheetDrawRoom = 0, GTuftSheetDrawFrame = -1;
+
+// The level's foliage sheets grown as tufts the engine hands over in the world's view (DrawComplexSurface): they are
+// not drawn, but they tell which tufts it sees. A tuft whose ground stays hidden - a bed behind a kerb or a step's lip,
+// the tufts' tops standing up into view - would come and go with its ground; such a one is laid by its sheets, lit by
+// their own light map as the level lights them, in a block of its own, kept for the world's end (DrawTuftSheets).
+static void NoteTuftSheets(FBackend& Backend, FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet,
+                           INT EngineFrame)
+{
+    if (!GTuftSheet || !GTuftGrewFrame || GTuftCount <= 0 || !GTuftRows || !Frame || !Facet.Polys)
+        return;
+    if (GTuftSheetDrawFrame != EngineFrame)
+    {
+        GTuftSheetDrawFrame = EngineFrame;
+        GTuftSheetDrawCount = 0;
+    }
+    // The tufts these sheets stand for that were not asked for yet this frame, and that no ground grew yet.
+    static TArray<INT> Tufts;
+    Tufts.Empty(Tufts.Num());
+    for (FSavedPoly* Poly = Facet.Polys; Poly; Poly = Poly->Next)
+    {
+        const INT n = Poly->iNode;
+        const INT u = (n >= 0 && n < GTuftSheetSlots) ? GTuftSheet[n] - 1 : -1;
+        if (u < 0 || u >= GTuftCount || GTuftSheetFrame[u] == EngineFrame)
+            continue;
+        GTuftSheetFrame[u] = EngineFrame;
+        if (GTuftGrewFrame[u] == EngineFrame && GTuftGrewView[u] == (const void*)Frame)
+            continue;
+        Tufts.AddItem(u);
+    }
+    if (Tufts.Num() == 0)
+        return;
+    const INT GrassSrv = MakeGrassPicture() ? Backend.PrepareTexture(GGrassInfo, 0, 1) : -1;
+    if (GrassSrv < 0)
+        return;
+    if (GGrassFrame.Frame != EngineFrame)
+        PrepareGrassFrame(Frame, EngineFrame);
+    // The sheets' place on their texture and on their light map, as DrawComplexSurface works them out for a surface it
+    // draws: the light map's divisor, its half-texel pan and its lit part, the light gain.
+    FGrassGround G;
+    appMemzero(&G, sizeof(G));
+    G.Srv      = -1;
+    G.LightSrv = -1;
+    G.Edge[2]  = 1.0f;
+    G.Edge[3]  = 1.0f;
+    const FCoords& MC  = Facet.MapCoords;
+    const FVector  AxU = MC.XAxis.TransformVectorBy(Frame->Uncoords);
+    const FVector  AxV = MC.YAxis.TransformVectorBy(Frame->Uncoords);
+    const FVector  Org = MC.Origin.TransformPointBy(Frame->Uncoords);
+    if (Surface.Texture)
+    {
+        const FTextureInfo& T = *Surface.Texture;
+        RdxMath::RtSurfaceRows(ToVec(AxU), ToVec(AxV), ToVec(Org), T.Pan.X, T.Pan.Y,
+                               1.0f / RdxMath::LightDivisor(T.UScale, T.USize),
+                               1.0f / RdxMath::LightDivisor(T.VScale, T.VSize), G.TexRows);
+    }
+    if (Surface.LightMap && RdxMath::WantsLightMap((unsigned int)Surface.PolyFlags))
+    {
+        G.LightSrv = Backend.PrepareTexture(*Surface.LightMap, 0, 0);
+        if (G.LightSrv >= 0)
+        {
+            const FTextureInfo& L = *Surface.LightMap;
+            RdxMath::RtSurfaceRows(ToVec(AxU), ToVec(AxV), ToVec(Org), RdxMath::LightPan(L.Pan.X, L.UScale),
+                                   RdxMath::LightPan(L.Pan.Y, L.VScale), 1.0f / RdxMath::LightDivisor(L.UScale, L.USize),
+                                   1.0f / RdxMath::LightDivisor(L.VScale, L.VSize), G.LightRows);
+            const INT LitU = (L.UClamp > 0 && L.UClamp <= L.USize) ? L.UClamp : L.USize;
+            const INT LitV = (L.VClamp > 0 && L.VClamp <= L.VSize) ? L.VClamp : L.VSize;
+            if (L.USize > 0 && L.VSize > 0)
+            {
+                G.Edge[0] = 0.5f / (FLOAT)L.USize;
+                G.Edge[1] = 0.5f / (FLOAT)L.VSize;
+                G.Edge[2] = ((FLOAT)LitU - 0.5f) / (FLOAT)L.USize;
+                G.Edge[3] = ((FLOAT)LitV - 0.5f) / (FLOAT)L.VSize;
+            }
+        }
+    }
+    G.Gain      = ((G.LightSrv >= 0) ? RdxMath::LightGain() : 1.0f) *
+                  RdxMath::EmissiveBoost((RdxMath::EHdrMode)Backend.GetHdrRunning(), (unsigned int)Surface.PolyFlags);
+    G.bNoSmooth = (Surface.PolyFlags & PF_NoSmooth) ? 1 : 0;
+    const FCoords& Cs    = Frame->Coords;
+    const FLOAT    Focal = Max(Frame->Proj.Z, 1.0f);
+    const FLOAT    TanX  = Frame->FX * 0.5f / Focal;
+    const FLOAT    TanY  = Frame->FY * 0.5f / Focal;
+    const INT      Floats = 4 * RdxMath::GrassTuftRows;
+    for (INT k = 0; k < Tufts.Num(); k++)
+    {
+        const INT          u = Tufts(k);
+        const FLOAT* const Q = GTuftRows + Floats * u;
+        const FLOAT        Reach = Max(Q[3], Q[4]);
+        const FVector      V = PointBy(FVector(Q[0], Q[1], Q[2] + 0.5f * Q[3]), Cs);
+        if (!RdxMath::SphereTouchesView(V.X, V.Y, V.Z, Reach, TanX, TanY))
+            continue;
+        if (GTuftSheetDrawCount >= GTuftSheetDrawRoom)
+        {
+            const INT             Room = Max(GTuftSheetDrawRoom * 2, 64);
+            FTuftSheetDraw* const More =
+                (FTuftSheetDraw*)appRealloc(GTuftSheetDraws, Room * sizeof(FTuftSheetDraw), TEXT("RdxTuftSheetDraws"));
+            if (!More)
+                return;
+            GTuftSheetDraws    = More;
+            GTuftSheetDrawRoom = Room;
+        }
+        D3D12_GPU_VIRTUAL_ADDRESS Address = 0;
+        FLOAT* const B = Backend.GrassBlock(RdxMath::GrassHeadRows + RdxMath::GrassPushMax + RdxMath::GrassTuftRows,
+                                            Address);
+        if (!B)
+            return;
+        const INT   g         = GTuftGround[u];
+        const INT   Kind      = (g >= 0 && g < GGrassNodeCount) ? GGrassNodes[g].Kind : 2;
+        const UBOOL bOutdoors = (g >= 0 && g < GGrassNodeCount) ? GGrassNodes[g].bOutdoors : 1;
+        WriteGrassHead(B, Frame, FrameOffsetX(Frame), FrameOffsetY(Frame), G, Kind, bOutdoors, 0, 1, Q[0] - Reach,
+                       Q[1] - Reach, Q[0] + Reach, Q[1] + Reach);
+        B[54] = 1.0f;
+        FLOAT* const T = B + 4 * (RdxMath::GrassHeadRows + RdxMath::GrassPushMax);
+        for (INT c = 0; c < Floats; c++)
+            T[c] = Q[c];
+        FTuftSheetDraw& D = GTuftSheetDraws[GTuftSheetDrawCount++];
+        D.Block     = Address;
+        D.Tuft      = u;
+        D.GrassSrv  = GrassSrv;
+        D.LightSrv  = G.LightSrv;
+        D.bNoSmooth = G.bNoSmooth;
+        D.View      = Frame;
+    }
+}
+
+// The world's end (the HUD's first tile; Unlock where none came): the tufts the sheets asked for this frame, each drawn
+// where no ground grew it - the ground handed over after its sheets has it, as when both are seen.
+static void DrawTuftSheets(FBackend& Backend, INT EngineFrame)
+{
+    if (GTuftSheetDrawFrame == EngineFrame && GTuftGrewFrame)
+        for (INT k = 0; k < GTuftSheetDrawCount; k++)
+        {
+            const FTuftSheetDraw& D = GTuftSheetDraws[k];
+            if (D.Tuft < 0 || D.Tuft >= GTuftCount ||
+                (GTuftGrewFrame[D.Tuft] == EngineFrame && GTuftGrewView[D.Tuft] == D.View))
+                continue;
+            Backend.AddGrassDraw(D.Block, RdxMath::GrassTuftBlades, D.GrassSrv, D.LightSrv, D.bNoSmooth, 1);
+            GGrassFrame.BySheets++;
+        }
+    GTuftSheetDrawCount = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -26377,6 +28455,323 @@ struct FWalkPiece
     const FLOAT*   Trig    = nullptr;
 };
 
+// ---------------------------------------------------------------------------------------------------------------
+// The water's outline under the rounded walls. The water's own run draws its surface as the level has it (SphereInput
+// leaves it out of the rounding), its edge along the walls as they were; where the spherifier moved such a wall out - a
+// round pool's straight sides bowed into an arc - a strip of the wall under the water is left with no water over it,
+// dark between the water's straight edge and the round wall. The sheet's outline - the sides of its polygons no other
+// polygon of it lies across - is pushed out in the water's plane as far as the walls along it moved out at the water's
+// edge (SphereOnWall's move, asked at a few places along each such side), and a little more: into the wall, behind it.
+// Only the sides along a wall that moved out go: one along no wall - where the sea meets its ring, a pool's edge under
+// a grate - stays where it was. The same distance for all of a sheet's sides that go, and one place for each corner,
+// so that the corners its polygons share go to the same place.
+// ---------------------------------------------------------------------------------------------------------------
+static const INT   WaterReachSamples = 8;       // places along each side of the outline asked where the wall went
+static const FLOAT WaterReachMore    = 0.5f;    // units beyond where the walls went: the edge ends in the wall
+static const FLOAT WaterReachLeast   = 0.25f;   // a sheet whose walls moved out less than this is left as it is
+static const FLOAT WaterReachOnSide  = 0.5f;    // a point this near a side of its polygon (units) lies on it
+static const INT   WaterReachSaid    = 16;      // sheets told in the log a level
+
+struct FWaterReach
+{
+    const UModel*   Model   = nullptr;
+    INT             Gen     = -1;   // the rounding it was made for (GSphereGen)
+    INT             Flushes = -1;   // and the level's (GLevelFlushes)
+    TArray<INT>     NodeFirst;      // a node's first corner in Corner and Push; -1 none pushed, -2 not asked yet
+    TArray<FVector> Corner, Push;   // a node's corners as the level has them, and where each goes (level space)
+    INT             Said = 0;       // sheets told in the log
+};
+static FWaterReach GWaterReach;
+
+// The corners of node n of model M into V (at most MAX_POLY_POINTS); their count, 0 where the node has none to draw.
+static INT WaterReachCorners(const UModel* M, INT n, FVector* V)
+{
+    const FBspNode& Node = M->Nodes(n);
+    if (Node.NumVertices < 3 || Node.NumVertices > MAX_POLY_POINTS || Node.iVertPool < 0 ||
+        Node.iVertPool + (INT)Node.NumVertices > M->Verts.Num())
+        return 0;
+    for (INT k = 0; k < Node.NumVertices; k++)
+    {
+        const INT P = M->Verts(Node.iVertPool + k).pVertex;
+        if (P < 0 || P >= M->Points.Num())
+            return 0;
+        V[k] = M->Points(P);
+    }
+    return Node.NumVertices;
+}
+
+// Whether point Q of the plane of node polygon V (Count corners, going round Turn) lies inside it.
+static UBOOL WaterReachInside(const FVector* V, INT Count, const FVector& Turn, const FVector& Q)
+{
+    for (INT k = 0; k < Count; k++)
+        if ((((V[(k + 1) % Count] - V[k]) ^ (Q - V[k])) | Turn) < -1e-3f * Turn.Size())
+            return 0;
+    return 1;
+}
+
+// The sheet of water surface iSurf of model M: how far the walls along its outline moved out, and each corner of its
+// nodes' push - into GWaterReach.
+static void WaterReachSheet(const UModel* M, INT iSurf)
+{
+    FWaterReach& W  = GWaterReach;
+    const DOUBLE T0 = appSeconds();
+    // The sheet's nodes, each one's corners and the way they go round.
+    TArray<INT>     Nodes;
+    TArray<FVector> Corners, Turns, BoxLo, BoxHi;
+    TArray<INT>     First;
+    for (INT n = 0; n < M->Nodes.Num(); n++)
+    {
+        if (M->Nodes(n).iSurf != iSurf)
+            continue;
+        FVector   V[MAX_POLY_POINTS];
+        const INT Count = WaterReachCorners(M, n, V);
+        W.NodeFirst(n)  = -1;
+        if (Count < 3)
+            continue;
+        FVector Turn(0.0f, 0.0f, 0.0f);
+        for (INT k = 0; k < Count; k++)
+            Turn += V[k] ^ V[(k + 1) % Count];
+        if (!(Turn.SizeSquared() > 1e-6f))
+            continue;
+        Nodes.AddItem(n);
+        First.AddItem(Corners.Num());
+        Turns.AddItem(Turn);
+        FVector Lo = V[0], Hi = V[0];
+        for (INT k = 0; k < Count; k++)
+        {
+            Corners.AddItem(V[k]);
+            Lo = FVector(Min(Lo.X, V[k].X), Min(Lo.Y, V[k].Y), Min(Lo.Z, V[k].Z));
+            Hi = FVector(Max(Hi.X, V[k].X), Max(Hi.Y, V[k].Y), Max(Hi.Z, V[k].Z));
+        }
+        BoxLo.AddItem(Lo - FVector(1.0f, 1.0f, 1.0f));
+        BoxHi.AddItem(Hi + FVector(1.0f, 1.0f, 1.0f));
+    }
+    First.AddItem(Corners.Num());
+    // The outline's sides: a side whose outer side lies in no other node of the sheet; each one's way out in the plane,
+    // and how far the wall along it moved out at the water's edge.
+    TArray<INT>     SideNode, SideK;
+    TArray<FVector> SideOut;
+    TArray<FLOAT>   SideMost;
+    FLOAT           Most = 0.0f;
+    INT             Asked = 0, OnWall = 0;
+    for (INT a = 0; a < Nodes.Num(); a++)
+    {
+        const INT      Count = First(a + 1) - First(a);
+        const FVector* V     = &Corners(First(a));
+        const FVector  Turn  = Turns(a).SafeNormal();
+        FVector        Mid(0.0f, 0.0f, 0.0f);
+        for (INT k = 0; k < Count; k++)
+            Mid += V[k];
+        Mid *= 1.0f / (FLOAT)Count;
+        for (INT k = 0; k < Count; k++)
+        {
+            const FVector A = V[k], B = V[(k + 1) % Count];
+            FVector       Out = ((B - A) ^ Turn).SafeNormal();
+            if (((Mid - (A + B) * 0.5f) | Out) > 0.0f)
+                Out = -Out;
+            const FVector Q     = (A + B) * 0.5f + Out * 0.5f;
+            UBOOL         bOpen = 1;
+            for (INT b = 0; b < Nodes.Num() && bOpen; b++)
+            {
+                if (b == a || Q.X < BoxLo(b).X || Q.Y < BoxLo(b).Y || Q.Z < BoxLo(b).Z || Q.X > BoxHi(b).X ||
+                    Q.Y > BoxHi(b).Y || Q.Z > BoxHi(b).Z)
+                    continue;
+                const FPlane& Pl = M->Nodes(Nodes(b)).Plane;
+                if (Abs(Pl.PlaneDot(Q)) < 1.0f &&
+                    WaterReachInside(&Corners(First(b)), First(b + 1) - First(b), Turns(b), Q))
+                    bOpen = 0;
+            }
+            if (!bOpen)
+                continue;
+            SideNode.AddItem(a);
+            SideK.AddItem(k);
+            SideOut.AddItem(Out);
+            FLOAT SideOutMost = 0.0f;
+            for (INT t = 0; t < WaterReachSamples; t++)
+            {
+                const FVector        P  = A + (B - A) * (((FLOAT)t + 0.5f) / (FLOAT)WaterReachSamples);
+                const RdxSphere::FV3 Pd = RdxSphere::V3(P.X, P.Y, P.Z);
+                RdxSphere::FV3       Move;
+                Asked++;
+                const INT Poly = RdxLevelRound::PolygonMoveAt(GSphere->R, Pd, 2.0, Move);
+                if (Poly < 0)
+                    continue;
+                RdxLevelRound::HoldOnPolygon(GSphere->R, Poly, Pd, Move);
+                OnWall++;
+                SideOutMost = Max(SideOutMost, (FLOAT)Move.X * Out.X + (FLOAT)Move.Y * Out.Y + (FLOAT)Move.Z * Out.Z);
+            }
+            SideMost.AddItem(SideOutMost);
+            Most = Max(Most, SideOutMost);
+        }
+    }
+    const FLOAT Cap  = (FLOAT)GSphere->R.MoveCap;
+    const FLOAT Dist = (Most >= WaterReachLeast) ? Min(Most, Cap) + WaterReachMore : 0.0f;
+    INT         Going = 0;
+    for (INT s2 = 0; s2 < SideMost.Num(); s2++)
+        Going += (SideMost(s2) >= WaterReachLeast) ? 1 : 0;
+    if (W.Said < WaterReachSaid)
+    {
+        W.Said++;
+        RDX_LOGF("water edge: surface %i - %i polygons, %i sides on its outline; at %i of %i places along them a moved wall, "
+                 "moved out up to %.2f units: %s %.2f (%i sides); %.2f ms", iSurf, Nodes.Num(), SideNode.Num(), OnWall,
+                 Asked, Most, (Dist > 0.0f) ? TEXT("the outline pushed out by") : TEXT("left as it is, under"),
+                 (Dist > 0.0f) ? Dist : WaterReachLeast, Going, 1000.0 * (appSeconds() - T0));
+    }
+    if (Dist <= 0.0f)
+        return;
+    // Each corner's push: where the outline's sides through it, each pushed out by its distance (Dist, or none where no
+    // wall along it moved out), meet - two of them; one alone pushes it straight out, more (the outline pinched there)
+    // by their mean - at most three times Dist away. Corners at one place are one corner: its sides found among all the
+    // sheet's nodes.
+    for (INT a = 0; a < Nodes.Num(); a++)
+    {
+        const INT n     = Nodes(a);
+        const INT Count = First(a + 1) - First(a);
+        W.NodeFirst(n)  = W.Corner.Num();
+        for (INT k = 0; k < Count; k++)
+        {
+            const FVector C = Corners(First(a) + k);
+            FVector       Outs[4];
+            FLOAT         Dists[4];
+            INT           Many = 0;
+            for (INT s2 = 0; s2 < SideNode.Num(); s2++)
+            {
+                const INT      b  = SideNode(s2);
+                const INT      kb = SideK(s2);
+                const INT      Cb = First(b + 1) - First(b);
+                const FVector& A  = Corners(First(b) + kb);
+                const FVector& B  = Corners(First(b) + (kb + 1) % Cb);
+                if (((A - C).SizeSquared() < 1e-4f || (B - C).SizeSquared() < 1e-4f) && Many < 4)
+                {
+                    const FLOAT D = (SideMost(s2) >= WaterReachLeast) ? Dist : 0.0f;
+                    INT         m = 0;
+                    while (m < Many && (Outs[m] - SideOut(s2)).SizeSquared() >= 1e-6f)
+                        m++;
+                    if (m < Many)
+                        Dists[m] = Max(Dists[m], D);
+                    else
+                    {
+                        Outs[Many]  = SideOut(s2);
+                        Dists[Many] = D;
+                        Many++;
+                    }
+                }
+            }
+            // Where the two sides' pushed lines meet: Push = a Outs[0] + b Outs[1], its reach along each side's way out
+            // that side's distance. Two sides nearly in line: straight out by the further.
+            FVector Push(0.0f, 0.0f, 0.0f);
+            if (Many == 1)
+                Push = Outs[0] * Dists[0];
+            else if (Many == 2)
+            {
+                const FLOAT Cos = Outs[0] | Outs[1];
+                const FLOAT Den = 1.0f - Cos * Cos;
+                if (Den < 1e-3f)
+                    Push = (Outs[0] + Outs[1]).SafeNormal() * Max(Dists[0], Dists[1]);
+                else
+                    Push = Outs[0] * ((Dists[0] - Cos * Dists[1]) / Den) +
+                           Outs[1] * ((Dists[1] - Cos * Dists[0]) / Den);
+            }
+            else if (Many > 2)
+            {
+                for (INT m = 0; m < Many; m++)
+                    Push += Outs[m] * Dists[m];
+                Push *= 1.0f / (FLOAT)Many;
+            }
+            if (Push.SizeSquared() > 9.0f * Dist * Dist)
+                Push = Push.SafeNormal() * (3.0f * Dist);
+            W.Corner.AddItem(C);
+            W.Push.AddItem(Push);
+        }
+    }
+}
+
+// Water polygon Poly with its sheet's outline pushed out under the rounded walls: each of its points that lies on a
+// side of its node moved as that side's ends go, by its shares of the side, into Pushed, and Use pointing at what each
+// point is drawn as. False: none moved - the rounding is not this level's, or the sheet meets no wall moved out.
+static UBOOL WaterReachPoly(const FSceneNode* Frame, const FSavedPoly* Poly, FTransform* Pushed, const FTransform** Use)
+{
+    // A measurement only (the marker SecondRevision-water-edge-off.txt): the water's outline where the level has it.
+    static const UBOOL bOff = FreshMarker(L"SecondRevision-water-edge-off.txt");
+    if (bOff || !GSphere->bOn || !Frame || !Frame->Level || !Frame->Level->Model || Frame->Level->Model != GSphere->Model ||
+        GSphere->Flushes != GLevelFlushes || Poly->User == (void*)&GRingTag || Poly->NumPts > MAX_POLY_POINTS)
+        return 0;
+    const UModel* const M = Frame->Level->Model;
+    FWaterReach&        W = GWaterReach;
+    if (W.Model != M || W.Gen != GSphereGen || W.Flushes != GLevelFlushes || W.NodeFirst.Num() != M->Nodes.Num())
+    {
+        W.Model   = M;
+        W.Gen     = GSphereGen;
+        W.Flushes = GLevelFlushes;
+        W.Said    = 0;
+        W.Corner.Empty();
+        W.Push.Empty();
+        W.NodeFirst.Empty();
+        W.NodeFirst.Add(M->Nodes.Num());
+        for (INT n = 0; n < M->Nodes.Num(); n++)
+            W.NodeFirst(n) = -2;
+    }
+    const INT n = Poly->iNode;
+    if (n < 0 || n >= M->Nodes.Num())
+        return 0;
+    if (W.NodeFirst(n) == -2)
+    {
+        const INT iSurf = M->Nodes(n).iSurf;
+        if (iSurf < 0 || iSurf >= M->Surfs.Num())
+        {
+            W.NodeFirst(n) = -1;
+            return 0;
+        }
+        WaterReachSheet(M, iSurf);
+        if (W.NodeFirst(n) == -2)
+            W.NodeFirst(n) = -1;
+    }
+    const INT First = W.NodeFirst(n);
+    if (First < 0)
+        return 0;
+    const INT Count = M->Nodes(n).NumVertices;
+    if (First + Count > W.Corner.Num())
+        return 0;
+    UBOOL bAny = 0;
+    for (INT i = 0; i < Poly->NumPts; i++)
+    {
+        const FTransform* const P = Poly->Pts[i];
+        Use[i]                    = P;
+        if (!P)
+            continue;
+        const FVector At   = P->Point.TransformPointBy(Frame->Uncoords);
+        FLOAT         Best = WaterReachOnSide * WaterReachOnSide;
+        FVector       Push(0.0f, 0.0f, 0.0f);
+        UBOOL         bOn  = 0;
+        for (INT k = 0; k < Count; k++)
+        {
+            const FVector& A  = W.Corner(First + k);
+            const FVector& B  = W.Corner(First + (k + 1) % Count);
+            const FVector  AB = B - A;
+            const FLOAT    L2 = AB.SizeSquared();
+            const FLOAT    T  = (L2 > 1e-8f) ? Clamp(((At - A) | AB) / L2, 0.0f, 1.0f) : 0.0f;
+            const FLOAT    D2 = (A + AB * T - At).SizeSquared();
+            if (D2 < Best)
+            {
+                Best = D2;
+                Push = W.Push(First + k) * (1.0f - T) + W.Push(First + (k + 1) % Count) * T;
+                bOn  = 1;
+            }
+        }
+        if (!bOn || !(Push.SizeSquared() > 1e-6f))
+            continue;
+        FTransform& Q = Pushed[i];
+        Q             = *P;
+        Q.Point       = (At + Push).TransformPointBy(Frame->Coords);
+        if (!(Q.Point.Z > 1.0f))
+            continue;
+        Q.Project(Frame);
+        Use[i] = &Q;
+        bAny   = 1;
+    }
+    return bAny;
+}
+
 // A facet's polygons one by one, as the engine hands them over - and where the spherifier moved a polygon's node, the
 // pieces of it that are in view in its place (SpherePiece, or made ahead: TakePieceJob), each one as the engine's
 // polygon would be. The sea's ring is the renderer's own and never rounded.
@@ -26387,27 +28782,74 @@ struct FPolyWalk
     INT                 Rounded = 0;        // its pieces; none: the polygon itself
     INT                 Pc      = 0;        // which of them now
     UBOOL               bDecal  = 0;        // they are a decal's on a moved node (FSphereDecal), not the node's own
+    UBOOL               bMover  = 0;        // ... or a rounded mover's polygon's (MoverPolygonNow)
+    UBOOL               bMoverDone = 0;     // the surface's mover polygon drawn already, at an earlier piece of it
+    INT                 ViewNumber = 0;     // the view drawn in (WalkViewNumber), for the movers' polygons drawn in it
+    INT                 Pass       = WalkPass_Surface;   // which of the surface's walks this is (Begin)
     FSphereDecal&       Decal   = GWalkDecal;
     const FPieceJob*    Job     = nullptr;  // the node's pieces made ahead, or none
     UBOOL               bAhead  = 0;        // the pieces made ahead are this view's (PieceJobsFor)
     INT                 ListIn  = -1;       // the frame the world view's rounded nodes are listed in; -1: not listed
     FWalkPiece          Piece;              // the piece the walk is at
+    // The world's view's rounded nodes drawn from the card (CardOn, SphereCardOf): Card the backend that draws
+    // them, null: none is; CardAt and CardTpl the surface's numbers for them; CardNode the node the walk is at whose
+    // triangles are one run - -1 none - and CardRecord its record in this frame's room.
+    FBackend*           Card       = nullptr;
+    FSphereCardAt       CardAt     = {};
+    const FLOAT*        CardTpl    = nullptr;
+    INT                 CardNode   = -1;
+    INT                 CardRecord = -1;
+    INT                 CardView   = -1;    // the surface's view in this frame's room (SphereCardView)
+    UBOOL               bCardAgain = 0;     // the main drawing's nodes again (SphereCardAgainOf)
+    void CardOn(FBackend* Backend, const FSphereCardAt& At, const FLOAT* Tpl, INT View)
+    {
+        Card          = Backend;
+        CardAt        = At;
+        CardTpl       = Tpl;
+        CardView      = View;
+        bCardAgain    = 0;
+        GCardMade.Num = 0;
+    }
+    void CardAgain(FBackend* Backend, const FLOAT* Tpl)
+    {
+        Card       = Backend;
+        CardTpl    = Tpl;
+        CardView   = GCardView;
+        bCardAgain = 1;
+    }
+    void CardOff()
+    {
+        Card       = nullptr;
+        CardNode   = -1;
+        bCardAgain = 0;
+    }
 
     // The view the walk goes through: whether the pieces made ahead are its own, and whether it is the world view, whose
     // rounded nodes the next frame makes ahead.
     void InView(const FSceneNode* Frame, INT EngineFrame, UBOOL bWorld)
     {
-        bAhead = PieceJobsFor(Frame, EngineFrame);
-        ListIn = (bWorld && GSphere->bOn && PieceNodesReady()) ? EngineFrame : -1;
+        bAhead     = PieceJobsFor(Frame, EngineFrame);
+        ListIn     = (bWorld && GSphere->bOn && PieceNodesReady()) ? EngineFrame : -1;
+        ViewNumber = WalkViewNumber(Frame, EngineFrame);
     }
-    const FSavedPoly* Begin(const FSceneNode* Frame, const FSurfaceInfo& Drawn, const FSavedPoly* First)
+    const FSavedPoly* Begin(const FSceneNode* Frame, const FSurfaceInfo& Drawn, const FSavedPoly* First,
+                            INT WalkPass = WalkPass_Surface)
     {
-        Surface = &Drawn;
-        Engine  = First;
+        Surface    = &Drawn;
+        Engine     = First;
+        CardNode   = -1;
+        bMoverDone = 0;
+        Pass       = WalkPass;
         return Enter(Frame);
     }
     const FSavedPoly* Step(const FSceneNode* Frame)
     {
+        if (CardNode >= 0)
+        {
+            CardNode = -1;
+            Engine   = Engine ? Engine->Next : nullptr;
+            return Enter(Frame);
+        }
         if (Rounded)
             for (Pc++; Pc < Rounded; Pc++)
                 if (const FSavedPoly* const Made = Make(Frame))
@@ -26429,9 +28871,11 @@ private:
         FSpherePiece& Own = GWalkPiece;
         if (bDecal)
         {
-            // A decal's picture is read as its surface's is (SphereReadAt).
+            // A decal's picture is read as its surface's is (SphereReadAt); a mover's polygon lies where it is drawn.
             static const FLOAT NoTurn[3] = { 0.0f, 0.0f, 0.0f };
-            if (!SpherePieceOf(Frame, Engine, &Decal.Tri[Pc * 3], &Decal.Was[Pc * 3], NoTurn, SphereDecalLift, Own))
+            const FVector* const Tri = bMover ? &GMoverTri[Pc * 3] : &Decal.Tri[Pc * 3];
+            const FVector* const Was = bMover ? &GMoverWas[Pc * 3] : &Decal.Was[Pc * 3];
+            if (!SpherePieceOf(Frame, Engine, Tri, Was, NoTurn, bMover ? 0.0f : SphereDecalLift, Own))
                 return nullptr;
         }
         else if (Job && GPieceAhead[Job->First + Pc].Poly().NumPts >= 0)
@@ -26462,6 +28906,31 @@ private:
     {
         for (; Engine; Engine = Engine->Next)
         {
+            // A rounded mover's polygon (MoverRoundOf): all of its triangles where the mover is now, at the first piece
+            // of it the engine hands over in the view - the others the BSP cut it into lie in them. The engine hands
+            // those over in this facet or in later ones, a surface's draw for each of the leaves they lie in: once drawn
+            // whole in the view, the polygon is not drawn again there.
+            bMover = 0;
+            INT                Poly = -1;
+            FMoverRound* const Mv   = (Engine->User == (void*)&GRingTag) ? nullptr : MoverOfPoly(Frame, Engine, Poly);
+            if (Mv)
+            {
+                if (bMoverDone || MoverDrawnIn(*Mv, Poly, Pass, ViewNumber))
+                    continue;
+                Rounded = MoverPolygonNow(*Mv, Poly);
+                if (Rounded > 0)
+                {
+                    NoteMoverDrawn(*Mv, Poly, Pass, ViewNumber);
+                    bMoverDone = 1;
+                    bMover     = 1;
+                    bDecal     = 1;
+                    Job        = nullptr;
+                    for (Pc = 0; Pc < Rounded; Pc++)
+                        if (const FSavedPoly* const Made = Make(Frame))
+                            return Made;
+                    continue;
+                }
+            }
             Rounded = (Engine->User == (void*)&GRingTag) ? 0 : SphereTris(Frame, Engine);
             bDecal  = 0;
             Job     = nullptr;
@@ -26475,6 +28944,20 @@ private:
             }
             else
             {
+                // Drawn from the card: one run of the node's triangles in place of its pieces, none made for it.
+                if (Card && CardTpl)
+                {
+                    const INT n = Engine->iNode;
+                    // The card turns and projects its corners: no piece of it is made, here or ahead.
+                    CardRecord = bCardAgain ? SphereCardAgainOf(*Card, Frame, n, CardTpl, CardView)
+                                            : SphereCardOf(*Card, Frame, n, CardAt, CardTpl, CardView);
+                    if (CardRecord >= 0)
+                    {
+                        CardNode = n;
+                        Rounded  = 0;
+                        return CardMarkOf(Engine);
+                    }
+                }
                 if (ListIn >= 0)
                     NotePieceDrawn(Engine->iNode, ListIn);
                 if (bAhead)
@@ -26490,6 +28973,119 @@ private:
         return nullptr;
     }
 };
+
+// A measurement only (the marker SecondRevision-piece-vs-engine.txt): each corner of a polygon the engine draws set
+// against where the spherifier's pieces would put it - the level's own point nearest to it, taken into the view and
+// projected as SpherePieceOf does -, and what the two differ by, said every 300 frames: on the screen, signed and at
+// most, and in the view's space.
+static DOUBLE GPveCount = 0.0, GPveCut = 0.0, GPveSumX = 0.0, GPveSumY = 0.0, GPveMostX = 0.0, GPveMostY = 0.0;
+static DOUBLE GPveMostView = 0.0;
+static void PieceVsEngine(const FSceneNode* Frame, const FSavedPoly* Poly, INT FrameCounter)
+{
+    const UModel* const M = Frame->Level->Model;
+    const INT           n = Poly->iNode;
+    if (n >= 0 && n < M->Nodes.Num())
+    {
+        const FBspNode& Node = M->Nodes(n);
+        if (Node.iVertPool >= 0 && Node.iVertPool + (INT)Node.NumVertices <= M->Verts.Num())
+            for (INT i = 0; i < Poly->NumPts; i++)
+            {
+                const FTransform* const P = Poly->Pts[i];
+                if (!P)
+                    continue;
+                FLOAT   Best = 1e30f;
+                FVector Near(0.0f, 0.0f, 0.0f);
+                for (INT k = 0; k < Node.NumVertices; k++)
+                {
+                    const INT V = M->Verts(Node.iVertPool + k).pVertex;
+                    if (V < 0 || V >= M->Points.Num())
+                        continue;
+                    const FVector Q = M->Points(V).TransformPointBy(Frame->Coords);
+                    const FLOAT   D = (Q - P->Point).SizeSquared();
+                    if (D < Best)
+                    {
+                        Best = D;
+                        Near = Q;
+                    }
+                }
+                // A corner the engine made, cutting the polygon: no point of the level's there.
+                if (Best > 0.01f * 0.01f)
+                {
+                    GPveCut += 1.0;
+                    continue;
+                }
+                FTransform T;
+                T.Point = Near;
+                ProjectAsEngine(T, Frame);
+                const DOUBLE Dx = (DOUBLE)T.ScreenX - (DOUBLE)P->ScreenX, Dy = (DOUBLE)T.ScreenY - (DOUBLE)P->ScreenY;
+                GPveCount += 1.0;
+                GPveSumX += Dx;
+                GPveSumY += Dy;
+                GPveMostX    = Max(GPveMostX, (DOUBLE)Abs(Dx));
+                GPveMostY    = Max(GPveMostY, (DOUBLE)Abs(Dy));
+                GPveMostView = Max(GPveMostView, (DOUBLE)appSqrt(Best));
+            }
+    }
+    static INT Said = -1;
+    if (FrameCounter % 300 == 0 && Said != FrameCounter && GPveCount > 0.0)
+    {
+        Said = FrameCounter;
+        RDX_LOGF("pieces against the engine (marker): %.0f corners, %.0f the engine cut; on the screen x %+.5f px on "
+                 "average (at most %.5f), y %+.5f (at most %.5f); in the view at most %.6f units",
+                 GPveCount, GPveCut, GPveSumX / GPveCount, GPveMostX, GPveSumY / GPveCount, GPveMostY, GPveMostView);
+        GPveCount = GPveCut = GPveSumX = GPveSumY = GPveMostX = GPveMostY = GPveMostView = 0.0;
+    }
+}
+
+// The same marker, for a piece drawn the CPU's way (SecondRevision-sphere-cpu.txt too): each of its corners at one of
+// the engine's polygon's own set against it - where it is drawn (Point), where its pictures are read (Was), and on the
+// screen -, signed on average and at most, in the view's space and in pixels.
+static DOUBLE GPcvCount = 0.0, GPcvP[3] = {}, GPcvW[3] = {}, GPcvS[2] = {}, GPcvMostP = 0.0, GPcvMostW = 0.0;
+static DOUBLE GPcvMostS = 0.0;
+static void PieceCornersVsEngine(const FSavedPoly* Poly, const FSavedPoly* Engine, const FVector* Was, INT FrameCounter)
+{
+    for (INT i = 0; i < Poly->NumPts && i < 8; i++)
+    {
+        const FTransform* const P = Poly->Pts[i];
+        if (!P)
+            continue;
+        const FTransform* E    = nullptr;
+        FLOAT             Best = 0.05f * 0.05f;
+        for (INT k = 0; k < Engine->NumPts; k++)
+            if (Engine->Pts[k])
+            {
+                const FLOAT D = (Engine->Pts[k]->Point - P->Point).SizeSquared();
+                if (D < Best)
+                {
+                    Best = D;
+                    E    = Engine->Pts[k];
+                }
+            }
+        if (!E)
+            continue;
+        const FVector DP = P->Point - E->Point, DW = Was[i] - E->Point;
+        GPcvCount += 1.0;
+        GPcvP[0] += DP.X; GPcvP[1] += DP.Y; GPcvP[2] += DP.Z;
+        GPcvW[0] += DW.X; GPcvW[1] += DW.Y; GPcvW[2] += DW.Z;
+        GPcvS[0] += (DOUBLE)P->ScreenX - E->ScreenX;
+        GPcvS[1] += (DOUBLE)P->ScreenY - E->ScreenY;
+        GPcvMostP = Max(GPcvMostP, (DOUBLE)DP.Size());
+        GPcvMostW = Max(GPcvMostW, (DOUBLE)DW.Size());
+        GPcvMostS = Max(GPcvMostS, (DOUBLE)Max(Abs(P->ScreenX - E->ScreenX), Abs(P->ScreenY - E->ScreenY)));
+    }
+    static INT Said = -1;
+    if (FrameCounter % 300 == 0 && Said != FrameCounter && GPcvCount > 0.0)
+    {
+        Said = FrameCounter;
+        const DOUBLE N = GPcvCount;
+        RDX_LOGF("pieces' corners against the engine's (marker): %.0f corners; drawn at %+.6f %+.6f %+.6f on average (at "
+                 "most %.6f units), read at %+.6f %+.6f %+.6f (at most %.6f); on the screen %+.5f %+.5f px (at most "
+                 "%.5f)", N, GPcvP[0] / N, GPcvP[1] / N, GPcvP[2] / N, GPcvMostP, GPcvW[0] / N, GPcvW[1] / N,
+                 GPcvW[2] / N, GPcvMostW, GPcvS[0] / N, GPcvS[1] / N, GPcvMostS);
+        GPcvCount = GPcvMostP = GPcvMostW = GPcvMostS = 0.0;
+        GPcvP[0] = GPcvP[1] = GPcvP[2] = GPcvW[0] = GPcvW[1] = GPcvW[2] = GPcvS[0] = GPcvS[1] = 0.0;
+    }
+}
 
 void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& Surface, FSurfaceFacet& Facet)
 {
@@ -26512,8 +29108,32 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     {
         // The words are the backend's own once handed over: it takes the list's block.
         RdxSphere::TList<unsigned int> Words;
-        if (GSphere->bOn && RdxLevelRound::PackRound(GSphere->R, Words))
+        FSphereJob&                    J = GSphereJob;
+        if (GSphere->bOn && J.bField && !J.Thread && J.Into == GSphere)
         {
+            // Laid out on the job beside the game (SphereJobField): only handed over here, the nodes' lists traded in.
+            Words.SwapWith(J.Field);
+            GSphereCardGen = -1;
+            if (J.bCard)
+            {
+                GSphereCard.Tri.SwapWith(J.Card.Tri);
+                GSphereCard.Corner.SwapWith(J.Card.Corner);
+                GSphereCard.Count.SwapWith(J.Card.Count);
+                GSphereCard.Ball.SwapWith(J.Card.Ball);
+                GSphereCardWords = Words.Num;
+                GSphereCardGen   = GSphereGen;
+            }
+            else
+                RDX_LOG("spherifier: no memory for the triangles drawn from the card - the CPU makes every piece");
+            SphereJobFieldForget();
+            const INT Count = Words.Num;
+            Backend.TakeSphereField((DWORD*)Words.Release(), Count, GSphereGen);
+        }
+        else if (GSphere->bOn && RdxLevelRound::PackRound(GSphere->R, Words))
+        {
+            // And after them the nodes' triangles the card draws (SphereCardPack); without them it draws none.
+            if (!SphereCardPack(Words, (Frame && Frame->Level) ? Frame->Level->Model : nullptr))
+                RDX_LOG("spherifier: no memory for the triangles drawn from the card - the CPU makes every piece");
             const INT Count = Words.Num;
             Backend.TakeSphereField((DWORD*)Words.Release(), Count, GSphereGen);
         }
@@ -26559,9 +29179,13 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     Backend.SetSurfaceBeam(BeamLights(Frame, FrameCounter, Surface.PolyFlags));
 
     // Grass3D: the level's foliage sheets grown again as tufts are not drawn - their tufts are, with the grass they
-    // stand in (ReadLevelTufts, GrowGrass).
+    // stand in (ReadLevelTufts, GrowGrass); one whose ground stays hidden by its sheets (NoteTuftSheets).
     if (GRunGrass && !GHud.bSwitched && Backend.CanGrass() && FacetIsTuftSheets(Facet))
+    {
+        if (IsWorldView(Frame, FrameCounter))
+            NoteTuftSheets(Backend, Frame, Surface, Facet, FrameCounter);
         return;
+    }
     // Trees3D: the level's small trees of foliage sheets are drawn grown again in their place, once in each view; their
     // sheets are not.
     if (GRunTrees && !GHud.bSwitched && Facet.Polys && Backend.CanTrees() &&
@@ -26832,7 +29456,6 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     if (Surface.DetailTexture) GNode.DetailMaps++;
     if (Surface.MacroTexture)  GNode.MacroMaps++;
 
-
     // A modulated surface's texture is a multiplier, not a colour: sampling it as sRGB
     // would linearise a value that is already a number (RdxMath::SamplesAsColour).
     const RdxMath::EBlend Blend = RdxMath::BlendFor((unsigned int)Surface.PolyFlags);
@@ -27088,7 +29711,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                         RoundNodeCount++;
                     }
                 }
-            if (GRunGeometry == RdxMath::Geometry_Tess && (ReliefDrawsInView(Frame, FrameCounter) || bMirrorRelief) &&
+            if (RdxMath::GeometryRaises(GRunGeometry) && (ReliefDrawsInView(Frame, FrameCounter) || bMirrorRelief) &&
                 SurfaceMode == BLEND_Opaque && Backend.CanTessellate())
             {
                 GReliefMirrorRaised += bMirrorRelief ? 1 : 0;
@@ -27582,17 +30205,42 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                             PomTileU = PomTileV = 0.0f;
                         }
                     }
-                    // How long a cut edge may be: a 960th of the view's width, so the relief is as fine at any
-                    // resolution. Coarser, a strong relief in the middle distance (a carpet's rods) comes out in lumps
-                    // between the cuts. A measurement only: the marker SecondRevision-relief-edge.txt gives the fraction
-                    // instead.
-                    static const INT EdgeParts = MarkerNumber(L"SecondRevision-relief-edge.txt", 0, 0);
-                    const FLOAT Edge = Max(2.0f, Frame->FX / (FLOAT)(EdgeParts > 0 ? EdgeParts : 960));
+                    // How long a cut edge may be: the share of the view's width the displacement mapping's density
+                    // takes (GeometryEdgeParts), so the relief is as fine at any resolution. Coarser, a strong relief
+                    // in the middle distance (a carpet's rods) comes out in lumps between the cuts. A measurement only:
+                    // the marker SecondRevision-relief-edge.txt gives the fraction instead (ReliefEdgeParts).
+                    const INT EdgeParts = ReliefEdgeParts();
+                    const FLOAT Edge = Max(2.0f, Frame->FX / (FLOAT)(EdgeParts > 0 ? EdgeParts
+                                                                                   : RdxMath::GeometryEdgeParts(GRunGeometry)));
                     TessFlags = (Flags & ~RdxMath::PomFlag_On) | RdxMath::PomFlag_Tess;
                     // A measurement view, marker only (SecondRevision-relief-keep.txt): where the relief is held down.
                     static const UBOOL bShowKeep = FreshMarker(L"SecondRevision-relief-keep.txt");
                     if (bShowKeep)
                         TessFlags |= RdxMath::PomFlag_ShowKeep;
+                    // Measurements only: parts of the work left out (ReliefMeasure).
+                    const INT Measure = ReliefMeasure();
+                    if (Measure & ReliefMeasure_NoShade)
+                        TessFlags |= RdxMath::PomFlag_NoShade;
+                    if (Measure & ReliefMeasure_NoClear)
+                        TessFlags |= RdxMath::PomFlag_NoClear;
+                    if (Measure & ReliefMeasure_CutOnce)
+                        TessFlags |= RdxMath::PomFlag_CutOnce;
+                    if (Measure & ReliefMeasure_NoHeld)
+                        TessFlags |= RdxMath::PomFlag_NoHeld;
+                    if (Measure & ReliefMeasure_TextureOnly)
+                        TessFlags |= RdxMath::PomFlag_TextureOnly;
+                    if (Measure & ReliefMeasure_NoSphere)
+                        TessFlags |= RdxMath::PomFlag_NoSphere;
+                    if (Measure & ReliefMeasure_Flat)
+                        TessFlags |= RdxMath::PomFlag_Flat;
+                    if (Measure & ReliefMeasure_NoPieces)
+                        TessFlags |= RdxMath::PomFlag_NoPieces;
+                    if (Measure & ReliefMeasure_NoFaces)
+                        TessFlags |= RdxMath::PomFlag_NoFaces;
+                    if (Measure & ReliefMeasure_CheckHeld)
+                        TessFlags |= RdxMath::PomFlag_CheckHeld;
+                    if (Measure & ReliefMeasure_CheckSame)
+                        TessFlags |= RdxMath::PomFlag_CheckSame;
                     TessTable = Table;
                     TessDepth = Depth;
                     TessInvW  = InvW;
@@ -28074,15 +30722,78 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     // lift over a raised relief its pieces got, asked once for the engine's polygon they are of (below).
     FPolyWalk         Walk;
     Walk.InView(Frame, FrameCounter, IsWorldView(Frame, FrameCounter));
-    const FWalkPiece& Piece   = Walk.Piece;
-    const FSavedPoly* LiftOf  = nullptr;
-    FLOAT             LiftWas = 0.0f;
     // The relief's axes in the level's space, for the pieces' turns (TurnedPomFrameOf): the surface's own, made at the
     // first piece that turns.
     FVector (&PomWorld)[3] = GWalkPomWorld;
     UBOOL   bPomWorld      = 0;
+    // The world's view's rounded nodes drawn from the card (SphereCardOf, FSolidPass::AddSphereRun), where this
+    // surface's pieces would go as the plain fans of its main drawing: not water or a fall, no traced mirror's or
+    // pane's image, not the sludge's mirror, no see-through sheet lifted over a relief, no field of the fog's volume,
+    // not the water's lead mapping, no measurement - with the field on the card and no marker asking for the CPU's
+    // pieces (SphereCardWanted). Its numbers, as DrawComplexSurface fills a piece's vertex with them (SolidPass.hlsl's
+    // SphereVertexOutOf): the gain, the texture's axes with their dots with the origin, the pans, the scales, the
+    // tiling, the light map's; and where the pixel shader walks a relief (POM), its frame in the view.
+    static const INT   CardUnderAsked = MarkerNumber(L"SecondRevision-sphere-under.txt", -1, -1);
+    static const UBOOL bCardNoUnder   = FreshMarker(L"SecondRevision-relief-no-under.txt");
+    const UBOOL        bCardWalk =
+        SphereCardWanted(FrameCounter) && GSphere->bOn && GSphereCardGen == GSphereGen &&
+        Backend.SphereFieldGen() == GSphereGen && Backend.SphereRunsNow() && IsWorldView(Frame, FrameCounter) &&
+        !SphereViewNarrow(Frame) && !bWaterRun && !FallAt && !bMirrorImage && !bGlassMirror && !bSludgeMirror &&
+        !bFieldVolume &&
+        !((SurfaceMode == BLEND_Modulated || SurfaceMode == BLEND_Translucent) &&
+          ReliefDecalCandidate(Surface.PolyFlags)) &&
+        !bLeadMap && !bSphereTint && !(bCardNoUnder && bTessDrawn);
+    FLOAT CardTpl[FSolidPass::SPHERE_RECORD_WORDS];
+    appMemzero(CardTpl, sizeof(CardTpl));
+    if (bCardWalk)
+    {
+        CardTpl[2]  = Gain;
+        CardTpl[4]  = MapX.X;
+        CardTpl[5]  = MapX.Y;
+        CardTpl[6]  = MapX.Z;
+        CardTpl[7]  = RdxMath::Dot(MapX, MapOrigin);
+        CardTpl[8]  = MapY.X;
+        CardTpl[9]  = MapY.Y;
+        CardTpl[10] = MapY.Z;
+        CardTpl[11] = RdxMath::Dot(MapY, MapOrigin);
+        CardTpl[12] = T.Pan.X;
+        CardTpl[13] = InvU;
+        CardTpl[14] = PomTileU;
+        CardTpl[15] = LPanU;
+        CardTpl[16] = T.Pan.Y;
+        CardTpl[17] = InvV;
+        CardTpl[18] = PomTileV;
+        CardTpl[19] = LPanV;
+        CardTpl[20] = LInvU;
+        CardTpl[21] = LInvV;
+        FSphereCardAt At;
+        At.OffX       = OffX;
+        At.OffY       = OffY;
+        At.Under      = bTessDrawn ? ((CardUnderAsked >= 0) ? (FLOAT)CardUnderAsked * 0.01f : SphereUnderPatches)
+                                   : 0.0f;
+        At.DepthScale = bTessDrawn ? (1.0f - 1.0f / 4096.0f) : 1.0f;
+        At.bPick      = (Frame && !Frame->Parent && Frame->X > 0 && Frame->Y > 0) ? 1 : 0;
+        At.Pom        = (PomEntry >= 0 && !bTessDrawn) ? &PomFrame : nullptr;
+        Walk.CardOn(&Backend, At, CardTpl, SphereCardView(Backend, Frame, At.OffX, At.OffY));
+    }
+    const FWalkPiece& Piece   = Walk.Piece;
+    const FSavedPoly* LiftOf  = nullptr;
+    FLOAT             LiftWas = 0.0f;
     for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
     {
+        // A node drawn from the card (FPolyWalk::Enter): its triangles one run, where its pieces' fans would have gone.
+        if (Walk.CardNode >= 0)
+        {
+            SphereTimer.bRounded = 1;
+            const INT Tris = GSphere->R.PolyTris[Walk.CardNode];
+            if (Backend.AddSphereRun(Tris, Walk.CardRecord, Srv, LightSrv, SurfaceMode,
+                                     (Surface.PolyFlags & PF_NoSmooth) ? 1 : 0))
+            {
+                GSphereCardNodes += 1.0;
+                GSphereCardTris  += (DOUBLE)Tris;
+            }
+            continue;
+        }
         const INT Num = Poly->NumPts;
         if (Num < 3 || Num > MAX_POLY_POINTS)
             continue;
@@ -28104,8 +30815,17 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             NoteWinding(Frame, 0, Poly->Pts[0]->ScreenX, Poly->Pts[0]->ScreenY,
                         Poly->Pts[1]->ScreenX, Poly->Pts[1]->ScreenY,
                         Poly->Pts[2]->ScreenX, Poly->Pts[2]->ScreenY);
+        static const UBOOL bPieceVsEngine = FreshMarker(L"SecondRevision-piece-vs-engine.txt");
+        if (bPieceVsEngine && !Walk.IsMade() && Frame->Level && Frame->Level->Model && IsWorldView(Frame, FrameCounter))
+            PieceVsEngine(Frame, Poly, FrameCounter);
+        if (bPieceVsEngine && Walk.IsMade() && Walk.Engine && IsWorldView(Frame, FrameCounter))
+            PieceCornersVsEngine(Poly, Walk.Engine, Piece.Was, FrameCounter);
 
         UBOOL bValid = 1;
+        // The water's outline pushed out under the rounded walls (WaterReachPoly): the points it moved, the rest as given.
+        static FTransform Pushed[MAX_POLY_POINTS];
+        const FTransform* PushUse[MAX_POLY_POINTS];
+        const UBOOL       bPushed = bWaterRun && !Walk.IsMade() && WaterReachPoly(Frame, Poly, Pushed, PushUse);
         // A piece's relief axes, turned as far as the surface turned there (TurnedPomFrameOf): the turn is the piece's own,
         // the same at each of its corners, so they are turned once for it - and again only for a corner whose turn is
         // another.
@@ -28114,7 +30834,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
         UBOOL              bTurned   = 0;
         for (INT i = 0; i < Num; i++)
         {
-            const FTransform* P = Poly->Pts[i];
+            const FTransform* P = bPushed ? PushUse[i] : Poly->Pts[i];
             if (!P)
             {
                 bValid = 0;
@@ -28154,8 +30874,9 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             // Same projection, the light map's own pan and scale.
             Verts[i].LU = RdxMath::SurfaceCoord(MapX, MapOrigin, Lit, LPanU) * LInvU;
             Verts[i].LV = RdxMath::SurfaceCoord(MapY, MapOrigin, Lit, LPanV) * LInvV;
-            // The sea's ring (EndlessWater) lies past its light map: it takes the map's nearest lit texel.
-            if (Poly->User == (void*)&GRingTag)
+            // The sea's ring (EndlessWater) lies past its light map: it takes the map's nearest lit texel - and so does a
+            // point of the water pushed out under a wall (WaterReachPoly).
+            if (Poly->User == (void*)&GRingTag || (bPushed && P != Poly->Pts[i]))
             {
                 Verts[i].LU = Clamp(Verts[i].LU, LMinU, LMaxU);
                 Verts[i].LV = Clamp(Verts[i].LV, LMinV, LMaxV);
@@ -28398,6 +31119,8 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
         }
     }
+    // The walks after the main drawing's make their pieces on the CPU.
+    Walk.CardOff();
     // Grass3D: the blades on this ground, if it is grass (GrowGrass) - with the ground's texture and light map, and the
     // stencil kind and flashlight's share its run has just taken. In the world's view and in the level's own mirrors,
     // which the engine draws as views of their own: the same blades, by the same code.
@@ -28467,10 +31190,15 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     // lifted by the same numbers, so every point lands where the surface's own did and the depth test passes it. Only
     // the coordinate its pixels read differs - the detail texture's, from the surface's (SetTessUvMap): both come from
     // the same mapping axes, so one is the other scaled and moved.
-    if (DetSrv >= 0 && bTessDrawn && TessCount > 0 && Backend.CanTessellateDetail())
+    if (DetSrv >= 0 && bTessDrawn && TessCount > 0 && Backend.CanTessellateDetail() &&
+        !(ReliefMeasure() & ReliefMeasure_NoDetail))
     {
-        Backend.SetPomRun(TessTable, TessDepth, (FLOAT)(TessFlags & (RdxMath::PomFlag_Tess | RdxMath::PomFlag_OnceMapped)),
-                          TessInvW, TessInvH);
+        const INT DetailFlags = RdxMath::PomFlag_Tess | RdxMath::PomFlag_OnceMapped | RdxMath::PomFlag_NoShade |
+                                RdxMath::PomFlag_NoClear | RdxMath::PomFlag_CutOnce | RdxMath::PomFlag_NoHeld |
+                                RdxMath::PomFlag_TextureOnly | RdxMath::PomFlag_NoSphere | RdxMath::PomFlag_Flat |
+                                RdxMath::PomFlag_NoPieces | RdxMath::PomFlag_NoFaces | RdxMath::PomFlag_CheckHeld |
+                                RdxMath::PomFlag_CheckSame;
+        Backend.SetPomRun(TessTable, TessDepth, (FLOAT)(TessFlags & DetailFlags), TessInvW, TessInvH);
         Backend.SetReliefRun(1, &TessNormal.X, &TessAxisU.X, &TessAxisV.X, PomFrame.Du, PomFrame.Dv, TessEdge,
                              Frame->Proj.Z, Frame->FX15 + OffX, Frame->FY15 + OffY,
                              ReliefLampStrength());
@@ -28485,9 +31213,34 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
     }
     if (DetSrv >= 0 && !bTessDrawn)
     {
-        // The same pieces as the surface's own drawing above, where the spherifier moved its nodes.
-        for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
+        // The same pieces as the surface's own drawing above, where the spherifier moved its nodes - those it drew from
+        // the card from the card again, with the detail texture's pan and scale, no tiling, no light map, no gain.
+        FLOAT DetTpl[FSolidPass::SPHERE_RECORD_WORDS];
+        if (bCardWalk)
         {
+            memcpy(DetTpl, CardTpl, sizeof(DetTpl));
+            DetTpl[2]  = 1.0f;
+            DetTpl[12] = DPanU;
+            DetTpl[13] = DInvU;
+            DetTpl[14] = 0.0f;
+            DetTpl[15] = 0.0f;
+            DetTpl[16] = DPanV;
+            DetTpl[17] = DInvV;
+            DetTpl[18] = 0.0f;
+            DetTpl[19] = 0.0f;
+            DetTpl[20] = 0.0f;
+            DetTpl[21] = 0.0f;
+            Walk.CardAgain(&Backend, DetTpl);
+        }
+        for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys, WalkPass_Detail); Poly;
+             Poly = Walk.Step(Frame))
+        {
+            if (Walk.CardNode >= 0)
+            {
+                Backend.AddSphereRun(GSphere->R.PolyTris[Walk.CardNode], Walk.CardRecord, DetSrv, -1,
+                                     BLEND_Modulated, 0);
+                continue;
+            }
             const INT Num = Poly->NumPts;
             if (Num < 3 || Num > MAX_POLY_POINTS)
                 continue;
@@ -28518,6 +31271,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             if (bValid)
                 Backend.AddFan(Verts, Num, DetSrv, -1, BLEND_Modulated, 0);
         }
+        Walk.CardOff();
     }
 
     // The engine's volumetric light (FogMaps): the fog map laid over the surface - its colour, and in its alpha how much
@@ -28543,15 +31297,20 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             {
                 // Over the sludge's lifted patches (BLEND_SludgeFog): the surface's own vertices once more - the texture's
                 // coordinate is what lifts them, so it stays - with the fog map's coordinates in the light map's place.
-                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
+                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys, WalkPass_Fog); Poly;
+                     Poly = Walk.Step(Frame))
                 {
                     const INT Num = Poly->NumPts;
                     if (Num < 3 || Num > MAX_POLY_POINTS)
                         continue;
                     UBOOL bValid = 1;
+                    // Pushed out under the rounded walls as the sludge itself was (WaterReachPoly).
+                    static FTransform FogPushed[MAX_POLY_POINTS];
+                    const FTransform* FogUse[MAX_POLY_POINTS];
+                    const UBOOL       bFogPushed = !Walk.IsMade() && WaterReachPoly(Frame, Poly, FogPushed, FogUse);
                     for (INT i = 0; i < Num && bValid; i++)
                     {
-                        const FTransform* P = Poly->Pts[i];
+                        const FTransform* P = bFogPushed ? FogUse[i] : Poly->Pts[i];
                         if (!P)
                         {
                             bValid = 0;
@@ -28596,8 +31355,35 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
             }
             else if (!bTessDrawn)
             {
-                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys); Poly; Poly = Walk.Step(Frame))
+                // Those the main drawing drew from the card, from the card again: the fog map's pan and scale, no
+                // tiling, no light map, no gain - not where the masked fog is shown for a measurement.
+                static const UBOOL bCardMaskedView = FreshMarker(L"SecondRevision-fogmaps-masked-view.txt");
+                FLOAT              FogTpl[FSolidPass::SPHERE_RECORD_WORDS];
+                if (bCardWalk && !(bFogMasked && bCardMaskedView))
                 {
+                    memcpy(FogTpl, CardTpl, sizeof(FogTpl));
+                    FogTpl[2]  = 1.0f;
+                    FogTpl[12] = FPanU;
+                    FogTpl[13] = FInvU;
+                    FogTpl[14] = 0.0f;
+                    FogTpl[15] = 0.0f;
+                    FogTpl[16] = FPanV;
+                    FogTpl[17] = FInvV;
+                    FogTpl[18] = 0.0f;
+                    FogTpl[19] = 0.0f;
+                    FogTpl[20] = 0.0f;
+                    FogTpl[21] = 0.0f;
+                    Walk.CardAgain(&Backend, FogTpl);
+                }
+                for (const FSavedPoly* Poly = Walk.Begin(Frame, Surface, Facet.Polys, WalkPass_Fog); Poly;
+                     Poly = Walk.Step(Frame))
+                {
+                    if (Walk.CardNode >= 0)
+                    {
+                        Backend.AddSphereRun(GSphere->R.PolyTris[Walk.CardNode], Walk.CardRecord, FogSrv, -1,
+                                             bFogMasked ? BLEND_FogEqual : BLEND_Fog, 0);
+                        continue;
+                    }
                     const INT Num = Poly->NumPts;
                     if (Num < 3 || Num > MAX_POLY_POINTS)
                         continue;
@@ -28643,6 +31429,7 @@ void URevisionRenderDevice::DrawComplexSurface(FSceneNode* Frame, FSurfaceInfo& 
                     else if (bValid)
                         Backend.AddFan(Verts, Num, FogSrv, -1, bFogMasked ? BLEND_FogEqual : BLEND_Fog, 0);
                 }
+                Walk.CardOff();
             }
         }
     }
@@ -32199,9 +34986,32 @@ static void NoteTreeSheetLight(INT i, const FTextureInfo& Map)
     T.SheetMaps++;
 }
 
+// How the leaves are drawn (FSolidPass's LeafDepthPipelines): their depth first, then their picture where its depth is
+// equal - each pixel lit once. The marker SecondRevision-leaf-depth.txt, looked for once a second whatever its age: 1 the
+// one pass they were drawn in, for the same view both ways; 2 the check - the depth pass cyan, the picture's magenta
+// where its depth is equal: cyan left anywhere is a leaf the two passes put in different places.
+static INT LeafDepthMode()
+{
+    static DOUBLE Looked = -1e9;
+    static INT    Mode   = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked       = Now;
+        const INT Was = Mode;
+        Mode          = LiveMarkerNumber(L"SecondRevision-leaf-depth.txt", 0, 0);
+        if (Mode != Was)
+            RDX_LOGF("leaves (marker SecondRevision-leaf-depth.txt): %s", (Mode == 1) ? TEXT("drawn in one pass")
+                     : (Mode == 2) ? TEXT("the check - the depth pass cyan, the picture's magenta where equal")
+                                   : TEXT("their depth first, then their picture where its depth is equal"));
+    }
+    return Mode;
+}
+
 // One of the level's plants grown again, drawn - once in this view. False where it cannot be.
 static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT OffX, FLOAT OffY, INT EngineFrame)
 {
+    Backend.SetLeafDepthMode(LeafDepthMode());
     FTreeInstance& T = GTreeInstances[i];
     if (T.DrawnFrame == EngineFrame && T.DrawnView == (const void*)Frame)
         return 1;
@@ -32329,7 +35139,7 @@ static UBOOL DrawTreeInstance(FBackend& Backend, FSceneNode* Frame, INT i, FLOAT
             Backend.GetPomSize(Entry, InvW, InvH);
             // Geometry=DisplacementMapping where the card cuts patches: the bark itself pushed in by the map (its
             // shading the map's too); otherwise the POM, its axes worked out by the pixel shader.
-            const UBOOL bReal = GRunGeometry == RdxMath::Geometry_Tess && Backend.CanTessellate();
+            const UBOOL bReal = RdxMath::GeometryRaises(GRunGeometry) && Backend.CanTessellate();
             Backend.SetPomRun(Backend.GetPomTable(Entry), TreeBarkRelief,
                               (FLOAT)(bReal ? RdxMath::PomFlag_Tess : (RdxMath::PomFlag_On | RdxMath::PomFlag_Rates)),
                               InvW, InvH);
@@ -32549,20 +35359,100 @@ static FLOAT ReliefSpriteLift(const FSceneNode* Frame, INT FrameNumber, const FV
 // it that came to nothing (RoundMissOf: a model the engine draws far off in a thinner shape of fewer vertices is never
 // known - its tries are its own, so that no other draw is left without any, square in one frame and round in the next
 // as the order the engine draws in turns); how many of a model's vertices the engine's normals are held against, how
-// far one may turn from the faces' and still agree, and how many guesses one triangle may take.
+// far one may turn from the faces' and still agree, and how many guesses one triangle may take of each model near it -
+// each model its own: a neighbour listed before the triangle's own model, with many faces of the same numbering, would
+// else take them all and leave its own model none.
 static const FLOAT MeshShape     = 1.0f;
 static const FLOAT MeshSag       = 0.25f;
 static const FLOAT MeshMinPixels = 40.0f;
 static const INT   MeshMostTries = 16;
 static const INT   MeshChecks    = 8;
+// The most vertices a round of RoundSamplesAgree looks at, where too few of the ones before had a normal to hold against:
+// its four rounds look at 120 of a model's vertices, a dozen of them in the view where a tenth of it is.
+static const INT   MeshChecksMost = 64;
 static const FLOAT MeshCheckCos  = 0.8f;
 static const INT   MeshMostGuesses = 32;
+// A draw known from a piece the engine cut at the view's edge (RoundFindDrawFromPiece): at most MeshPieceTries pieces a
+// frame asked, MeshPieceGuesses places a model; a model of more than MeshPieceVerts vertices only where two of the
+// piece's own corners fix their pair.
+static const INT   MeshPieceTries   = 16;
+static const INT   MeshPieceGuesses = 64;
+static const INT   MeshPieceVerts   = 64;
+// A guess at where a draw's samples lie is held against MESH_LENGTH_CHECKS of the model's edges, kept with their lengths
+// from the pose its shape was made in (RoundLengthsAgree): each edge's length over its kept one is one scale for all of
+// them, to within MeshLengthGive of the middle one - a vertex's animation stretches an edge somewhat, a wrong guess
+// joins places of other parts of the model.
+enum { MESH_LENGTH_CHECKS = 16 };
+static const FLOAT MeshLengthGive = 0.5f;
 
 enum
 {
     ROUND_MODELS = 512,   // models known since the level came
     ROUND_ACTORS = 4096   // the level's actors that are drawn as a model
 };
+
+// A model's fine bevel (LevelBevel.h): its faces as polygons, rounded and bevelled once, in the pose its actor stood in
+// when a draw of it first asked (MeshBevelMake). A face the bevel cut is drawn as its pieces in its place (MeshBevelOut),
+// every other one as the engine hands it over. A piece's corner is a share of the face's corners plus the bevel's move,
+// both taken along the face's edges and normal then and laid along them now: the face's first corner then, the duals of
+// its edges from it (a point's shares along them), its unit normal and the root of twice its area.
+struct FMeshBevelFace
+{
+    INT    First, Count;   // its pieces' corners in FMeshBevel's Corner from First on, three a piece
+    double R0[3], D1[3], D2[3], N[3], S;
+};
+struct FMeshBevel
+{
+    INT                              Level  = -1;     // the spherifier's level it was made at (its Sag)
+    INT                              Again  = 0;      // none could be made: the frame from which it is asked for again
+    INT                              Used   = 0;      // the frame a draw last took it in (MeshBevelsMake lets it go)
+    FLOAT                            Mirror = 1.0f;   // the view it was made in, mirrored or not (FSceneNode's Mirror)
+    RdxSphere::TList<int>            Slot;            // per face of the model, its record in Faces; -1 none
+    RdxSphere::TList<FMeshBevelFace> Faces;
+    // Per piece corner: its place times four, plus the face's corner it is (0 to 2) where it stayed there, else 3.
+    RdxSphere::TList<int>            Corner;
+    RdxSphere::TList<RdxSphere::FV3> Orig, Moved;     // per place, where it was and where the bevel put it then
+    INT                              Rounded = 0;     // the places the rounding made: those after them the bevel's
+    // Per place, the draw it was last worked out for (FRoundDraw's Stamp) and where it went there: in the view, then on
+    // the screen, five numbers a place - every face that has it draws it there, the same to the last bit.
+    RdxSphere::TList<unsigned int>   AtStamp;
+    RdxSphere::TList<float>          At;
+    UBOOL                            bOn = 0;
+};
+// The models whose bevel a draw asked for this frame: made at the frame's end (MeshBevelsMake), where the model's whole
+// is read off the engine away from any draw of it. The view the draw was in, as plain bytes (an FCoords is made through
+// calls into Core.dll).
+struct FMeshBevelAsk
+{
+    INT          Model;      // its number among GRoundModels
+    const UMesh* Mesh;       // compared only: by then the number may be another mesh's
+    AActor*      Actor;      // the draw's, read at the end of the frame it was drawn in
+    BYTE         Coords[sizeof(FCoords)];
+    FLOAT        Mirror;
+    INT          FrameNo;
+};
+enum { MESH_BEVEL_ASKS = 64 };
+static FMeshBevelAsk GMeshBevelAsks[MESH_BEVEL_ASKS];
+static INT           GMeshBevelAskCount = 0;
+// How many models' bevels the log has told of this level (MeshBevelMake).
+static INT GMeshBevelsSaid = 0;
+// Pixels: a model whose bevel's round is less than this across where the model comes nearest is drawn without it.
+static const FLOAT MeshBevelLeastPixels = 0.5f;
+// Whether a curved model's fine bevel is drawn (MeshBevelPatchesOut): not in the game's own run yet - a measurement's
+// alone, with the marker SecondRevision-curved-bevel.txt (looked for once a second, written within a day), until it is
+// seen to keep a curved outline smooth.
+static UBOOL MeshBevelCurvedOn()
+{
+    static DOUBLE Looked = -1e9;
+    static UBOOL  bOn    = 0;
+    const DOUBLE  Now    = appSeconds();
+    if (Now - Looked >= 1.0 || Now < Looked)
+    {
+        Looked = Now;
+        bOn    = MarkerWrittenWithin(L"SecondRevision-curved-bevel.txt", 24ull * 60 * 60);
+    }
+    return bOn;
+}
 
 // A model, once a level: its faces (FModel), and its shape (FShape) once a draw of it was known.
 struct FRoundModel
@@ -32573,6 +35463,7 @@ struct FRoundModel
     BYTE*                 Round;     // a face: drawn rounded, by its material
     UBOOL                 bShaped;   // the shape was tried
     UBOOL                 bCurved;   // some edge of it bows: a model all of flat parts is drawn as it always was
+    FMeshBevel*           Bevel;     // its fine bevel once one was made for it (MeshBevelMake); null none yet
     // Each edge of its shape: its number among the frame's edges (FSolidPass::MeshEdgeRoom), the shape's pose stamp it
     // was written for, how far its bends reach together and the least of its rooms (RoundEdgeRef).
     INT*                  EdgeNo;
@@ -32583,6 +35474,15 @@ struct FRoundModel
     // the pose stamp it was written for (RoundPolyRef).
     INT*                  PolyNo;
     INT*                  PolyStamp;
+    // Where a draw of it was last known (RoundFindDraw): its samples' first address and the frame - for the measurement
+    // (GRoundTrace) to tell a draw known somewhere else than the frame before.
+    size_t                LastBase;
+    INT                   LastFrame;
+    FLOAT                 LastForward[3];   // the view's forward axis then, in the world (the measurement's too)
+    // Edges of its faces spread over it, and their lengths in the pose its shape was made in (RoundLengthsAgree).
+    INT                   CheckA[MESH_LENGTH_CHECKS], CheckB[MESH_LENGTH_CHECKS];
+    FLOAT                 CheckLength[MESH_LENGTH_CHECKS];
+    INT                   CheckCount;
 };
 static FRoundModel GRoundModels[ROUND_MODELS];
 static INT         GRoundModelCount = 0;
@@ -32602,6 +35502,26 @@ static const FSceneNode* GRoundPlacedFrame = nullptr;
 // a thinner shape of fewer vertices besides, are never looked for.
 static INT GRoundWorth[ROUND_ACTORS];
 static INT GRoundWorthCount = 0;
+// Their places in the view and how far a corner may be from them, in rows - RoundFindDraw's first test of a corner
+// against four of them at a time; three more than the list, for the last four read.
+static FLOAT GRoundWorthX[ROUND_ACTORS + 3], GRoundWorthY[ROUND_ACTORS + 3], GRoundWorthZ[ROUND_ACTORS + 3],
+             GRoundWorthLim[ROUND_ACTORS + 3];
+// The viewer's own things as RoundFindDraw last placed them for a view and frame, in the order it walks them: what
+// each one's place in the view and its reach are made from - itself, its model, the bits of its place, its scale and
+// its collision's size; the model's own scale and box stay as they were imported - and those two, made again only
+// where any of it changed: the engine places the weapon in hand anew just before it draws it.
+struct FRoundCarried
+{
+    const AInventory* Item;   // compared only
+    const UMesh*      Mesh;   // compared only
+    DWORD             Made[6];
+    FLOAT             View[3];
+    FLOAT             Reach;
+};
+enum { ROUND_CARRIED = 256 };   // as many as the walk goes through
+static FRoundCarried     GRoundCarried[ROUND_CARRIED];
+static INT               GRoundCarriedCount = 0, GRoundCarriedFrameNo = -1;
+static const FSceneNode* GRoundCarriedFrame = nullptr;
 // The triangle that came to no model last: a triangle after it with a corner of its - the same sample, at the same
 // place - is of the same draw, and is not looked for again.
 static const FTransTexture* GRoundFailPts[3] = { nullptr, nullptr, nullptr };
@@ -32700,20 +35620,27 @@ struct FRoundDraw
     FLOAT             Focal, CentreX, CentreY;
     UBOOL             bLive;
     UBOOL             bFlat;     // known, but drawn flat: too small, all flat, or off the projection
+    AActor*           Actor;     // whose model it was known as
+    FMeshBevel*       Bevel;     // a model all of flat parts drawn with its fine bevel (MeshBevelOut); null none
+    unsigned int      Stamp;     // a number no draw known before it had (MeshBevelOut's places)
 };
-static FRoundDraw GRoundDraw = {};
+static FRoundDraw   GRoundDraw      = {};
+static unsigned int GRoundDrawStamp = 0;
 // The live draw's samples' places when it was known (RoundFindDraw), its vertices' count of them (GRoundSnapOk: taken).
 static FVector* GRoundSnap     = nullptr;
 static INT      GRoundSnapRoom = 0;
 static UBOOL    GRoundSnapOk   = 0;
 // Memory found readable this frame (RoundReadable): each stretch is asked of Windows once a frame - a frame's arrays
 // of samples lie in a few stretches, and none is given back while the frame is drawn. And memory found not readable:
-// a wrong guess at a draw's array asks about the same few stretches again and again.
+// a wrong guess at a draw's array asks about the same few stretches again and again. Each kept in rising order, the
+// stretches that meet or overlap made one (RoundRangeKeep), so that the one a guess falls in is found by halving.
 struct FRoundRange
 {
     size_t From, To;
 };
-static FRoundRange GRoundRanges[16], GRoundBad[16];
+// Room for more stretches than a frame's guesses reach; one past it is not kept, and Windows is asked about it again.
+enum { ROUND_RANGES = 256 };
+static FRoundRange GRoundRanges[ROUND_RANGES], GRoundBad[ROUND_RANGES];
 static INT         GRoundRangeCount = 0, GRoundBadCount = 0, GRoundRangesFrame = -1;
 static INT        GRoundStamp = 0, GRoundTries = 0, GRoundTriesFrame = -1;
 // The spherifier's angle and number the models' shapes were made by: a new one from the menu, and they are all made
@@ -32742,10 +35669,14 @@ struct FRoundTraceRow
     FLOAT         Dist;
     INT           Count[RTH_HOWS];
 };
-enum { ROUND_TRACE_ROWS = 48, ROUND_TRACE_DETAILS = 4 };
+enum { ROUND_TRACE_ROWS = 48, ROUND_TRACE_DETAILS = 8 };
 static UBOOL          GRoundTrace = 0;
 static FRoundTraceRow GRoundTraceRows[ROUND_TRACE_ROWS];
 static INT            GRoundTraceRowCount = 0, GRoundTraceFrame = -1, GRoundTraceDetails = 0;
+// The frame's draws not known told in detail: a quarter of them in each frame, in turn, and one for each model nearest
+// such a draw - the many small things round one model (a gun's shell casings) do not take all of them.
+static const AActor*  GRoundTraceDetailed[ROUND_TRACE_DETAILS];
+static INT            GRoundTraceFails = 0;
 static INT            GRoundTraceHeldRound = 0, GRoundTraceHeldFlat = 0;
 
 // The farthest corner of a mesh's box from its origin, in the mesh's own units (RoundReachOf) - kept by mesh: the reach
@@ -32780,8 +35711,11 @@ static void ForgetRoundModels()
             appFree(R.PolyNo);
         if (R.PolyStamp)
             appFree(R.PolyStamp);
+        delete R.Bevel;
     }
-    GRoundModelCount  = 0;
+    GRoundModelCount   = 0;
+    GMeshBevelAskCount = 0;
+    GMeshBevelsSaid    = 0;
     appMemzero(GRoundMeshFar, sizeof(GRoundMeshFar));
     GRoundActorCount  = 0;
     GRoundActorsFrame = -1;
@@ -32813,6 +35747,10 @@ static FRoundModel* RoundModelOf(UMesh* M)
     R.EdgeRoom  = nullptr;
     R.PolyNo    = nullptr;
     R.PolyStamp = nullptr;
+    R.Bevel     = nullptr;
+    R.LastBase  = 0;
+    R.LastFrame = -1;
+    R.CheckCount = 0;
     ULodMesh* const L     = Cast<ULodMesh>(M);
     const INT       Faces = L ? L->Faces.Num() : M->Tris.Num();
     const INT       Verts = L ? L->ModelVerts : M->FrameVerts;
@@ -32945,8 +35883,77 @@ static void RoundPlaceActors(const FSceneNode* Frame, INT FrameNo)
         FRoundActor& R = GRoundActors[i];
         R.View         = R.Actor->Location.TransformPointBy(Frame->Coords);
         if (RoundWorthAt(Frame, R.View, R.Reach))
-            GRoundWorth[GRoundWorthCount++] = i;
+        {
+            GRoundWorthX[GRoundWorthCount]   = R.View.X;
+            GRoundWorthY[GRoundWorthCount]   = R.View.Y;
+            GRoundWorthZ[GRoundWorthCount]   = R.View.Z;
+            GRoundWorthLim[GRoundWorthCount] = R.Reach * 1.25f + 16.0f;
+            GRoundWorth[GRoundWorthCount++]  = i;
+        }
     }
+}
+
+// Stretch [From, To) into Set's Count stretches, in rising order and none meeting another: made one with the ones it
+// meets or overlaps. A new one past the room is not kept.
+static void RoundRangeKeep(FRoundRange* Set, INT& Count, size_t From, size_t To)
+{
+    // The first that does not end before From: the ones before it are apart from the stretch.
+    INT Lo = 0, Hi = Count;
+    while (Lo < Hi)
+    {
+        const INT Mid = (Lo + Hi) / 2;
+        if (Set[Mid].To < From)
+            Lo = Mid + 1;
+        else
+            Hi = Mid;
+    }
+    // From there, the ones that start at or before To meet it: they and the stretch become one.
+    INT Past = Lo;
+    while (Past < Count && Set[Past].From <= To)
+    {
+        From = Min(From, Set[Past].From);
+        To   = Max(To, Set[Past].To);
+        Past++;
+    }
+    const INT Merged = Past - Lo;
+    if (Merged == 0 && Count >= ROUND_RANGES)
+        return;
+    if (Merged != 1)
+        memmove(&Set[Lo + 1], &Set[Past], sizeof(FRoundRange) * (size_t)(Count - Past));
+    Set[Lo] = { From, To };
+    Count += 1 - Merged;
+}
+
+// Whether [From, End) lies in one of Set's stretches: the last one that starts at or before From, as the ones before
+// it end before it starts.
+static UBOOL RoundRangeHolds(const FRoundRange* Set, INT Count, size_t From, size_t End)
+{
+    INT Lo = 0, Hi = Count;
+    while (Lo < Hi)
+    {
+        const INT Mid = (Lo + Hi) / 2;
+        if (Set[Mid].From <= From)
+            Lo = Mid + 1;
+        else
+            Hi = Mid;
+    }
+    return Lo > 0 && End <= Set[Lo - 1].To;
+}
+
+// Whether [From, End) reaches into one of Set's stretches: the first one that ends after From, as the ones after it
+// start later still.
+static UBOOL RoundRangeMeets(const FRoundRange* Set, INT Count, size_t From, size_t End)
+{
+    INT Lo = 0, Hi = Count;
+    while (Lo < Hi)
+    {
+        const INT Mid = (Lo + Hi) / 2;
+        if (Set[Mid].To <= From)
+            Lo = Mid + 1;
+        else
+            Hi = Mid;
+    }
+    return Lo < Count && Set[Lo].From < End;
 }
 
 // Whether [From, From + Bytes) can be read: committed, readable memory all through (VirtualQuery) - what the engine's
@@ -32962,13 +35969,12 @@ static UBOOL RoundReadable(size_t From, size_t Bytes, INT FrameNo)
         GRoundRangeCount  = 0;
         GRoundBadCount    = 0;
     }
-    for (INT i = 0; i < GRoundRangeCount; i++)
-        if (From >= GRoundRanges[i].From && End <= GRoundRanges[i].To)
-            return 1;
-    // A stretch that reaches into memory found not readable: not readable, whatever else it takes in.
-    for (INT i = 0; i < GRoundBadCount && i < 16; i++)
-        if (From < GRoundBad[i].To && End > GRoundBad[i].From)
-            return 0;
+    // A stretch that reaches into memory found not readable: not readable, whatever else it takes in - asked first, so
+    // that memory found given back later in the frame counts against a stretch found readable before it.
+    if (RoundRangeMeets(GRoundBad, GRoundBadCount, From, End))
+        return 0;
+    if (RoundRangeHolds(GRoundRanges, GRoundRangeCount, From, End))
+        return 1;
     const DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                            PAGE_EXECUTE_WRITECOPY;
     size_t At = From, RunFrom = 0;
@@ -32979,20 +35985,27 @@ static UBOOL RoundReadable(size_t From, size_t Bytes, INT FrameNo)
             return 0;
         if (Info.State != MEM_COMMIT || (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(Info.Protect & Readable))
         {
-            GRoundBad[GRoundBadCount++ % 16] = { (size_t)Info.BaseAddress, (size_t)Info.BaseAddress + Info.RegionSize };
+            RoundRangeKeep(GRoundBad, GRoundBadCount, (size_t)Info.BaseAddress,
+                           (size_t)Info.BaseAddress + Info.RegionSize);
             return 0;
         }
         if (At == From)
             RunFrom = (size_t)Info.BaseAddress;
         At = (size_t)Info.BaseAddress + Info.RegionSize;
     }
-    GRoundRanges[(GRoundRangeCount < 16) ? GRoundRangeCount++ : (INT)(From >> 12) % 16] = { RunFrom, At };
+    RoundRangeKeep(GRoundRanges, GRoundRangeCount, RunFrom, At);
     return 1;
 }
 
 // Whether the engine's samples of model R lie from Base on, a Stride apart: at MeshChecks of its vertices spread over
 // it, the engine's own normal against the one R's faces give in the places read there - too many off, or a place that
-// is no number, and it is not. False as soon as it cannot be any more.
+// is no number, and it is not. False as soon as it cannot be any more. The answer does not hang on the order the
+// vertices are looked at in, and they are looked at from the last back: a model the engine draws far off in a thinner
+// shape keeps its first vertices, and a guess at it shows wrong at the last ones. A vertex out of the view the engine
+// leaves with a normal not of unit length (longer than two, or no number), and such a vertex tells nothing: where fewer
+// than half of those vertices have a normal to hold against - a model the view leaves mostly outside, as the player
+// turns from it - as many again are looked at between them, and so on (MeshChecksMost), with no more off allowed in
+// all; a round only where the model has vertices enough that none is looked at twice.
 static UBOOL RoundSamplesAgree(const RdxMeshRound::FModel& M, size_t Base, INT Stride)
 {
     RdxMeshRound::FPose P;
@@ -33000,41 +36013,165 @@ static UBOOL RoundSamplesAgree(const RdxMeshRound::FModel& M, size_t Base, INT S
     P.Stride     = Stride;
     INT Checked  = 0, Off = 0;
     const INT MostOff = MeshChecks / 4;
-    for (INT k = 0; k < MeshChecks; k++)
+    for (INT Spread = MeshChecks; Spread <= MeshChecksMost && Checked < MeshChecks / 2; Spread *= 2)
     {
-        const INT              v = (INT)(((QWORD)(2 * k + 1) * (QWORD)M.Verts) / (QWORD)(2 * MeshChecks));
-        const FTransTexture&   S = *(const FTransTexture*)(Base + (size_t)v * (size_t)Stride);
-        const RdxMeshRound::FV Q = P.At(v);
-        if (!(Abs(Q.X) < 1e7f && Abs(Q.Y) < 1e7f && Abs(Q.Z) < 1e7f))
-            return 0;
-        const FVector E(S.Normal.X, S.Normal.Y, S.Normal.Z);
-        const FLOAT   L = E.Size();
-        if (!(L > 0.5f && L < 2.0f) || M.VertStart[v] == M.VertStart[v + 1])
-            continue;
-        const RdxMeshRound::FV N = M.PlainNormal(P, v);
-        if (RdxMeshRound::Dot(N, N) == 0.0f)
-            continue;
-        Checked++;
-        if (Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) < MeshCheckCos * L && ++Off > MostOff)
-            return 0;
+        if (Spread > MeshChecks && M.Verts < 2 * Spread)
+            break;
+        for (INT k = Spread - 1; k >= 0; k--)
+        {
+            const INT              v = (INT)(((QWORD)(2 * k + 1) * (QWORD)M.Verts) / (QWORD)(2 * Spread));
+            const FTransTexture&   S = *(const FTransTexture*)(Base + (size_t)v * (size_t)Stride);
+            const RdxMeshRound::FV Q = P.At(v);
+            if (!(Abs(Q.X) < 1e7f && Abs(Q.Y) < 1e7f && Abs(Q.Z) < 1e7f))
+                return 0;
+            const FVector E(S.Normal.X, S.Normal.Y, S.Normal.Z);
+            const FLOAT   L = RootOf(E.X * E.X + E.Y * E.Y + E.Z * E.Z);   // FVector::Size, laid in
+            if (!(L > 0.5f && L < 2.0f) || M.VertStart[v] == M.VertStart[v + 1])
+                continue;
+            const RdxMeshRound::FV N = M.PlainNormal(P, v);
+            if (RdxMeshRound::Dot(N, N) == 0.0f)
+                continue;
+            Checked++;
+            if (Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) < MeshCheckCos * L && ++Off > MostOff)
+                return 0;
+        }
     }
     return Checked >= MeshChecks / 2;
 }
 
-// Which model a draw's first triangle is of, and where its samples lie: into GRoundDraw. False: not known.
-static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, INT FrameNo)
+// The measurement (GRoundTrace) of a guess RoundSamplesAgree turned away: at the same vertices, how many degrees the
+// engine's normal stands off the one the model's faces give there, into Out - else -1 a vertex of no face, -2 a normal
+// shorter than a half, -3 one longer than two or no number - and each sample's clipping flags into Flags.
+static void RoundSampleAngles(const RdxMeshRound::FModel& M, size_t Base, INT Stride, INT* Out, INT* Flags)
+{
+    RdxMeshRound::FPose P;
+    P.Base   = (const char*)Base;
+    P.Stride = Stride;
+    for (INT k = 0; k < MeshChecks; k++)
+    {
+        const INT              v = (INT)(((QWORD)(2 * k + 1) * (QWORD)M.Verts) / (QWORD)(2 * MeshChecks));
+        const FTransTexture&   S = *(const FTransTexture*)(Base + (size_t)v * (size_t)Stride);
+        const FVector          E(S.Normal.X, S.Normal.Y, S.Normal.Z);
+        const FLOAT            L = RootOf(E.X * E.X + E.Y * E.Y + E.Z * E.Z);
+        Flags[k]                 = S.Flags;
+        Out[k]                   = (M.VertStart[v] == M.VertStart[v + 1]) ? -1 : (L <= 0.5f) ? -2 : !(L < 2.0f) ? -3 : 0;
+        if (Out[k] < 0)
+            continue;
+        const RdxMeshRound::FV N  = M.PlainNormal(P, v);
+        const FLOAT            NL = RootOf(RdxMeshRound::Dot(N, N));
+        if (!(NL > 0.0f))
+            continue;
+        const FLOAT C = Clamp(Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) / (L * NL), 0.0f, 1.0f);
+        Out[k]        = (INT)(acosf(C) * 180.0f / PI + 0.5f);
+    }
+}
+
+// Whether model R's kept edges (CheckA, CheckB), read in the samples from Base on, are of one scale with the lengths they
+// had: no more than an eighth of them off the middle one's scale by MeshLengthGive. The normals alone let a wrong guess
+// through where the model's faces lie in a few planes - a logo's letters, whose places elsewhere have the same normals -
+// and its faces are then drawn from places of other parts, as slivers and lumps. True where none were kept yet.
+static UBOOL RoundLengthsAgree(const FRoundModel& R, size_t Base, INT Stride)
+{
+    if (R.CheckCount < MESH_LENGTH_CHECKS / 2)
+        return 1;
+    FLOAT Scale[MESH_LENGTH_CHECKS];
+    for (INT k = 0; k < R.CheckCount; k++)
+    {
+        const FVector A = ((const FTransTexture*)(Base + (size_t)R.CheckA[k] * (size_t)Stride))->Point;
+        const FVector B = ((const FTransTexture*)(Base + (size_t)R.CheckB[k] * (size_t)Stride))->Point;
+        const FLOAT   L = (A - B).Size();
+        if (!(L < 1e7f))
+            return 0;
+        // In rising order as they come.
+        INT At = k;
+        while (At > 0 && Scale[At - 1] > L / R.CheckLength[k])
+        {
+            Scale[At] = Scale[At - 1];
+            At--;
+        }
+        Scale[At] = L / R.CheckLength[k];
+    }
+    const FLOAT Mid = Scale[R.CheckCount / 2];
+    if (!(Mid > 0.0f))
+        return 0;
+    INT Off = 0;
+    for (INT k = 0; k < R.CheckCount; k++)
+        Off += (Abs(Scale[k] - Mid) > MeshLengthGive * Mid) ? 1 : 0;
+    return Off <= R.CheckCount / 8;
+}
+
+// A check that reads the engine's memory where a guess says a draw's samples lie, taken as a wrong guess where a read
+// faults: memory RoundReadable found readable may have been given back since, later in the same frame - the engine
+// frees memory while a frame is drawn (its scripts run between the world's models and the overlay's), and a wrong
+// guess reaches past the samples into its other blocks. Only a fault of reading is caught; anything else goes on.
+template <class FCheck>
+static UBOOL RoundReadsAgree(const FCheck& Check)
+{
+    __try
+    {
+        return Check();
+    }
+    __except (::GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        return 0;
+    }
+}
+
+// A draw known: model R's samples from Base on, Stride apart, its actor's place View in the frame's view and its reach -
+// into GRoundDraw, with the samples' places as they stand now (GRoundSnap): its later triangles are told from another
+// draw's by them.
+static void RoundKnown(const FSceneNode* Frame, INT FrameNo, FRoundModel* R, size_t Base, INT Stride, const FVector& View,
+                       FLOAT Reach, AActor* Actor)
+{
+    FRoundDraw D = {};
+    D.Frame      = Frame;
+    D.FrameNo    = FrameNo;
+    D.Model      = R;
+    D.Base       = Base;
+    D.Stride     = Stride;
+    D.Verts      = R->Model->Verts;
+    D.View       = View;
+    D.Reach      = Reach * 1.25f + 16.0f;
+    D.Bound      = Reach * 1.5f + 16.0f;
+    D.bLive      = 1;
+    D.Actor      = Actor;
+    D.Stamp      = ++GRoundDrawStamp;
+    if (!D.Stamp)
+        D.Stamp = ++GRoundDrawStamp;
+    GRoundDraw   = D;
+    R->LastBase       = Base;
+    R->LastFrame      = FrameNo;
+    R->LastForward[0] = Frame->Coords.ZAxis.X;
+    R->LastForward[1] = Frame->Coords.ZAxis.Y;
+    R->LastForward[2] = Frame->Coords.ZAxis.Z;
+    if (GRoundSnapRoom < D.Verts)
+    {
+        FVector* const More = (FVector*)appRealloc(GRoundSnap, sizeof(FVector) * D.Verts, TEXT("RdxRoundSnap"));
+        if (More)
+        {
+            GRoundSnap     = More;
+            GRoundSnapRoom = D.Verts;
+        }
+    }
+    GRoundSnapOk = GRoundSnapRoom >= D.Verts && RoundReadsAgree([&]() -> UBOOL {
+                       for (INT v = 0; v < D.Verts; v++)
+                           GRoundSnap[v] = ((const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride))->Point;
+                       return 1;
+                   });
+}
+
+// The models whose reach takes in place P0 of Frame's view, the nearest for their size first - a few (ROUND_NEAREST),
+// into Near, NearOff, NearView and NearReach, their count returned; how many models take it in at all into Within. The
+// viewer's own things (the weapon in hand) are placed just before they are drawn: their places are taken anew.
+enum { ROUND_NEAREST = 4 };
+static INT RoundNearModels(const FSceneNode* Frame, const FVector& P0, INT FrameNo, AActor** Near, FLOAT* NearOff,
+                           FVector* NearView, FLOAT* NearReach, INT& Within)
 {
     RoundListActors(Frame, FrameNo);
     RoundPlaceActors(Frame, FrameNo);
-    const FVector& P0 = Pts[0]->Point;
-    // The models whose reach takes in the corner, the nearest for their size first - a few. The viewer's own things
-    // (the weapon in hand) are placed just before they are drawn: their places are taken anew.
-    enum { NEAREST = 4 };
-    AActor*        Near[NEAREST];
-    FLOAT          NearOff[NEAREST];
-    static FVector NearView[NEAREST];   // made once (an FVector array is made through calls into Core.dll)
-    FLOAT          NearReach[NEAREST];
-    INT            NearCount = 0;
+    enum { NEAREST = ROUND_NEAREST };
+    INT NearCount = 0;
+    Within        = 0;
     auto           Consider  = [&](AActor* A, const FVector& View, FLOAT Reach)
     {
         // Farther than the reach along one axis, and so farther in all: turned away before the distance is asked of the
@@ -33042,9 +36179,11 @@ static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, I
         const FLOAT Lim = Reach * 1.25f + 16.0f;
         if (Abs(View.X - P0.X) > Lim || Abs(View.Y - P0.Y) > Lim || Abs(View.Z - P0.Z) > Lim)
             return;
-        const FLOAT Dist = (View - P0).Size();
+        const FVector D    = View - P0;
+        const FLOAT   Dist = RootOf(D.X * D.X + D.Y * D.Y + D.Z * D.Z);   // FVector::Size, laid in
         if (!(Dist <= Reach * 1.25f + 16.0f))
             return;
+        Within++;
         const FLOAT Off = Dist / (Reach + 16.0f);
         INT         At  = NearCount;
         while (At > 0 && NearOff[At - 1] > Off)
@@ -33065,24 +36204,106 @@ static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, I
         NearCount     = Min(NearCount + 1, (INT)NEAREST);
     };
     APlayerPawn* const Viewer = Frame->Viewport ? Frame->Viewport->Actor : nullptr;
-    for (INT w = 0; w < GRoundWorthCount; w++)
+    // Consider's first test, four of the listed models at a time on their rows (RoundPlaceActors), before an actor itself
+    // is read: most of the frame's models are far from the corner. The same numbers as Consider's: a model it lets
+    // through is near by that test, and they are taken in the list's order.
     {
-        const FRoundActor& R = GRoundActors[GRoundWorth[w]];
-        if (!(Viewer && R.Actor->Owner == Viewer && R.Actor->IsA(AInventory::StaticClass())))
-            Consider(R.Actor, R.View, R.Reach);
+        const __m128 Sign = _mm_set1_ps(-0.0f);
+        const __m128 PX = _mm_set1_ps(P0.X), PY = _mm_set1_ps(P0.Y), PZ = _mm_set1_ps(P0.Z);
+        for (INT w0 = 0; w0 < GRoundWorthCount; w0 += 4)
+        {
+            const __m128 Lim = _mm_loadu_ps(GRoundWorthLim + w0);
+            const __m128 FarX =
+                _mm_cmpgt_ps(_mm_andnot_ps(Sign, _mm_sub_ps(_mm_loadu_ps(GRoundWorthX + w0), PX)), Lim);
+            const __m128 FarY =
+                _mm_cmpgt_ps(_mm_andnot_ps(Sign, _mm_sub_ps(_mm_loadu_ps(GRoundWorthY + w0), PY)), Lim);
+            const __m128 FarZ =
+                _mm_cmpgt_ps(_mm_andnot_ps(Sign, _mm_sub_ps(_mm_loadu_ps(GRoundWorthZ + w0), PZ)), Lim);
+            const INT Close = ~_mm_movemask_ps(_mm_or_ps(_mm_or_ps(FarX, FarY), FarZ)) & 15;
+            for (INT k = 0; k < 4 && Close; k++)
+            {
+                const INT w = w0 + k;
+                if (!(Close & (1 << k)) || w >= GRoundWorthCount)
+                    continue;
+                const FRoundActor& R = GRoundActors[GRoundWorth[w]];
+                // The player's own body in first person is not in the main view's picture (a mirror's has it), yet it
+                // stands at the camera: as a guess for the triangles near the player it would take one of the few
+                // places of the models really drawn there.
+                const UBOOL bOwnBody = Viewer && R.Actor == Viewer && !Viewer->bBehindView && !Frame->Parent;
+                if (!bOwnBody && !(Viewer && R.Actor->Owner == Viewer && R.Actor->IsA(AInventory::StaticClass())))
+                    Consider(R.Actor, R.View, R.Reach);
+            }
+        }
     }
     if (Viewer)
     {
-        INT Guard = 0;
-        for (AInventory* I = Viewer->Inventory; I && Guard < 256; I = I->Inventory, Guard++)
-            if (I->DrawType == DT_Mesh && I->Mesh && !I->bDeleteMe)
+        if (GRoundCarriedFrame != Frame || GRoundCarriedFrameNo != FrameNo)
+        {
+            GRoundCarriedFrame   = Frame;
+            GRoundCarriedFrameNo = FrameNo;
+            GRoundCarriedCount   = 0;
+        }
+        // Of what the player carries only what is in hand is drawn - the weapon, or the item the game holds in its
+        // inHand (and inHandPending while one is brought up). The rest stands at the player's place too, undrawn, and
+        // as guesses would take the places of the models really drawn near the player.
+        static FPropCache GPropInHand, GPropInHandPending;
+        AInventory*       InHand = nullptr, *Pending = nullptr;
+        if (UObjectProperty* const P = Cast<UObjectProperty>(
+                CachedProperty(GPropInHand, Viewer->GetClass(), TEXT("inHand"), TEXT("models rounded"))))
+            InHand = Cast<AInventory>(*(UObject**)((BYTE*)Viewer + P->Offset));
+        if (UObjectProperty* const P = Cast<UObjectProperty>(
+                CachedProperty(GPropInHandPending, Viewer->GetClass(), TEXT("inHandPending"), TEXT("models rounded"))))
+            Pending = Cast<AInventory>(*(UObject**)((BYTE*)Viewer + P->Offset));
+        INT Guard = 0, Kept = 0;
+        for (AInventory* I = Viewer->Inventory; I && Guard < ROUND_CARRIED; I = I->Inventory, Guard++)
+            if (I->DrawType == DT_Mesh && I->Mesh && !I->bDeleteMe &&
+                (I == Viewer->Weapon || I == InHand || I == Pending))
             {
-                const FVector View  = I->Location.TransformPointBy(Frame->Coords);
-                const FLOAT   Reach = RoundReachOf(I);
+                FRoundCarried& C       = GRoundCarried[Kept];
+                DWORD          Made[6];
+                memcpy(&Made[0], &I->Location.X, sizeof(FLOAT));
+                memcpy(&Made[1], &I->Location.Y, sizeof(FLOAT));
+                memcpy(&Made[2], &I->Location.Z, sizeof(FLOAT));
+                memcpy(&Made[3], &I->DrawScale, sizeof(FLOAT));
+                memcpy(&Made[4], &I->CollisionRadius, sizeof(FLOAT));
+                memcpy(&Made[5], &I->CollisionHeight, sizeof(FLOAT));
+                if (Kept >= GRoundCarriedCount || C.Item != I || C.Mesh != I->Mesh || memcmp(C.Made, Made, sizeof(Made)))
+                {
+                    const FVector Placed = I->Location.TransformPointBy(Frame->Coords);
+                    C.Item               = I;
+                    C.Mesh               = I->Mesh;
+                    memcpy(C.Made, Made, sizeof(Made));
+                    C.View[0]          = Placed.X;
+                    C.View[1]          = Placed.Y;
+                    C.View[2]          = Placed.Z;
+                    C.Reach            = RoundReachOf(I);
+                    GRoundCarriedCount = Max(GRoundCarriedCount, Kept + 1);
+                }
+                Kept++;
+                const FVector View(C.View[0], C.View[1], C.View[2]);
+                const FLOAT   Reach = C.Reach;
+                // Consider's first test before the view is asked: most of what the viewer carries is far from the corner.
+                const FLOAT Lim = Reach * 1.25f + 16.0f;
+                if (Abs(View.X - P0.X) > Lim || Abs(View.Y - P0.Y) > Lim || Abs(View.Z - P0.Z) > Lim)
+                    continue;
                 if (RoundWorthAt(Frame, View, Reach))
                     Consider(I, View, Reach);
             }
     }
+    return NearCount;
+}
+
+// Which model a draw's first triangle is of, and where its samples lie: into GRoundDraw. False: not known.
+static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, INT FrameNo)
+{
+    const FVector& P0 = Pts[0]->Point;
+    enum { NEAREST = ROUND_NEAREST };
+    AActor*        Near[NEAREST];
+    FLOAT          NearOff[NEAREST];
+    static FVector NearView[NEAREST];   // made once (an FVector array is made through calls into Core.dll)
+    FLOAT          NearReach[NEAREST];
+    INT            Within    = 0;
+    const INT      NearCount = RoundNearModels(Frame, P0, FrameNo, Near, NearOff, NearView, NearReach, Within);
     if (NearCount == 0)
     {
         GRoundNoActor++;
@@ -33108,33 +36329,55 @@ static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, I
     // The triangle's corners by address - in the order of the guessed face's vertices, rising.
     const FTransTexture* const ByAddress[3] = { (const FTransTexture*)O[0], (const FTransTexture*)O[1],
                                                 (const FTransTexture*)O[2] };
+    // The engine's normals at the triangle's corners and their lengths: the same for every guess, read at the first.
+    // Plain numbers: an FVector array is made through calls into Core.dll.
+    FLOAT CornerNormal[3][3], CornerLength[3];
+    UBOOL bCornersRead = 0;
     // Whether the engine's normals at the triangle's corners agree with the ones model M's faces give at vertices
     // S[0..2], in the array from Base - the cheapest way a wrong guess shows.
     auto CornersAgree = [&](const RdxMeshRound::FModel& M, size_t Base, const int* S)
     {
+        if (!bCornersRead)
+        {
+            for (INT k = 0; k < 3; k++)
+            {
+                const FLOAT X = ByAddress[k]->Normal.X, Y = ByAddress[k]->Normal.Y, Z = ByAddress[k]->Normal.Z;
+                CornerNormal[k][0] = X;
+                CornerNormal[k][1] = Y;
+                CornerNormal[k][2] = Z;
+                CornerLength[k]    = RootOf(X * X + Y * Y + Z * Z);   // FVector::Size, laid in
+            }
+            bCornersRead = 1;
+        }
         RdxMeshRound::FPose P;
         P.Base   = (const char*)Base;
         P.Stride = Stride;
         for (INT k = 0; k < 3; k++)
         {
-            const FVector E(ByAddress[k]->Normal.X, ByAddress[k]->Normal.Y, ByAddress[k]->Normal.Z);
-            const FLOAT   L = E.Size();
+            const FLOAT* const E = CornerNormal[k];
+            const FLOAT        L = CornerLength[k];
             if (!(L > 0.5f && L < 2.0f))
                 continue;
             const RdxMeshRound::FV N = M.PlainNormal(P, S[k]);
-            if (Abs(N.X * E.X + N.Y * E.Y + N.Z * E.Z) < MeshCheckCos * L)
+            if (Abs(N.X * E[0] + N.Y * E[1] + N.Z * E[2]) < MeshCheckCos * L)
                 return 0;
         }
         return 1;
     };
     INT Guesses = 0;
     // Each model's faces so numbered (-1: it has no faces to know), and its guesses that were off: memory that is not
-    // readable, the engine's normals at the triangle's corners, at the model's samples (the measurement, GRoundTrace).
-    INT NearSig[NEAREST] = {}, NearBad[NEAREST][3] = {};
+    // readable, the engine's normals at the triangle's corners, at the model's samples, its kept edges' lengths (the
+    // measurement, GRoundTrace).
+    INT NearSig[NEAREST] = {}, NearBad[NEAREST][4] = {};
+    // And the measurement's angles of the first guess turned away at the samples (RoundSampleAngles).
+    INT          NearAngles[NEAREST][MeshChecks], NearFlags[NEAREST][MeshChecks];
+    UBOOL        NearAngled[NEAREST] = {};
+    FRoundModel* NearModel[NEAREST]  = {};
     for (INT n = 0; n < NearCount; n++)
     {
         FRoundModel* const R = RoundModelOf(Near[n]->Mesh);
         NearSig[n]           = -1;
+        NearModel[n]         = R;
         if (!R || !R->Model)
             continue;
         const RdxMeshRound::FModel& M     = *R->Model;
@@ -33143,7 +36386,7 @@ static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, I
         NearSig[n]                        = Count;
         size_t      Tried[MeshMostGuesses];
         INT         TriedCount = 0;
-        for (INT i = 0; i < Count && Guesses < MeshMostGuesses; i++)
+        for (INT i = 0; i < Count && TriedCount < MeshMostGuesses; i++)
         {
             int S[3];
             RdxMeshRound::Sorted(M.Corner[Faces[i] * 3], M.Corner[Faces[i] * 3 + 1], M.Corner[Faces[i] * 3 + 2], S);
@@ -33159,50 +36402,68 @@ static UBOOL RoundFindDraw(const FSceneNode* Frame, FTransTexture* const* Pts, I
             Guesses++;
             GRoundGuesses++;
             const UBOOL bRead    = RoundReadable(Base, (size_t)M.Verts * (size_t)Stride, FrameNo);
-            const UBOOL bCorners = bRead && CornersAgree(M, Base, S);
-            if (!bCorners || !RoundSamplesAgree(M, Base, Stride))
+            const UBOOL bCorners = bRead && RoundReadsAgree([&]() -> UBOOL { return CornersAgree(M, Base, S); });
+            const UBOOL bSamples =
+                bCorners && RoundReadsAgree([&]() -> UBOOL { return RoundSamplesAgree(M, Base, Stride); });
+            if (!bSamples || !RoundReadsAgree([&]() -> UBOOL { return RoundLengthsAgree(*R, Base, Stride); }))
             {
                 GRoundGuessesBad++;
-                NearBad[n][!bRead ? 0 : !bCorners ? 1 : 2]++;
+                NearBad[n][!bRead ? 0 : !bCorners ? 1 : !bSamples ? 2 : 3]++;
+                if (GRoundTrace && bCorners && !bSamples && !NearAngled[n])
+                    NearAngled[n] = RoundReadsAgree([&]() -> UBOOL {
+                        RoundSampleAngles(M, Base, Stride, NearAngles[n], NearFlags[n]);
+                        return 1;
+                    });
                 continue;
             }
-            FRoundDraw D = {};
-            D.Frame      = Frame;
-            D.FrameNo    = FrameNo;
-            D.Model      = R;
-            D.Base       = Base;
-            D.Stride     = Stride;
-            D.Verts      = M.Verts;
-            D.View       = NearView[n];
-            D.Reach      = NearReach[n] * 1.25f + 16.0f;
-            D.Bound      = NearReach[n] * 1.5f + 16.0f;
-            D.bLive      = 1;
-            GRoundDraw   = D;
-            // The draw's samples' places as they stand now: its later triangles are told from another draw's by them.
-            if (GRoundSnapRoom < D.Verts)
-            {
-                FVector* const More = (FVector*)appRealloc(GRoundSnap, sizeof(FVector) * D.Verts, TEXT("RdxRoundSnap"));
-                if (More)
-                {
-                    GRoundSnap     = More;
-                    GRoundSnapRoom = D.Verts;
-                }
-            }
-            GRoundSnapOk = GRoundSnapRoom >= D.Verts;
-            for (INT v = 0; v < D.Verts && GRoundSnapOk; v++)
-                GRoundSnap[v] = ((const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride))->Point;
+            if (GRoundTrace && R->LastBase && R->LastBase != Base && R->LastFrame >= FrameNo - 1)
+                RDX_LOGF("round trace: frame %i, %s known %lld samples off where it was in frame %i - guess %i of %i "
+                         "faces so numbered, its samples %i and %i apart",
+                         FrameNo, Near[n]->GetName(),
+                         (long long)(((INT64)Base - (INT64)R->LastBase) / (INT64)Stride), R->LastFrame, i + 1, Count,
+                         D1, D2);
+            RoundKnown(Frame, FrameNo, R, Base, Stride, NearView[n], NearReach[n], Near[n]);
             return 1;
         }
     }
-    if (GRoundTrace && GRoundTraceDetails < ROUND_TRACE_DETAILS)
+    GRoundTraceFails++;
+    UBOOL bDetail = GRoundTrace && GRoundTraceDetails < ROUND_TRACE_DETAILS && (GRoundTraceFails & 3) == (FrameNo & 3);
+    for (INT k = 0; k < GRoundTraceDetails && bDetail; k++)
+        bDetail = GRoundTraceDetailed[k] != Near[0];
+    if (bDetail)
     {
-        GRoundTraceDetails++;
-        RDX_LOGF("round trace: frame %i, a draw not known at (%.0f %.0f %.0f), its samples %i and %i apart, %i guesses",
-                 FrameNo, P0.X, P0.Y, P0.Z, D1, D2, Guesses);
+        GRoundTraceDetailed[GRoundTraceDetails++] = Near[0];
+        RDX_LOGF("round trace: frame %i, a draw not known at (%.0f %.0f %.0f), its samples %i and %i apart, %i guesses; "
+                 "%i models' reach takes it in, the %i nearest asked",
+                 FrameNo, P0.X, P0.Y, P0.Z, D1, D2, Guesses, Within, NearCount);
         for (INT n = 0; n < NearCount; n++)
+        {
             RDX_LOGF("round trace:   %s (%.2f of its reach off): %i faces so numbered; guesses off: %i unreadable, %i "
-                     "at the corners, %i at the samples",
-                     Near[n]->GetName(), NearOff[n], NearSig[n], NearBad[n][0], NearBad[n][1], NearBad[n][2]);
+                     "at the corners, %i at the samples, %i at the edges' lengths",
+                     Near[n]->GetName(), NearOff[n], NearSig[n], NearBad[n][0], NearBad[n][1], NearBad[n][2],
+                     NearBad[n][3]);
+            if (!NearAngled[n])
+                continue;
+            // The first guess turned away at the samples: each checked vertex's angle between the engine's normal and the
+            // faces', and how far the view has turned since a draw of the model was last known.
+            TCHAR Angles[96] = { 0 }, Clips[96] = { 0 };
+            for (INT k = 0; k < MeshChecks; k++)
+            {
+                TCHAR One[12];
+                appSprintf(One, TEXT("%s%i"), k ? TEXT(" ") : TEXT(""), NearAngles[n][k]);
+                appStrcat(Angles, One);
+                appSprintf(One, TEXT("%s%02x"), k ? TEXT(" ") : TEXT(""), NearFlags[n][k]);
+                appStrcat(Clips, One);
+            }
+            const FRoundModel* const R = NearModel[n];
+            const FLOAT Dot = (R && R->LastFrame > 0) ? R->LastForward[0] * Frame->Coords.ZAxis.X +
+                                                            R->LastForward[1] * Frame->Coords.ZAxis.Y +
+                                                            R->LastForward[2] * Frame->Coords.ZAxis.Z
+                                                      : 1.0f;
+            RDX_LOGF("round trace:     its normals off the faces' by (degrees; -1 no face, -2 short, -3 long): %s; their "
+                     "clipping flags %s; the view turned %.1f degrees since it was last known (frame %i)",
+                     Angles, Clips, acosf(Clamp(Dot, -1.0f, 1.0f)) * 180.0f / PI, R ? R->LastFrame : -1);
+        }
     }
     GRoundNoFace++;
     return 0;
@@ -33295,6 +36556,51 @@ static UBOOL RoundProjection(const FSceneNode* Frame, FTransTexture* const* Pts,
     return 1;
 }
 
+// Whether the measurement (GRoundTrace) tells of what befell a polygon of actor A (What: which of its lines) in frame
+// FrameNo: in one frame of every RoundTraceEvery for each actor and line, at most RoundTraceFrameMost times in it - the
+// scene's steady state is told, not only its first frames; at most RoundTraceMost times in all.
+static const INT RoundTraceEvery = 120, RoundTraceFrameMost = 8, RoundTraceMost = 2000;
+static UBOOL RoundTraceDue(const AActor* A, INT What, INT FrameNo)
+{
+    struct FSaid
+    {
+        const AActor* Actor;
+        INT           What, FrameNo, Count;
+    };
+    enum { SAID_ROOM = 32 };
+    static FSaid Said[SAID_ROOM];
+    static INT   SaidCount = 0, Told = 0, Next = 0;
+    if (Told >= RoundTraceMost)
+        return 0;
+    for (INT i = 0; i < SaidCount; i++)
+    {
+        FSaid& S = Said[i];
+        if (S.Actor != A || S.What != What)
+            continue;
+        if (S.FrameNo == FrameNo)
+        {
+            if (S.Count >= RoundTraceFrameMost)
+                return 0;
+            S.Count++;
+            Told++;
+            return 1;
+        }
+        if (FrameNo > S.FrameNo && FrameNo - S.FrameNo < RoundTraceEvery)
+            return 0;
+        S.FrameNo = FrameNo;
+        S.Count   = 1;
+        Told++;
+        return 1;
+    }
+    FSaid& S = Said[(SaidCount < SAID_ROOM) ? SaidCount++ : (Next++ % SAID_ROOM)];
+    S.Actor   = A;
+    S.What    = What;
+    S.FrameNo = FrameNo;
+    S.Count   = 1;
+    Told++;
+    return 1;
+}
+
 // The traced frame's lines (GRoundTrace): its tries, and each model with what became of its polygons.
 static void RoundTraceSay()
 {
@@ -33315,6 +36621,7 @@ static void RoundTraceSay()
     }
     GRoundTraceRowCount  = 0;
     GRoundTraceDetails   = 0;
+    GRoundTraceFails     = 0;
     GRoundTraceHeldRound = 0;
     GRoundTraceHeldFlat  = 0;
 }
@@ -33375,6 +36682,143 @@ static void RoundFrameStart(INT FrameNo)
         ForgetRoundModels();
         GRoundShapesAngle = GSpherifierAngle;
         GRoundShapesCap   = SpherifierCap();
+    }
+}
+
+static FMeshBevel* MeshBevelOf(FRoundModel& M, const FRoundDraw& D, const FSceneNode* Frame);
+
+// What a draw just known needs before its polygons are drawn (RoundTriangle; RoundPolygon's pieces): its model's shape,
+// made once from the first pose it was known in; whether it is drawn as a model of flat parts, and its fine bevel; the
+// draw's projection from Pts, three corners of its first polygon; a curved one's pose.
+static void RoundDrawMade(const FSceneNode* Frame, FTransTexture* const* Pts, FLOAT OffX, FLOAT OffY)
+{
+    FRoundDraw& D = GRoundDraw;
+    GRoundDraws++;
+    FRoundModel&              R = *D.Model;
+    const RdxMeshRound::FPose Here = { (const char*)D.Base, D.Stride };
+    const UBOOL bSane = RoundPoseSane(D);
+    if (!bSane)
+        GRoundInsane++;
+    if (!R.bShaped && bSane)
+    {
+        // A measurement (the marker SecondRevision-mesh-dump.txt): each model as it was first known - its faces,
+        // which are drawn rounded, its vertices' places and the engine's normals there - for the shape's rules to
+        // be looked at off line; into the temp folder, beside the marker, not the game's.
+        static const UBOOL bDump = FreshMarker(L"SecondRevision-mesh-dump.txt");
+        if (bDump)
+        {
+            static FILE* Bin = []() -> FILE* {
+                WCHAR       Path[MAX_PATH + 64];
+                const DWORD N = ::GetTempPathW(MAX_PATH, Path);
+                if (N == 0 || N >= MAX_PATH)
+                    return nullptr;
+                ::lstrcatW(Path, L"SecondRevision-mesh-round.bin");
+                return _wfopen(Path, L"wb");
+            }();
+            if (Bin)
+            {
+                const RdxMeshRound::FModel& M = *R.Model;
+                const INT Head[3] = { 0x444E524D, M.Verts, M.Faces };
+                fwrite(Head, sizeof(INT), 3, Bin);
+                char Name[64];
+                appMemzero(Name, sizeof(Name));
+                const TCHAR* const MeshName = R.Mesh->GetName();
+                for (INT i = 0; i < 63 && MeshName[i]; i++)
+                    Name[i] = (char)MeshName[i];
+                fwrite(Name, 1, 64, Bin);
+                fwrite(M.Corner.Data, sizeof(int), (size_t)M.Faces * 3, Bin);
+                fwrite(R.Round, 1, (size_t)M.Faces, Bin);
+                for (INT v = 0; v < M.Verts; v++)
+                {
+                    const FTransTexture& S = *(const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride);
+                    const FLOAT          Q[6] = { S.Point.X, S.Point.Y, S.Point.Z, S.Normal.X, S.Normal.Y,
+                                                  S.Normal.Z };
+                    fwrite(Q, sizeof(FLOAT), 6, Bin);
+                }
+                fflush(Bin);
+            }
+        }
+        // The edges a later guess is held against, from this pose (RoundLengthsAgree).
+        {
+            const RdxMeshRound::FModel& M = *R.Model;
+            R.CheckCount                  = 0;
+            for (INT k = 0; k < MESH_LENGTH_CHECKS && M.Faces > 0; k++)
+            {
+                const INT     f = (INT)(((INT64)(2 * k + 1) * (INT64)M.Faces) / (INT64)(2 * MESH_LENGTH_CHECKS));
+                const INT     a = M.Corner[f * 3], b = M.Corner[f * 3 + 1];
+                const FVector A = ((const FTransTexture*)(D.Base + (size_t)a * (size_t)D.Stride))->Point;
+                const FVector B = ((const FTransTexture*)(D.Base + (size_t)b * (size_t)D.Stride))->Point;
+                const FLOAT   L = (A - B).Size();
+                if (!(L > 1e-3f && L < 1e7f))
+                    continue;
+                R.CheckA[R.CheckCount]      = a;
+                R.CheckB[R.CheckCount]      = b;
+                R.CheckLength[R.CheckCount] = L;
+                R.CheckCount++;
+            }
+        }
+        // The shape, once: from the first pose a draw of the model was known in.
+        R.bShaped                         = 1;
+        RdxMeshRound::FShape* const Shape = new RdxMeshRound::FShape;
+        const INT Most = R.Model->Faces * 3;
+        R.EdgeNo       = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeNo"));
+        R.EdgeStamp    = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeStamp"));
+        R.EdgeSize     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeSize"));
+        R.EdgeRoom     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeRoom"));
+        R.PolyNo       = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyNo"));
+        R.PolyStamp    = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyStamp"));
+        if (R.EdgeStamp)
+            for (INT e = 0; e < Most; e++)
+                R.EdgeStamp[e] = -1;
+        if (R.PolyStamp)
+            for (INT f = 0; f < R.Model->Faces; f++)
+                R.PolyStamp[f] = -1;
+        if (R.EdgeNo && R.EdgeStamp && R.EdgeSize && R.EdgeRoom && R.PolyNo && R.PolyStamp &&
+            Shape->Make(*R.Model, R.Round, Here, (FLOAT)(180 - GSpherifierAngle), (FLOAT)SpherifierCap()))
+        {
+            R.Shape = Shape;
+            Shape->Pose(Here, ++GRoundStamp);
+            R.bCurved = Shape->AnyBow();
+            if (R.bCurved)
+                Shape->MakeRest();
+        }
+        else
+            delete Shape;
+    }
+    D.bFlat = !bSane || !R.Shape || !R.bCurved;
+    if (D.bFlat)
+    {
+        GRoundFlatModel += bSane;
+        // A model all of flat parts is drawn as it always was - but where its fine bevel is made, the faces the
+        // bevel cut as their pieces, on the draw's projection (MeshBevelOut).
+        if (bSane && R.Shape && SphereBevelWanted())
+        {
+            D.Bevel = MeshBevelOf(R, D, Frame);
+            if (D.Bevel && !RoundProjection(Frame, Pts, OffX, OffY, D))
+                D.Bevel = nullptr;
+            // One so far off that the bevel's round is under MeshBevelLeastPixels at its nearest: its triangles as
+            // the engine hands them over - what is not seen is not worked out.
+            const FLOAT Nearest = D.View.Z - D.Reach;
+            if (D.Bevel && Nearest > 0.0f && (FLOAT)SphereBevelRadius * D.Focal < MeshBevelLeastPixels * Nearest)
+                D.Bevel = nullptr;
+        }
+    }
+    else if (!RoundProjection(Frame, Pts, OffX, OffY, D))
+        D.bFlat = 1;
+    else
+    {
+        R.Shape->Pose(Here, ++GRoundStamp);
+        if (R.Shape->Fit())
+            GRoundFits++;
+        // A curved model's fine bevel: its pieces patches of their faces (MeshBevelPatchesOut), bowed as the faces
+        // are in whatever pose (MeshBevelCurvedOn).
+        if (MeshBevelCurvedOn() && SphereBevelWanted())
+        {
+            D.Bevel             = MeshBevelOf(R, D, Frame);
+            const FLOAT Nearest = D.View.Z - D.Reach;
+            if (D.Bevel && Nearest > 0.0f && (FLOAT)SphereBevelRadius * D.Focal < MeshBevelLeastPixels * Nearest)
+                D.Bevel = nullptr;
+        }
     }
 }
 
@@ -33446,87 +36890,11 @@ static UBOOL RoundTriangle(const FSceneNode* Frame, FTransTexture* const* Pts, F
             return 0;
         }
         GRoundFailFrameNo = -1;
-        GRoundDraws++;
-        FRoundModel&              R = *D.Model;
-        const RdxMeshRound::FPose Here = { (const char*)D.Base, D.Stride };
-        const UBOOL bSane = RoundPoseSane(D);
-        if (!bSane)
-            GRoundInsane++;
-        if (!R.bShaped && bSane)
-        {
-            // A measurement (the marker SecondRevision-mesh-dump.txt): each model as it was first known - its faces,
-            // which are drawn rounded, its vertices' places and the engine's normals there - for the shape's rules to
-            // be looked at off line.
-            static const UBOOL bDump = FreshMarker(L"SecondRevision-mesh-dump.txt");
-            if (bDump)
-            {
-                static FILE* Bin = fopen("SecondRevision-mesh-round.bin", "wb");
-                if (Bin)
-                {
-                    const RdxMeshRound::FModel& M = *R.Model;
-                    const INT Head[3] = { 0x444E524D, M.Verts, M.Faces };
-                    fwrite(Head, sizeof(INT), 3, Bin);
-                    char Name[64];
-                    appMemzero(Name, sizeof(Name));
-                    const TCHAR* const MeshName = R.Mesh->GetName();
-                    for (INT i = 0; i < 63 && MeshName[i]; i++)
-                        Name[i] = (char)MeshName[i];
-                    fwrite(Name, 1, 64, Bin);
-                    fwrite(M.Corner.Data, sizeof(int), (size_t)M.Faces * 3, Bin);
-                    fwrite(R.Round, 1, (size_t)M.Faces, Bin);
-                    for (INT v = 0; v < M.Verts; v++)
-                    {
-                        const FTransTexture& S = *(const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride);
-                        const FLOAT          Q[6] = { S.Point.X, S.Point.Y, S.Point.Z, S.Normal.X, S.Normal.Y,
-                                                      S.Normal.Z };
-                        fwrite(Q, sizeof(FLOAT), 6, Bin);
-                    }
-                    fflush(Bin);
-                }
-            }
-            // The shape, once: from the first pose a draw of the model was known in.
-            R.bShaped                         = 1;
-            RdxMeshRound::FShape* const Shape = new RdxMeshRound::FShape;
-            const INT Most = R.Model->Faces * 3;
-            R.EdgeNo       = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeNo"));
-            R.EdgeStamp    = (INT*)appMalloc(sizeof(INT) * Most, TEXT("RdxRoundEdgeStamp"));
-            R.EdgeSize     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeSize"));
-            R.EdgeRoom     = (FLOAT*)appMalloc(sizeof(FLOAT) * Most, TEXT("RdxRoundEdgeRoom"));
-            R.PolyNo       = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyNo"));
-            R.PolyStamp    = (INT*)appMalloc(sizeof(INT) * R.Model->Faces, TEXT("RdxRoundPolyStamp"));
-            if (R.EdgeStamp)
-                for (INT e = 0; e < Most; e++)
-                    R.EdgeStamp[e] = -1;
-            if (R.PolyStamp)
-                for (INT f = 0; f < R.Model->Faces; f++)
-                    R.PolyStamp[f] = -1;
-            if (R.EdgeNo && R.EdgeStamp && R.EdgeSize && R.EdgeRoom && R.PolyNo && R.PolyStamp &&
-                Shape->Make(*R.Model, R.Round, Here, (FLOAT)(180 - GSpherifierAngle), (FLOAT)SpherifierCap()))
-            {
-                R.Shape = Shape;
-                Shape->Pose(Here, ++GRoundStamp);
-                R.bCurved = Shape->AnyBow();
-                if (R.bCurved)
-                    Shape->MakeRest();
-            }
-            else
-                delete Shape;
-        }
-        D.bFlat = !bSane || !R.Shape || !R.bCurved;
-        if (D.bFlat)
-            GRoundFlatModel += bSane;
-        else if (!RoundProjection(Frame, Pts, OffX, OffY, D))
-            D.bFlat = 1;
-        else
-        {
-            R.Shape->Pose(Here, ++GRoundStamp);
-            if (R.Shape->Fit())
-                GRoundFits++;
-        }
+        RoundDrawMade(Frame, Pts, OffX, OffY);
         for (INT k = 0; k < 3; k++)
             J[k] = RoundVertexOf(D, Pts[k]);
     }
-    if (D.bFlat)
+    if (D.bFlat && !D.Bevel)
         return 0;
     // Each triangle on the draw's projection too: one that is not (clipped by the engine) is drawn flat.
     for (INT k = 0; k < 3; k++)
@@ -33545,7 +36913,10 @@ static UBOOL RoundTriangle(const FSceneNode* Frame, FTransTexture* const* Pts, F
     if (F < 0)
     {
         GRoundNotFace++;
-        D.bLive = 0;
+        // A flat model's draw stays known: one far off is drawn of fewer vertices, its triangles none of the model's
+        // faces, and each is drawn flat as all of them were.
+        if (!D.bFlat)
+            D.bLive = 0;
         return 0;
     }
     for (INT c = 0; c < 3; c++)
@@ -33578,27 +36949,45 @@ static UBOOL RoundLooksCut(const FSceneNode* Frame, FTransTexture* const* Pts, I
 // its edges, a seam that moves with the view's edge. The triangle is the face of the draw's model whose plane holds
 // every corner of the polygon and whose inside has them all, the polygon's corners that are samples of the draw among
 // its own. Its texture coordinates, light and fog are carried back from the polygon's: the engine's cut mixes them from
-// the triangle's corners in straight shares, so one such mix must give every corner of the polygon its own. False: no
-// such face, or the polygon off the draw's projection.
-// The whole triangles found for a cut piece that could not be drawn in its place: a corner of theirs behind the camera,
-// or not where its projection puts it (RoundCutFace) - the piece drawn as the engine cut it.
+// the triangle's corners in straight shares, so one such mix must give every corner of the polygon its own. A polygon
+// whose corners stand beyond the draw's reach is another draw's - the engine draws the next model of the same kind into
+// the same array, its first polygons pieces at the view's edge, their corners at the live draw's samples' addresses.
+// False: no such face, the polygon off the draw's projection, or another draw's.
+// The whole triangles found for a cut piece that could not be drawn in its place: a corner of theirs before the near
+// plane, or beyond the draw's reach (RoundCutFace) - the piece drawn as the engine cut it.
 static INT GRoundCutUnseen = 0;
+// Why RoundCutFace last found no whole triangle, and at which of the polygon's corners (-1: none) - for the measurement.
+static const TCHAR* GRoundCutWhy       = TEXT("");
+static INT          GRoundCutWhyCorner = -1;
 static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, FLOAT OffX, FLOAT OffY,
                           FTransTexture* Whole, INT& Face)
 {
-    FRoundDraw& D = GRoundDraw;
-    if (D.bFlat || !D.Model || !D.Model->Shape || !D.Model->Model || NumPts > MAX_POLY_POINTS)
+    FRoundDraw& D      = GRoundDraw;
+    GRoundCutWhyCorner = -1;
+    if ((D.bFlat && !D.Bevel) || !D.Model || !D.Model->Shape || !D.Model->Model || NumPts > MAX_POLY_POINTS)
+    {
+        GRoundCutWhy = (D.bFlat && !D.Bevel) ? TEXT("the draw flat, with no bevel") : TEXT("no shape");
         return 0;
+    }
+    const FLOAT ReachSq = D.Reach * D.Reach;
     for (INT k = 0; k < NumPts; k++)
     {
         const FTransTexture& P = *Pts[k];
+        GRoundCutWhyCorner     = k;
         if (!(P.Point.Z > 1e-3f) || Abs(D.CentreX - OffX + P.Point.X * D.Focal / P.Point.Z - P.ScreenX) > 1.0f ||
             Abs(D.CentreY - OffY + P.Point.Y * D.Focal / P.Point.Z - P.ScreenY) > 1.0f)
         {
             GRoundOffProjection++;
+            GRoundCutWhy = TEXT("a corner off the projection");
+            return 0;
+        }
+        if ((P.Point - D.View).SizeSquared() > ReachSq)
+        {
+            GRoundCutWhy = TEXT("a corner beyond the draw's reach");
             return 0;
         }
     }
+    GRoundCutWhyCorner = -1;
     const RdxMeshRound::FModel& M = *D.Model->Model;
     INT                         J[MAX_POLY_POINTS];
     INT                         Kept = -1;
@@ -33607,6 +36996,14 @@ static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, IN
         J[k] = RoundVertexOf(D, Pts[k]);
         if (J[k] >= 0 && Kept < 0)
             Kept = J[k];
+        // A corner at a sample that no longer holds what it held when the draw was known: the next model's piece
+        // (RoundTriangle's test).
+        if (J[k] >= 0 && GRoundSnapOk && !(Pts[k]->Point == GRoundSnap[J[k]]))
+        {
+            GRoundCutWhy       = TEXT("a corner's sample moved since the draw was known");
+            GRoundCutWhyCorner = k;
+            return 0;
+        }
     }
     auto Sample = [&](INT v) -> const FTransTexture& {
         return *(const FTransTexture*)(D.Base + (size_t)v * (size_t)D.Stride);
@@ -33687,25 +37084,31 @@ static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, IN
         }
         if (!bOk)
             continue;
-        // The whole triangle goes where the piece was by its corners as the engine projected them, so each must stand
-        // before the camera and where its projection puts it: a corner behind the camera - the engine cut the piece
-        // off at the near plane - flings the triangle across the screen. Then the piece is drawn as the engine cut it.
+        // The whole triangle goes where the piece was, so each corner must stand before the near plane (a unit deep,
+        // DepthFromViewZ) - one behind it, where the engine cut the piece off, flings the triangle across the screen -
+        // within the draw's reach, and where it stood when the draw was known. Else the piece is drawn as the engine cut
+        // it. A corner off the view is one the
+        // engine never projected, its place on the screen another draw's: that place is worked out from where it
+        // stands in the view, by the draw's projection. A corner the engine did project keeps the place it gave, the
+        // one its other triangles are drawn at.
         for (INT c = 0; c < 3 && bOk; c++)
         {
             const FTransTexture& S = Sample(C[c]);
-            bOk = S.Point.Z > 1e-3f && Abs(D.CentreX - OffX + S.Point.X * D.Focal / S.Point.Z - S.ScreenX) <= 1.0f &&
-                  Abs(D.CentreY - OffY + S.Point.Y * D.Focal / S.Point.Z - S.ScreenY) <= 1.0f;
+            bOk = S.Point.Z > 1.0f && (S.Point - D.View).SizeSquared() <= ReachSq &&
+                  (!GRoundSnapOk || S.Point == GRoundSnap[C[c]]);
         }
         if (!bOk)
         {
             GRoundCutUnseen++;
+            GRoundCutWhy = TEXT("the whole triangle's corner before the near plane, beyond the reach or moved");
             static INT Told = 0;
             if (Told < 40)
             {
                 Told++;
                 RDX_LOGF("models rounded: frame %i - the whole triangle of a piece cut at the view's edge has a corner "
-                         "behind the camera or off its projection (the corners' depths %.1f %.1f %.1f): the piece drawn as "
-                         "the engine cut it", D.FrameNo, Sample(C[0]).Point.Z, Sample(C[1]).Point.Z, Sample(C[2]).Point.Z);
+                         "before the near plane or beyond the draw's reach (the corners' depths %.1f %.1f %.1f): the piece "
+                         "drawn as the engine cut it", D.FrameNo, Sample(C[0]).Point.Z, Sample(C[1]).Point.Z,
+                         Sample(C[2]).Point.Z);
             }
             return 0;
         }
@@ -33719,10 +37122,18 @@ static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, IN
                 (&Whole[c].Light.X)[n] = Corner[c][2 + n];
                 (&Whole[c].Fog.X)[n]   = Corner[c][6 + n];
             }
+            const FLOAT SeenX = D.CentreX - OffX + Whole[c].Point.X * D.Focal / Whole[c].Point.Z;
+            const FLOAT SeenY = D.CentreY - OffY + Whole[c].Point.Y * D.Focal / Whole[c].Point.Z;
+            if (!(Abs(SeenX - Whole[c].ScreenX) <= 1.0f && Abs(SeenY - Whole[c].ScreenY) <= 1.0f))
+            {
+                Whole[c].ScreenX = SeenX;
+                Whole[c].ScreenY = SeenY;
+            }
         }
         Face = F;
         return 1;
     }
+    GRoundCutWhy = TEXT("no face of the model holds the corners, or their values");
     return 0;
 }
 
@@ -33731,6 +37142,7 @@ static UBOOL RoundCutFace(const FSceneNode* Frame, FTransTexture* const* Pts, IN
 // model was known (RoundRelease), or flat; and those that could not be held.
 static INT GRoundCut = 0, GRoundCutMissed = 0, GRoundCutUnknown = 0, GRoundHeldRound = 0, GRoundHeldFlat = 0;
 static INT GRoundHeldRefused = 0;
+static INT GRoundCutStale    = 0;   // polygons at the live draw's samples that were the next model's (RoundPolygon)
 
 // The counts a flat polygon's reason is told by, in the order of the measurement's (GRoundTrace) reasons.
 static void RoundTraceCounts(INT* C)
@@ -33744,6 +37156,153 @@ static void RoundTraceCounts(INT* C)
     C[6] = GRoundCutMissed;
 }
 
+// A piece the engine cut at the view's edge out of a model not known yet, the draw known from the piece itself while its
+// samples are the engine's of now: a model near the eye whose every triangle in view reaches past the view's edge (a
+// big box close by) comes as such pieces only, and with no whole triangle it would never be known. The piece's own
+// corners - inside the view; the cut's new corners lie on its edge - are samples of the draw: each model near the first
+// of them asked with each of its vertices put there (or, with two own corners, only the pairs of its faces' corners as
+// many samples apart; with one, only a model whose shape is made already), all the own corners of one face of the
+// model, and held against the same tests as a draw's first triangle (RoundFindDraw): the own corners' normals, the
+// samples', the kept edges' lengths. Into GRoundDraw (RoundKnown). False: not known.
+static INT GRoundPieceKnown = 0;   // draws known so since the log's last line
+static UBOOL RoundFindDrawFromPiece(const FSceneNode* Frame, FTransTexture* const* Pts, INT NumPts, INT FrameNo)
+{
+    static INT TriesFrame = -1, Tries = 0;
+    if (TriesFrame != FrameNo)
+    {
+        TriesFrame = FrameNo;
+        Tries      = 0;
+    }
+    if (Tries >= MeshPieceTries || NumPts > MAX_POLY_POINTS)
+        return 0;
+    const FTransTexture* Own[MAX_POLY_POINTS];
+    INT                  OwnCount = 0;
+    for (INT k = 0; k < NumPts; k++)
+    {
+        const FTransTexture& P = *Pts[k];
+        if (P.ScreenX >= 0.75f && P.ScreenY >= 0.75f && P.ScreenX <= Frame->FX - 0.25f && P.ScreenY <= Frame->FY - 0.25f)
+            Own[OwnCount++] = Pts[k];
+    }
+    if (OwnCount == 0)
+        return 0;
+    Tries++;
+    enum { NEAREST = ROUND_NEAREST };
+    AActor*        Near[NEAREST];
+    FLOAT          NearOff[NEAREST];
+    static FVector NearView[NEAREST];   // made once (an FVector array is made through calls into Core.dll)
+    FLOAT          NearReach[NEAREST];
+    INT            Within    = 0;
+    const INT      NearCount = RoundNearModels(Frame, Own[0]->Point, FrameNo, Near, NearOff, NearView, NearReach, Within);
+    const INT      Stride    = (INT)sizeof(FTransTexture);
+    for (INT n = 0; n < NearCount; n++)
+    {
+        FRoundModel* const R = RoundModelOf(Near[n]->Mesh);
+        if (!R || !R->Model)
+            continue;
+        // Every corner of the piece within the actor's reach (the draw's, RoundKnown): else the piece is not this
+        // actor's - another of the same kind stands by it, stacked on it - and under it could not be drawn whole.
+        const FLOAT ReachSq = (NearReach[n] * 1.25f + 16.0f) * (NearReach[n] * 1.25f + 16.0f);
+        UBOOL       bHeld   = 1;
+        for (INT k = 0; k < NumPts && bHeld; k++)
+            bHeld = (Pts[k]->Point - NearView[n]).SizeSquared() <= ReachSq;
+        if (!bHeld)
+            continue;
+        const RdxMeshRound::FModel& M       = *R->Model;
+        INT                         Guesses = 0;
+        // Vertex V0 put at the first own corner: every own corner a sample of the model, all of them corners of one of
+        // its faces, then the tests.
+        auto Try = [&](INT V0) -> UBOOL {
+            if (V0 < 0 || V0 >= M.Verts || (size_t)Own[0] < (size_t)V0 * (size_t)Stride || Guesses >= MeshPieceGuesses)
+                return 0;
+            const size_t Base = (size_t)Own[0] - (size_t)V0 * (size_t)Stride;
+            INT          V[MAX_POLY_POINTS];
+            for (INT k = 0; k < OwnCount; k++)
+            {
+                const size_t Off = (size_t)Own[k] - Base;
+                if ((size_t)Own[k] < Base || Off % (size_t)Stride || Off / (size_t)Stride >= (size_t)M.Verts)
+                    return 0;
+                V[k] = (INT)(Off / (size_t)Stride);
+            }
+            UBOOL bFace = 0;
+            for (INT j = M.VertStart[V[0]]; j < M.VertStart[V[0] + 1] && !bFace; j++)
+            {
+                const INT F = M.VertFaces[j];
+                bFace       = 1;
+                for (INT k = 1; k < OwnCount && bFace; k++)
+                    bFace = M.Corner[F * 3] == V[k] || M.Corner[F * 3 + 1] == V[k] || M.Corner[F * 3 + 2] == V[k];
+            }
+            if (!bFace)
+                return 0;
+            Guesses++;
+            GRoundGuesses++;
+            if (!RoundReadable(Base, (size_t)M.Verts * (size_t)Stride, FrameNo))
+                return 0;
+            const UBOOL bCorners = RoundReadsAgree([&]() -> UBOOL {
+                RdxMeshRound::FPose P;
+                P.Base   = (const char*)Base;
+                P.Stride = Stride;
+                for (INT k = 0; k < OwnCount; k++)
+                {
+                    const FLOAT X = Own[k]->Normal.X, Y = Own[k]->Normal.Y, Z = Own[k]->Normal.Z;
+                    const FLOAT L = RootOf(X * X + Y * Y + Z * Z);   // FVector::Size, laid in
+                    if (!(L > 0.5f && L < 2.0f))
+                        continue;
+                    const RdxMeshRound::FV N = M.PlainNormal(P, V[k]);
+                    if (Abs(N.X * X + N.Y * Y + N.Z * Z) < MeshCheckCos * L)
+                        return 0;
+                }
+                return 1;
+            });
+            if (!bCorners || !RoundReadsAgree([&]() -> UBOOL { return RoundSamplesAgree(M, Base, Stride); }) ||
+                !RoundReadsAgree([&]() -> UBOOL { return RoundLengthsAgree(*R, Base, Stride); }))
+            {
+                GRoundGuessesBad++;
+                return 0;
+            }
+            RoundKnown(Frame, FrameNo, R, Base, Stride, NearView[n], NearReach[n], Near[n]);
+            GRoundPieceKnown++;
+            // The measurement (GRoundTrace): the actor taken, and the others near the piece.
+            if (GRoundTrace && RoundTraceDue(Near[n], 3, FrameNo))
+            {
+                RDX_LOGF("round trace: frame %i, a piece of %i corners (%i of them in the view) made %s known (%.2f of "
+                         "its reach off), vertex %i at the first:", FrameNo, NumPts, OwnCount, Near[n]->GetName(),
+                         NearOff[n], V0);
+                for (INT m = 0; m < NearCount; m++)
+                    RDX_LOGF("round trace:   near: %s, %.2f of its reach off, the same model %i", Near[m]->GetName(),
+                             NearOff[m], (RoundModelOf(Near[m]->Mesh) == R) ? 1 : 0);
+            }
+            return 1;
+        };
+        if (OwnCount >= 2)
+        {
+            // The first two own corners are as many samples apart as a pair of one face's corners.
+            const INT64 Apart = ((INT64)(size_t)Own[1] - (INT64)(size_t)Own[0]);
+            if (Apart % Stride)
+                continue;
+            const INT D01 = (INT)(Apart / Stride);
+            for (INT f = 0; f < M.Faces && Guesses < MeshPieceGuesses; f++)
+                for (INT c = 0; c < 3; c++)
+                {
+                    const INT A = M.Corner[f * 3 + c], B = M.Corner[f * 3 + (c + 1) % 3];
+                    if ((B - A == D01 && Try(A)) || (A - B == D01 && Try(B)))
+                        return 1;
+                }
+        }
+        // One own corner is held against one normal, and on a model of repeated parts (a table's legs) the tests pass at
+        // a vertex of another part too - the first that passes may be the wrong one. Known so only a model whose kept
+        // edges hold every guess (RoundLengthsAgree): the pose a model's shape and those edges are made from is the
+        // first a draw of it is known in, and a wrong one stays the model's for the level, every right guess after it
+        // turned away at the edges' lengths and the model drawn flat.
+        else if (M.Verts <= MeshPieceVerts && R->CheckCount >= MESH_LENGTH_CHECKS / 2)
+        {
+            for (INT v = 0; v < M.Verts && Guesses < MeshPieceGuesses; v++)
+                if (Try(v))
+                    return 1;
+        }
+    }
+    return 0;
+}
+
 // A mesh polygon as a patch of its model: 1 - a triangle of the draw (RoundTriangle); 2 - a piece the engine cut out of
 // one, whose whole triangle is drawn in its place (RoundCutFace); 3 - a piece cut out of a model not known yet, to be
 // held back until its first whole triangle makes it known (RoundHold); 0 - drawn flat. Whole: the corners drawn, in the
@@ -33753,11 +37312,28 @@ static INT RoundPolygon(const FSceneNode* Frame, FTransTexture* const* Pts, INT 
                         INT FrameNo, FTransTexture* Whole, INT& Face)
 {
     RoundFrameStart(FrameNo);
-    const FRoundDraw& D     = GRoundDraw;
-    const UBOOL       bLive = D.bLive && D.Frame == Frame && D.FrameNo == FrameNo;
-    INT               Kept  = 0;
+    FRoundDraw& D     = GRoundDraw;
+    UBOOL       bLive = D.bLive && D.Frame == Frame && D.FrameNo == FrameNo;
+    INT         Kept  = 0;
+    // A corner at one of the live draw's samples that no longer holds what it held when the draw was known is the next
+    // model's (RoundTriangle's test): the engine hands it the memory the last one's samples had, a model of the same
+    // kind its samples at the very same places. Such a polygon is none of the live draw's - the draw is over, and the
+    // polygon's own is to be known: from its own corners where it is a piece (RoundFindDrawFromPiece).
     for (INT k = 0; k < NumPts && bLive; k++)
-        Kept += (RoundVertexOf(D, Pts[k]) >= 0) ? 1 : 0;
+    {
+        const INT J = RoundVertexOf(D, Pts[k]);
+        if (J < 0)
+            continue;
+        if (GRoundSnapOk && !(Pts[k]->Point == GRoundSnap[J]))
+        {
+            D.bLive = 0;
+            bLive   = 0;
+            Kept    = 0;
+            GRoundCutStale++;
+        }
+        else
+            Kept++;
+    }
     // Cut: more corners than a triangle has, some of the draw's samples among others, or none of them with a corner on
     // the view's edge.
     const UBOOL bCut = NumPts != 3 || (Kept > 0 && Kept < 3) || (Kept == 0 && RoundLooksCut(Frame, Pts, NumPts));
@@ -33771,11 +37347,60 @@ static INT RoundPolygon(const FSceneNode* Frame, FTransTexture* const* Pts, INT 
         if (Kept > 0)
         {
             GRoundCutMissed++;
+            // The measurement (GRoundTrace): a piece of the live draw not drawn as its whole triangle - the draw, and
+            // each corner's depth, its place off the draw's projection and off the draw's place.
+            if (GRoundTrace && RoundTraceDue(D.Actor, 1, FrameNo))
+            {
+                RDX_LOGF("round trace: frame %i, a cut piece of the live draw of %s not drawn whole: flat %i, bevel %i, "
+                         "reach %.1f; %s (corner %i)", FrameNo, D.Actor ? D.Actor->GetName() : TEXT("?"),
+                         D.bFlat ? 1 : 0, D.Bevel ? 1 : 0, D.Reach, GRoundCutWhy, GRoundCutWhyCorner);
+                for (INT k = 0; k < NumPts; k++)
+                {
+                    const FTransTexture& P = *Pts[k];
+                    const FLOAT Z  = P.Point.Z;
+                    const FLOAT DX = (Z > 1e-3f) ? D.CentreX - OffX + P.Point.X * D.Focal / Z - P.ScreenX : 0.0f;
+                    const FLOAT DY = (Z > 1e-3f) ? D.CentreY - OffY + P.Point.Y * D.Focal / Z - P.ScreenY : 0.0f;
+                    RDX_LOGF("round trace:   corner %i: sample %i, depth %.2f, screen %.1f %.1f, off the projection %.2f "
+                             "%.2f, off the draw's place %.1f", k, RoundVertexOf(D, Pts[k]), Z, P.ScreenX, P.ScreenY, DX,
+                             DY, (P.Point - D.View).Size());
+                }
+            }
             return 0;
         }
         // None of its corners is the live draw's: a piece of a model not known yet. Not tried as a triangle of a draw -
         // a piece's new corners are no samples, so it would not be known, and its failure would be taken for its
         // model's: every triangle after it that shares a corner with it drawn flat unasked, the whole model square.
+        // Its draw known from its own corners where it can be (RoundFindDrawFromPiece), while the samples are this
+        // draw's - by the time the held pieces are drawn the engine has handed them to the next model.
+        if (RoundFindDrawFromPiece(Frame, Pts, NumPts, FrameNo))
+        {
+            RoundDrawMade(Frame, Pts, OffX, OffY);
+            if (RoundCutFace(Frame, Pts, NumPts, OffX, OffY, Whole, Face))
+            {
+                GRoundCut++;
+                return 2;
+            }
+            // The measurement (GRoundTrace): why a piece whose draw it made known was not drawn as its whole triangle -
+            // the draw's state, and each corner's depth, its place off the draw's projection and off the draw's place.
+            const FRoundDraw& K = GRoundDraw;
+            if (GRoundTrace && RoundTraceDue(K.Actor, 2, FrameNo))
+            {
+                RDX_LOGF("round trace: frame %i, a piece made %s known but not drawn whole: flat %i, bevel %i, focal %.1f "
+                         "(the frame's %.1f), reach %.1f; %s (corner %i)", FrameNo,
+                         K.Actor ? K.Actor->GetName() : TEXT("?"), K.bFlat ? 1 : 0, K.Bevel ? 1 : 0, K.Focal,
+                         Frame->Proj.Z, K.Reach, GRoundCutWhy, GRoundCutWhyCorner);
+                for (INT k = 0; k < NumPts; k++)
+                {
+                    const FTransTexture& P = *Pts[k];
+                    const FLOAT Z  = P.Point.Z;
+                    const FLOAT DX = (Z > 1e-3f) ? K.CentreX - OffX + P.Point.X * K.Focal / Z - P.ScreenX : 0.0f;
+                    const FLOAT DY = (Z > 1e-3f) ? K.CentreY - OffY + P.Point.Y * K.Focal / Z - P.ScreenY : 0.0f;
+                    RDX_LOGF("round trace:   corner %i: sample %i, depth %.2f, screen %.1f %.1f, off the projection %.2f %.2f, "
+                             "off the draw's place %.1f", k, RoundVertexOf(K, Pts[k]), Z, P.ScreenX, P.ScreenY, DX, DY,
+                             (P.Point - K.View).Size());
+                }
+            }
+        }
         GRoundCutUnknown++;
         return 3;
     }
@@ -33829,6 +37454,684 @@ static UBOOL RoundEdgeRef(FBackend& Backend, FRoundModel& R, INT F, INT c, FLOAT
     Ref   = (FLOAT)(R.EdgeNo[E] * 2 + (bBack ? 1 : 0));
     Size  = R.EdgeSize[E];
     Least = R.EdgeRoom[E];
+    return 1;
+}
+
+// A model's bevel is made with the frame's other asks at its end within this much time - at least one a frame.
+static const DOUBLE MeshBevelFrameSeconds = 0.004;
+// A model whose bevel could not be made for a reason that may pass is asked for again this many frames on.
+static const INT MeshBevelAgainFrames = 30;
+// A model whose faces hold less than this share of its box is not shut: no outside to bevel.
+static const double MeshBevelShut = 0.01;
+// A piece's corner this near one of its face's corners (the square, units) and not moved is that corner.
+static const double MeshBevelSameSq = 1e-6;
+// A model's bevel no draw took for this many frames is let go (half a minute at sixty a second).
+static const INT MeshBevelKeepFrames = 1800;
+
+// Model M's fine bevel for draw D in the view Frame: the one made, else none - asked for at the frame's end where there
+// is none at the spherifier's level now (MeshBevelsMake), and again where none could be made then for a reason that may
+// pass. Null where none is drawn.
+static FMeshBevel* MeshBevelOf(FRoundModel& M, const FRoundDraw& D, const FSceneNode* Frame)
+{
+    FMeshBevel* const E = M.Bevel;
+    if (E && E->Level == GRunSpherifier && (E->bOn || !E->Again || D.FrameNo < E->Again))
+    {
+        if (!E->bOn)
+            return nullptr;
+        E->Used = D.FrameNo;
+        return E;
+    }
+    if (!D.Actor || GMeshBevelAskCount >= MESH_BEVEL_ASKS)
+        return nullptr;
+    const INT Index = (INT)(&M - GRoundModels);
+    for (INT i = 0; i < GMeshBevelAskCount; i++)
+        if (GMeshBevelAsks[i].Model == Index && GMeshBevelAsks[i].Mesh == M.Mesh)
+            return nullptr;
+    FMeshBevelAsk& A = GMeshBevelAsks[GMeshBevelAskCount++];
+    A.Model   = Index;
+    A.Mesh    = M.Mesh;
+    A.Actor   = D.Actor;
+    A.Mirror  = Frame->Mirror;
+    A.FrameNo = D.FrameNo;
+    memcpy(A.Coords, &Frame->Coords, sizeof(FCoords));
+    return nullptr;
+}
+
+// A list's block handed from one list to another, the first left empty.
+template <class T> static void MeshBevelTake(RdxSphere::TList<T>& To, RdxSphere::TList<T>& From)
+{
+    To.Free();
+    To.Data   = From.Data;
+    To.Num    = From.Num;
+    To.Room   = From.Room;
+    From.Data = nullptr;
+    From.Num = From.Room = 0;
+}
+
+// Model M's fine bevel made: its actor's pose read off the engine whole, in the view Coords (mirrored by Mirror) the draw
+// that asked was in - every vertex of the model, where a draw far off is made of fewer and the rest of its samples hold
+// another model's. Its faces go in as polygons going round their outward normals as the level's do (LevelRound.h): a
+// model whose faces go round the other way has them taken in the other way round, and one that holds next to nothing for
+// its box is not shut and has no outside to bevel. Each face the bevel cut keeps its pieces and its frame then, and the
+// places they use where they were and where they went.
+static void MeshBevelMake(FRoundModel& M, AActor* Actor, const FCoords& Coords, FLOAT Mirror, INT FrameNo)
+{
+    if (!M.Bevel)
+        M.Bevel = new FMeshBevel;
+    FMeshBevel& E = *M.Bevel;
+    E.Level  = GRunSpherifier;
+    E.Again  = 0;
+    E.Used   = FrameNo;
+    E.Mirror = Mirror;
+    E.bOn    = 0;
+    E.Slot.Free();
+    E.Faces.Free();
+    E.Corner.Free();
+    E.Orig.Free();
+    E.Moved.Free();
+    E.AtStamp.Free();
+    E.At.Free();
+    const DOUBLE                T0   = appSeconds();
+    const RdxMeshRound::FModel& Md   = *M.Model;
+    UMesh* const                Mesh = Actor->Mesh;
+    ULodMesh* const             L    = Cast<ULodMesh>(Mesh);
+    const INT                   Want = L ? L->ModelVerts + L->SpecialVerts : Mesh->FrameVerts;
+    const TCHAR*                Why  = nullptr;
+    // The pose: GetFrame writes a lod model's special vertices first and its own after them (PrepareCasterShape).
+    RdxSphere::TList<float> Buf;
+    INT                     First = 0, Count = 0;
+    if (Want < Md.Verts || Want > 65536 || !Buf.Resize((Want + 64) * 3))
+        Why = TEXT("its vertices not to be read");
+    else if (L)
+    {
+        INT Got = Want;
+        L->GetFrame((FVector*)Buf.Data, sizeof(FVector), Coords, Actor, Got);
+        First = L->SpecialVerts;
+        Count = Got;
+    }
+    else
+    {
+        Mesh->Tris.Load();
+        Mesh->GetFrame((FVector*)Buf.Data, sizeof(FVector), Coords, Actor);
+        Count = Mesh->FrameVerts;
+    }
+    RdxSphere::TList<RdxSphere::FV3> Rest;
+    if (!Why && (First < 0 || Count < Md.Verts || First + Md.Verts > Want + 64 || !Rest.ReserveExact(Md.Verts)))
+        Why = TEXT("its vertices not to be read");
+    if (!Why)
+    {
+        const FVector        Mid = Actor->Location.TransformPointBy(Coords);
+        const RdxSphere::FV3 At  = RdxSphere::V3(Mid.X, Mid.Y, Mid.Z);
+        const double         Far = (double)RoundReachOf(Actor) * 2.0 + 32.0;
+        const float* const   B   = Buf.Data + (size_t)First * 3;
+        for (INT v = 0; v < Md.Verts && !Why; v++)
+        {
+            const RdxSphere::FV3 P   = RdxSphere::V3(B[v * 3], B[v * 3 + 1], B[v * 3 + 2]);
+            const RdxSphere::FV3 Off = P - At;
+            if (!(RdxSphere::Dot(Off, Off) <= Far * Far))
+                Why = TEXT("a vertex out of its reach");
+            else
+                Rest.Add(P);
+        }
+        if (Why)
+            E.Again = FrameNo + MeshBevelAgainFrames;
+    }
+    Buf.Free();
+    // Which way round its faces go: what they hold about the middle of its box.
+    bool bTurn = false;
+    if (!Why)
+    {
+        RdxSphere::FV3 Lo = Rest[0], Hi = Rest[0];
+        for (INT v = 1; v < Rest.Num; v++)
+        {
+            const RdxSphere::FV3& P = Rest[v];
+            Lo = RdxSphere::V3(P.X < Lo.X ? P.X : Lo.X, P.Y < Lo.Y ? P.Y : Lo.Y, P.Z < Lo.Z ? P.Z : Lo.Z);
+            Hi = RdxSphere::V3(P.X > Hi.X ? P.X : Hi.X, P.Y > Hi.Y ? P.Y : Hi.Y, P.Z > Hi.Z ? P.Z : Hi.Z);
+        }
+        const RdxSphere::FV3 O   = (Lo + Hi) * 0.5;
+        double               Vol = 0.0;
+        for (INT f = 0; f < Md.Faces; f++)
+            if (M.Round[f])
+            {
+                const RdxSphere::FV3 A = Rest[Md.Corner[f * 3]] - O, B = Rest[Md.Corner[f * 3 + 1]] - O;
+                const RdxSphere::FV3 C = Rest[Md.Corner[f * 3 + 2]] - O;
+                Vol += RdxSphere::Dot(A, RdxSphere::Cross(B, C)) / 6.0;
+            }
+        if (!(fabs(Vol) > MeshBevelShut * (Hi.X - Lo.X) * (Hi.Y - Lo.Y) * (Hi.Z - Lo.Z)))
+            Why = TEXT("not shut");
+        bTurn = Vol < 0.0;
+    }
+    // Its faces as polygons: the corners going round the outward normal - one drawn from both sides a sheet, as the
+    // level's are (Spherify.h's UseFor), which the bevel does not cut. But where every face it rounds is drawn from both
+    // sides and none is seen through - masked, see-through or multiplying -, the material is - a crate's -, not a thin
+    // part of it: shut as it is, it is a solid, and its faces walls. A cage's bars are drawn from both sides to show the
+    // far ones through the near: those stay sheets. A curved model's are rounded at no angle: the card bends them
+    // (DSMesh), and its pieces with them (MeshBevelPatchesOut) - the rounding here only rings them for the bevel.
+    const UBOOL                          bCurved = M.bCurved && M.Shape;
+    RdxSphere::TList<RdxSphere::FV3>     In;
+    RdxSphere::TList<RdxSphere::FPolyIn> Polys;
+    auto                                 FlagsOf = [&](INT f) -> DWORD {
+        if (L)
+        {
+            const INT Mat = (f < L->Faces.Num()) ? L->Faces(f).MaterialIndex : -1;
+            return (Mat >= 0 && Mat < L->Materials.Num()) ? L->Materials(Mat).PolyFlags : 0;
+        }
+        return (f < Mesh->Tris.Num()) ? Mesh->Tris(f).PolyFlags : 0;
+    };
+    // The faces it rounds, of them those drawn from both sides, and those seen through.
+    INT TwoSided = 0, Rounds = 0, SeenThrough = 0;
+    for (INT f = 0; f < Md.Faces && !Why; f++)
+        if (M.Round[f])
+        {
+            const DWORD Flags = FlagsOf(f);
+            Rounds++;
+            TwoSided += (Flags & PF_TwoSided) ? 1 : 0;
+            SeenThrough += (Flags & (PF_Masked | PF_Translucent | PF_Modulated)) ? 1 : 0;
+        }
+    const UBOOL bSheets = TwoSided < Rounds || SeenThrough > 0;
+    INT         Sheets  = 0;   // faces taken for sheets, which the bevel does not cut
+    if (!Why && (!In.ReserveExact(Md.Faces * 3) || !Polys.ReserveExact(Md.Faces)))
+        Why = TEXT("no memory");
+    for (INT f = 0; f < Md.Faces && !Why; f++)
+    {
+        RdxSphere::FPolyIn P;
+        P.First = In.Num;
+        P.Count = 3;
+        for (INT k = 0; k < 3; k++)
+            In.Add(Rest[Md.Corner[f * 3 + (bTurn ? (3 - k) % 3 : k)]]);
+        const RdxSphere::FV3 N   = RdxSphere::Cross(In[P.First + 1] - In[P.First], In[P.First + 2] - In[P.First]);
+        const double         Len = RdxSphere::Length(N);
+        const DWORD          Flags = FlagsOf(f);
+        P.Use = (M.Round[f] && Len > 1e-9)
+                    ? (RdxSphere::Use_Wall | ((bSheets && (Flags & PF_TwoSided)) ? RdxSphere::Use_Sheet : 0))
+                    : 0;
+        Sheets += (P.Use & RdxSphere::Use_Sheet) ? 1 : 0;
+        P.Nx  = (Len > 0.0) ? N.X / Len : 0.0;
+        P.Ny  = (Len > 0.0) ? N.Y / Len : 0.0;
+        P.Nz  = (Len > 0.0) ? N.Z / Len : 0.0;
+        P.W   = P.Nx * In[P.First].X + P.Ny * In[P.First].Y + P.Nz * In[P.First].Z;
+        Polys.Add(P);
+    }
+    RdxSphere::FResult         R;
+    RdxLevelRound::FBevelStats Edges;
+    RdxLevelRound::FBevelMade  Made;
+    if (!Why)
+    {
+        INT Walls = 0;
+        for (INT f = 0; f < Polys.Num; f++)
+            Walls += (Polys[f].Use & RdxSphere::Use_Wall) ? 1 : 0;
+        if (Walls == 0)
+            Why = TEXT("no face of it drawn rounded");
+    }
+    if (!Why)
+    {
+        R.Workers = 1;
+        R.Sag     = RdxMath::SpherifierSagOf(GRunSpherifier);
+        R.Seconds = nullptr;
+        if (!RdxLevelRound::Round(In.Data, In.Num, Polys.Data, Polys.Num, (double)SpherifierCap(),
+                                  bCurved ? 180.0 : (double)GSpherifierAngle, R))
+            Why = TEXT("no memory for its rounding");
+        else
+        {
+            E.Rounded = R.Orig.Num;
+            if (!RdxLevelRound::Bevel(In.Data, In.Num, Polys.Data, Polys.Num, nullptr, nullptr, 0,
+                                      (double)GSpherifierAngle, SphereBevelRadius, R, Edges, Made))
+                Why = TEXT("no memory for its bevel");
+            else if (Made.Polygons <= 0)
+                Why = TEXT("no edge of it bevelled");
+        }
+    }
+    In.Free();
+    // Each face with pieces: its frame then, in its own order (the engine's), and its pieces' corners in that order.
+    INT Cut = 0, Pieces = 0;
+    if (!Why && !E.Slot.Resize(Md.Faces))
+        Why = TEXT("no memory");
+    for (INT f = 0; f < Md.Faces && !Why; f++)
+    {
+        E.Slot[f] = -1;
+        if (!Polys[f].Use || f >= R.PolyTris.Num || R.PolyTris[f] <= 0)
+            continue;
+        const RdxSphere::FV3 R0  = Rest[Md.Corner[f * 3]];
+        const RdxSphere::FV3 E1  = Rest[Md.Corner[f * 3 + 1]] - R0, E2 = Rest[Md.Corner[f * 3 + 2]] - R0;
+        const RdxSphere::FV3 X   = RdxSphere::Cross(E1, E2);
+        const double         Lr  = RdxSphere::Length(X);
+        const double         G11 = RdxSphere::Dot(E1, E1), G12 = RdxSphere::Dot(E1, E2), G22 = RdxSphere::Dot(E2, E2);
+        const double         Det = G11 * G22 - G12 * G12;
+        if (!(Lr > 1e-9) || !(Det > 0.0))
+            continue;
+        const RdxSphere::FV3 D1 = (E1 * G22 - E2 * G12) * (1.0 / Det), D2 = (E2 * G11 - E1 * G12) * (1.0 / Det);
+        const RdxSphere::FV3 Nu = X * (1.0 / Lr);
+        FMeshBevelFace       Fc;
+        Fc.First = E.Corner.Num;
+        Fc.Count = R.PolyTris[f];
+        const RdxSphere::FV3 Rows[4] = { R0, D1, D2, Nu };
+        double* const        Into[4] = { Fc.R0, Fc.D1, Fc.D2, Fc.N };
+        for (INT r = 0; r < 4; r++)
+        {
+            Into[r][0] = Rows[r].X;
+            Into[r][1] = Rows[r].Y;
+            Into[r][2] = Rows[r].Z;
+        }
+        Fc.S = sqrt(Lr);
+        for (INT t = R.PolyFirst[f]; t < R.PolyFirst[f] + R.PolyTris[f] && !Why; t++)
+            for (INT c = 0; c < 3 && !Why; c++)
+            {
+                const INT            p    = R.Tri[t * 3 + (bTurn ? (3 - c) % 3 : c)];
+                const RdxSphere::FV3 Went = R.Moved[p] - R.Orig[p];
+                INT                  Code = 3;
+                if (Went.X == 0.0 && Went.Y == 0.0 && Went.Z == 0.0)
+                    for (INT k = 0; k < 3 && Code == 3; k++)
+                    {
+                        const RdxSphere::FV3 Gap = R.Orig[p] - Rest[Md.Corner[f * 3 + k]];
+                        if (RdxSphere::Dot(Gap, Gap) <= MeshBevelSameSq)
+                            Code = k;
+                    }
+                if (!E.Corner.Add(p * 4 + Code))
+                    Why = TEXT("no memory");
+            }
+        E.Slot[f] = E.Faces.Num;
+        if (!E.Faces.Add(Fc))
+            Why = TEXT("no memory");
+        Cut++;
+        Pieces += Fc.Count;
+    }
+    // The places, handed over from the rounding: kept as long as the model is known.
+    if (!Why)
+    {
+        MeshBevelTake(E.Orig, R.Orig);
+        MeshBevelTake(E.Moved, R.Moved);
+        const INT Places = E.Orig.Num;
+        if (!E.AtStamp.ReserveExact(Places) || !E.At.ReserveExact(Places * 5))
+            Why = TEXT("no memory");
+        else
+        {
+            E.AtStamp.Num = Places;
+            E.At.Num      = Places * 5;
+            for (INT w = 0; w < Places; w++)
+                E.AtStamp[w] = 0;
+        }
+        E.Slot.Shrink();
+        E.Faces.Shrink();
+        E.Corner.Shrink();
+    }
+    E.bOn = !Why && E.Faces.Num > 0;
+    if (!E.bOn)
+    {
+        E.Slot.Free();
+        E.Faces.Free();
+        E.Corner.Free();
+        E.Orig.Free();
+        E.Moved.Free();
+        E.AtStamp.Free();
+        E.At.Free();
+    }
+    const double Ms = (appSeconds() - T0) * 1000.0;
+    if (GMeshBevelsSaid < 24)
+    {
+        GMeshBevelsSaid++;
+        if (E.bOn)
+        {
+            const double Bytes = (double)E.Slot.Room * sizeof(int) + (double)E.Faces.Room * sizeof(FMeshBevelFace) +
+                                 (double)E.Corner.Room * sizeof(int) +
+                                 (double)(E.Orig.Room + E.Moved.Room) * sizeof(RdxSphere::FV3) +
+                                 (double)E.AtStamp.Room * sizeof(unsigned int) + (double)E.At.Room * sizeof(float);
+            RDX_LOGF("models bevelled: %s - %i of its %i faces cut into %i pieces over %i places (%i hard edges), %.1f KB, "
+                     "%.2f ms", Mesh->GetName(), Cut, Md.Faces, Pieces, E.Orig.Num, Edges.Edges, Bytes / 1024.0, Ms);
+        }
+        else
+            RDX_LOGF("models bevelled: %s - none: %s%s (%.2f ms; %i faces, %i of them taken for sheets; %i hard sides, "
+                     "%i edges; left sharp: a free end %i, thin %i, touching %i, no worn solid %i)",
+                     Mesh->GetName(), Why ? Why : TEXT("no face cut"), E.Again ? TEXT(", asked for again later") : TEXT(""),
+                     Ms, Md.Faces, Sheets, Edges.Sides, Edges.Edges, Edges.LeftFree, Edges.LeftThin, Made.LeftTouching,
+                     Made.LeftWorn);
+    }
+}
+
+// The bevels the frame's draws asked for, made at its end (URevisionRenderDevice::Unlock): out of every draw, where the
+// engine's own frame of a model's vertices may be asked for. A few milliseconds' worth a frame; those left are asked for
+// again by their next draws. And now and then, the bevels of the models no draw took for a while let go: what is not
+// seen is not kept, and one seen again is made again.
+static void MeshBevelsMake(INT FrameNo)
+{
+    if ((FrameNo & 63) == 0)
+        for (INT i = 0; i < GRoundModelCount; i++)
+        {
+            FMeshBevel* const E = GRoundModels[i].Bevel;
+            if (!E || !E->bOn || FrameNo - E->Used <= MeshBevelKeepFrames)
+                continue;
+            E->bOn   = 0;
+            E->Level = -1;
+            E->Slot.Free();
+            E->Faces.Free();
+            E->Corner.Free();
+            E->Orig.Free();
+            E->Moved.Free();
+            E->AtStamp.Free();
+            E->At.Free();
+        }
+    const DOUBLE T0 = appSeconds();
+    for (INT i = 0; i < GMeshBevelAskCount; i++)
+    {
+        if (i > 0 && appSeconds() - T0 > MeshBevelFrameSeconds)
+            break;
+        const FMeshBevelAsk& A = GMeshBevelAsks[i];
+        if (A.Model < 0 || A.Model >= GRoundModelCount)
+            continue;
+        FRoundModel&            M = GRoundModels[A.Model];
+        const FMeshBevel* const E = M.Bevel;
+        if (M.Mesh != A.Mesh || !M.Model || !M.Shape || !M.Round ||
+            (E && E->Level == GRunSpherifier && (E->bOn || !E->Again || A.FrameNo < E->Again)))
+            continue;
+        AActor* const Actor = A.Actor;
+        if (!Actor || Actor->bDeleteMe || Actor->Mesh != A.Mesh)
+            continue;
+        FCoords Coords;
+        memcpy(&Coords, A.Coords, sizeof(FCoords));
+        MeshBevelMake(M, Actor, Coords, A.Mirror, A.FrameNo);
+    }
+    GMeshBevelAskCount = 0;
+}
+
+// What became of the faces of models drawn with their fine bevel since the log's last line: drawn as their pieces, the
+// pieces, and those left as the engine hands them over (a piece's corner behind the eye, or no room in the frame).
+static INT GRoundBevelFaces = 0, GRoundBevelPieces = 0, GRoundBevelLeft = 0;
+
+// Face F of the live draw's model, its corners in Whole in the face's own order, as its fine bevel's pieces in its place
+// (FMeshBevel): each piece's corner that stayed one of the face's is that corner as the engine hands it over, every other
+// one the place's share of the face now plus its move, laid along the face's edges and normal now as it lay along them
+// then - its normal turned the other way where the view is mirrored against the one the bevel was made in. Its texture's
+// places and colours are the face's in the shares of its place then. Wind: the polygon the engine handed over, for the
+// winding's count. 1 drawn; 0 a face the bevel left whole; -1 left as the engine hands it over.
+static INT MeshBevelOut(FBackend& Backend, const FSceneNode* Frame, const FTransTexture* Whole, INT F, INT Srv,
+                        EBlendMode Mode, UBOOL bNoSmooth, FLOAT InvU, FLOAT InvV, FLOAT Boost,
+                        FTransTexture* const* Wind, FLOAT OffX, FLOAT OffY)
+{
+    const FRoundDraw& D = GRoundDraw;
+    FMeshBevel* const B = D.Bevel;
+    if (!B || F < 0 || F >= B->Slot.Num || B->Slot[F] < 0)
+        return 0;
+    const FMeshBevelFace& Fc    = B->Faces[B->Slot[F]];
+    const double          C0[3] = { Whole[0].Point.X, Whole[0].Point.Y, Whole[0].Point.Z };
+    const double          E1[3] = { Whole[1].Point.X - C0[0], Whole[1].Point.Y - C0[1], Whole[1].Point.Z - C0[2] };
+    const double          E2[3] = { Whole[2].Point.X - C0[0], Whole[2].Point.Y - C0[1], Whole[2].Point.Z - C0[2] };
+    const double          X[3]  = { E1[1] * E2[2] - E1[2] * E2[1], E1[2] * E2[0] - E1[0] * E2[2],
+                                    E1[0] * E2[1] - E1[1] * E2[0] };
+    const double          L     = sqrt(X[0] * X[0] + X[1] * X[1] + X[2] * X[2]);
+    if (!(L > 0.0))
+    {
+        GRoundBevelLeft++;
+        return -1;
+    }
+    const double Sc    = (((Frame->Mirror < 0.0f) != (B->Mirror < 0.0f)) ? -1.0 : 1.0) / sqrt(L);
+    const double Nc[3] = { X[0] * Sc, X[1] * Sc, X[2] * Sc };
+    // The places worked out first, once a draw: a corner behind the eye leaves the face to the engine.
+    const INT End = Fc.First + Fc.Count * 3;
+    for (INT i = Fc.First; i < End; i++)
+    {
+        const INT Code = B->Corner[i];
+        if ((Code & 3) != 3)
+            continue;
+        const INT p = Code >> 2;
+        if (B->AtStamp[p] == D.Stamp)
+            continue;
+        const RdxSphere::FV3& Mv   = B->Moved[p];
+        const double          Q[3] = { Mv.X - Fc.R0[0], Mv.Y - Fc.R0[1], Mv.Z - Fc.R0[2] };
+        const double          A    = Q[0] * Fc.D1[0] + Q[1] * Fc.D1[1] + Q[2] * Fc.D1[2];
+        const double          Bb   = Q[0] * Fc.D2[0] + Q[1] * Fc.D2[1] + Q[2] * Fc.D2[2];
+        const double          C    = (Q[0] * Fc.N[0] + Q[1] * Fc.N[1] + Q[2] * Fc.N[2]) / Fc.S;
+        float* const          At   = &B->At[p * 5];
+        for (INT k = 0; k < 3; k++)
+            At[k] = (float)(C0[k] + A * E1[k] + Bb * E2[k] + C * Nc[k]);
+        if (!(At[2] > 1e-3f))
+        {
+            GRoundBevelLeft++;
+            return -1;
+        }
+        At[3]         = D.CentreX + At[0] * D.Focal / At[2];
+        At[4]         = D.CentreY + At[1] * D.Focal / At[2];
+        B->AtStamp[p] = D.Stamp;
+    }
+    FSolidVertex* const V = Backend.BeginTriangles(Fc.Count, Srv, -1, Mode, bNoSmooth);
+    if (!V)
+    {
+        GRoundBevelLeft++;
+        return -1;
+    }
+    FLOAT Col[3][3], Tu[3], Tv[3];
+    for (INT k = 0; k < 3; k++)
+    {
+        Col[k][0] = RdxMath::GouraudLight(Whole[k].Light.X) * Boost;
+        Col[k][1] = RdxMath::GouraudLight(Whole[k].Light.Y) * Boost;
+        Col[k][2] = RdxMath::GouraudLight(Whole[k].Light.Z) * Boost;
+        Tu[k]     = Whole[k].U * InvU;
+        Tv[k]     = Whole[k].V * InvV;
+    }
+    for (INT i = 0; i < Fc.Count * 3; i++)
+    {
+        const INT    Code = B->Corner[Fc.First + i];
+        const INT    k    = Code & 3;
+        FSolidVertex O;
+        if (k < 3)
+            FillGouraudVertex(O, Whole[k], OffX, OffY, InvU, InvV, Boost);
+        else
+        {
+            const INT             p    = Code >> 2;
+            const RdxSphere::FV3& Or   = B->Orig[p];
+            const double          d[3] = { Or.X - Fc.R0[0], Or.Y - Fc.R0[1], Or.Z - Fc.R0[2] };
+            const double          S1   = d[0] * Fc.D1[0] + d[1] * Fc.D1[1] + d[2] * Fc.D1[2];
+            const double          S2   = d[0] * Fc.D2[0] + d[1] * Fc.D2[1] + d[2] * Fc.D2[2];
+            const double          S0   = 1.0 - S1 - S2;
+            const float* const    At   = &B->At[p * 5];
+            O.X     = At[3];
+            O.Y     = At[4];
+            O.Depth = RdxMath::DepthFromViewZ(At[2]);
+            O.U     = (FLOAT)(S0 * Tu[0] + S1 * Tu[1] + S2 * Tu[2]);
+            O.V     = (FLOAT)(S0 * Tv[0] + S1 * Tv[1] + S2 * Tv[2]);
+            O.LU    = 0.0f;
+            O.LV    = 0.0f;
+            O.R     = (FLOAT)(S0 * Col[0][0] + S1 * Col[1][0] + S2 * Col[2][0]);
+            O.G     = (FLOAT)(S0 * Col[0][1] + S1 * Col[1][1] + S2 * Col[2][1]);
+            O.B     = (FLOAT)(S0 * Col[0][2] + S1 * Col[1][2] + S2 * Col[2][2]);
+            O.A     = 1.0f;
+        }
+        V[i] = O;
+    }
+    NoteWinding(Frame, 1, Wind[0]->ScreenX + OffX, Wind[0]->ScreenY + OffY, Wind[1]->ScreenX + OffX,
+                Wind[1]->ScreenY + OffY, Wind[2]->ScreenX + OffX, Wind[2]->ScreenY + OffY);
+    GRoundBevelFaces++;
+    GRoundBevelPieces += Fc.Count;
+    return 1;
+}
+
+// Face F of the live draw's curved model, its corners in Whole in the face's own order, as its fine bevel's pieces in
+// its place, each a patch of the face's own (DSMesh): its corners where the flat face has the piece's (as MeshBevelOut
+// lays them, a face's own corner as the engine hands it over), each with where on the face it lies - its shares of the
+// face's corners, from where it lay on the face then - and the face's edges' records Ref and its polygon's Poly, so that
+// every point of a piece bows as the face does there. A piece's edge along one of the face's edges is cut as finely as
+// that edge's bow over its share of it asks (Size, Least), one inside the face as the face's most bow over its share;
+// both ends of a piece's edge read the same, and so does the piece on its other side. Its texture's places and colours
+// are the face's in the shares of its corners. Wind: the polygon the engine handed over, for the winding's count. 1
+// drawn; 0 a face the bevel left whole; -1 left as its own patch.
+static INT MeshBevelPatchesOut(FBackend& Backend, const FSceneNode* Frame, const FTransTexture* Whole, INT F, INT Srv,
+                               EBlendMode Mode, UBOOL bNoSmooth, FLOAT InvU, FLOAT InvV, FLOAT Boost, const FLOAT* Ref,
+                               const FLOAT* Size, const FLOAT* Least, FLOAT Poly, FTransTexture* const* Wind,
+                               FLOAT OffX, FLOAT OffY)
+{
+    const FRoundDraw& D = GRoundDraw;
+    FMeshBevel* const B = D.Bevel;
+    if (!B || F < 0 || F >= B->Slot.Num || B->Slot[F] < 0)
+        return 0;
+    const FMeshBevelFace& Fc    = B->Faces[B->Slot[F]];
+    const double          C0[3] = { Whole[0].Point.X, Whole[0].Point.Y, Whole[0].Point.Z };
+    const double          E1[3] = { Whole[1].Point.X - C0[0], Whole[1].Point.Y - C0[1], Whole[1].Point.Z - C0[2] };
+    const double          E2[3] = { Whole[2].Point.X - C0[0], Whole[2].Point.Y - C0[1], Whole[2].Point.Z - C0[2] };
+    const double          X[3]  = { E1[1] * E2[2] - E1[2] * E2[1], E1[2] * E2[0] - E1[0] * E2[2],
+                                    E1[0] * E2[1] - E1[1] * E2[0] };
+    const double          L     = sqrt(X[0] * X[0] + X[1] * X[1] + X[2] * X[2]);
+    if (!(L > 0.0))
+    {
+        GRoundBevelLeft++;
+        return -1;
+    }
+    const double Sc    = (((Frame->Mirror < 0.0f) != (B->Mirror < 0.0f)) ? -1.0 : 1.0) / sqrt(L);
+    const double Nc[3] = { X[0] * Sc, X[1] * Sc, X[2] * Sc };
+    // The places in the view, once a draw - as MeshBevelOut works them out. A patch is clipped where it goes behind the
+    // eye (DSMesh), so none is left for that.
+    const INT End = Fc.First + Fc.Count * 3;
+    for (INT i = Fc.First; i < End; i++)
+    {
+        const INT Code = B->Corner[i];
+        if ((Code & 3) != 3)
+            continue;
+        const INT p = Code >> 2;
+        if (B->AtStamp[p] == D.Stamp)
+            continue;
+        const RdxSphere::FV3& Mv   = B->Moved[p];
+        const double          Q[3] = { Mv.X - Fc.R0[0], Mv.Y - Fc.R0[1], Mv.Z - Fc.R0[2] };
+        const double          A    = Q[0] * Fc.D1[0] + Q[1] * Fc.D1[1] + Q[2] * Fc.D1[2];
+        const double          Bb   = Q[0] * Fc.D2[0] + Q[1] * Fc.D2[1] + Q[2] * Fc.D2[2];
+        const double          C    = (Q[0] * Fc.N[0] + Q[1] * Fc.N[1] + Q[2] * Fc.N[2]) / Fc.S;
+        float* const          At   = &B->At[p * 5];
+        for (INT k = 0; k < 3; k++)
+            At[k] = (float)(C0[k] + A * E1[k] + Bb * E2[k] + C * Nc[k]);
+        At[3]         = 0.0f;
+        At[4]         = 0.0f;
+        B->AtStamp[p] = D.Stamp;
+    }
+    // The face's record among the frame's edges, which its pieces' corners name in Ref (below nought: DSMesh): the face's
+    // own edges as Ref names them, and its corners in the view - where on the face a piece's point lay before the bevel
+    // moved it, for a flat polygon's move along its plane to be read there, as the faces beside it read their edges.
+    INT          FaceRecord = 0;
+    FLOAT* const Record     = Backend.MeshEdgeRoom(1, FaceRecord);
+    if (!Record)
+    {
+        GRoundBevelLeft++;
+        return -1;
+    }
+    Record[0] = Ref[0];
+    Record[1] = Ref[1];
+    Record[2] = Ref[2];
+    Record[3] = 0.0f;
+    for (INT k = 0; k < 3; k++)
+    {
+        Record[4 + k * 3]     = Whole[k].Point.X;
+        Record[4 + k * 3 + 1] = Whole[k].Point.Y;
+        Record[4 + k * 3 + 2] = Whole[k].Point.Z;
+    }
+    // A corner's Ref: the record's number plus one, below nought - and a quarter more where the patch bends the corner
+    // (DSMesh's MeshPieceBend): a place the bevel moved or made is drawn where the bevel put it, the patch's bend coming
+    // back over the pieces to the face's own places the bevel left; the band's thin pieces, bent as the face, turn over.
+    const FLOAT FaceRef = -(FLOAT)(FaceRecord + 1);
+    const FLOAT Sag = MeshSag * (RdxMath::SpherifierSagOf(GRunSpherifier) /
+                                 RdxMath::SpherifierSagOf(RdxMath::Spherifier_High));
+    Backend.SetMeshRun(Sag, D.Focal, D.CentreX, D.CentreY, (FLOAT)SpherifierCap(), MeshShape);
+    FSolidVertex* const V = Backend.BeginTriangles(Fc.Count, Srv, -1, Mode, bNoSmooth);
+    Backend.ClearMeshRun();
+    if (!V)
+    {
+        GRoundBevelLeft++;
+        return -1;
+    }
+    FLOAT Col[3][3], Tu[3], Tv[3];
+    for (INT k = 0; k < 3; k++)
+    {
+        Col[k][0] = RdxMath::GouraudLight(Whole[k].Light.X) * Boost;
+        Col[k][1] = RdxMath::GouraudLight(Whole[k].Light.Y) * Boost;
+        Col[k][2] = RdxMath::GouraudLight(Whole[k].Light.Z) * Boost;
+        Tu[k]     = Whole[k].U * InvU;
+        Tv[k]     = Whole[k].V * InvV;
+    }
+    // The face's most bow and least room, for a piece's edge inside it.
+    const FLOAT MostSize  = Max(Size[0], Max(Size[1], Size[2]));
+    const FLOAT LeastRoom = Min(Least[0], Min(Least[1], Least[2]));
+    for (INT t = 0; t < Fc.Count; t++)
+    {
+        // The piece's corners: where they lie in the view, and their shares of the face's corners.
+        double Share[3][3];
+        FLOAT  At3[3][3];
+        // And where the patch reads it (DSMesh): a place a little off the face - a neighbour's corner the rounding
+        // put on its side - held to the face, none of its shares below nought; read past the face, the patch's terms
+        // swing far, and the piece parts from the one beside it.
+        double Lam[3][3];
+        UBOOL  Bends[3];   // the bevel left the place where it was: the patch bends it (FaceRef)
+        for (INT c = 0; c < 3; c++)
+        {
+            const INT Code = B->Corner[Fc.First + t * 3 + c];
+            const INT k    = Code & 3;
+            Bends[c]       = 1;
+            if (k < 3)
+            {
+                for (INT j = 0; j < 3; j++)
+                    Share[c][j] = Lam[c][j] = (j == k) ? 1.0 : 0.0;
+                At3[c][0] = Whole[k].Point.X;
+                At3[c][1] = Whole[k].Point.Y;
+                At3[c][2] = Whole[k].Point.Z;
+                continue;
+            }
+            const INT             p    = Code >> 2;
+            const RdxSphere::FV3& Or   = B->Orig[p];
+            const RdxSphere::FV3& Mv   = B->Moved[p];
+            Bends[c]                   = p < B->Rounded && Mv.X == Or.X && Mv.Y == Or.Y && Mv.Z == Or.Z;
+            const double          d[3] = { Or.X - Fc.R0[0], Or.Y - Fc.R0[1], Or.Z - Fc.R0[2] };
+            Share[c][1]                = d[0] * Fc.D1[0] + d[1] * Fc.D1[1] + d[2] * Fc.D1[2];
+            Share[c][2]                = d[0] * Fc.D2[0] + d[1] * Fc.D2[1] + d[2] * Fc.D2[2];
+            Share[c][0]                = 1.0 - Share[c][1] - Share[c][2];
+            double Held = 0.0;
+            for (INT j = 0; j < 3; j++)
+            {
+                Lam[c][j] = (Share[c][j] > 0.0) ? Share[c][j] : 0.0;
+                Held += Lam[c][j];
+            }
+            for (INT j = 0; j < 3; j++)
+                Lam[c][j] = (Held > 0.0) ? Lam[c][j] / Held : Share[c][j];
+            const float* const At      = &B->At[p * 5];
+            At3[c][0]                  = At[0];
+            At3[c][1]                  = At[1];
+            At3[c][2]                  = At[2];
+        }
+        for (INT c = 0; c < 3; c++)
+        {
+            const INT c1 = (c + 1) % 3;
+            // The piece's edge from this corner to the next: on the face's edge across from a corner neither end has a
+            // share of - the face's edge e runs from its corner e to e + 1 -, its share of that edge the change of the
+            // share of the edge's far end along it; else inside the face, its share the most any share changes along it.
+            INT    OnEdge = -1;
+            double Part   = 0.0;
+            for (INT j = 0; j < 3 && OnEdge < 0; j++)
+                if (Share[c][j] <= 1e-6 && Share[c1][j] <= 1e-6)
+                    OnEdge = (j + 1) % 3;
+            if (OnEdge >= 0)
+                Part = fabs(Share[c1][(OnEdge + 1) % 3] - Share[c][(OnEdge + 1) % 3]);
+            else
+                for (INT j = 0; j < 3; j++)
+                    Part = Max(Part, fabs(Share[c1][j] - Share[c][j]));
+            const FLOAT  Bow  = (OnEdge >= 0) ? Size[OnEdge] : MostSize;
+            const FLOAT  Room = (OnEdge >= 0) ? Least[OnEdge] : LeastRoom;
+            FSolidVertex O;
+            O.X     = At3[c][0];
+            O.Y     = At3[c][1];
+            O.Depth = At3[c][2];
+            O.U     = (FLOAT)(Share[c][0] * Tu[0] + Share[c][1] * Tu[1] + Share[c][2] * Tu[2]);
+            O.V     = (FLOAT)(Share[c][0] * Tv[0] + Share[c][1] * Tv[1] + Share[c][2] * Tv[2]);
+            O.LU    = (FLOAT)Lam[c][0];
+            O.LV    = (FLOAT)Lam[c][1];
+            O.R     = (FLOAT)(Share[c][0] * Col[0][0] + Share[c][1] * Col[1][0] + Share[c][2] * Col[2][0]);
+            O.G     = (FLOAT)(Share[c][0] * Col[0][1] + Share[c][1] * Col[1][1] + Share[c][2] * Col[2][1]);
+            O.B     = (FLOAT)(Share[c][0] * Col[0][2] + Share[c][1] * Col[1][2] + Share[c][2] * Col[2][2]);
+            O.A     = 1.0f;
+            // The face's record, through which the patch reads the face's edges' curves at the point's shares (DSMesh);
+            // this piece's edge's bow and room over its share of it, for how finely it is cut (MeshCuts).
+            O.PX         = FaceRef - (Bends[c] ? 0.25f : 0.0f);
+            O.PY         = (FLOAT)(Bow * Part * Part);
+            O.PN         = (Part > 1e-6) ? Min(1.0f, (FLOAT)(Room / Part)) : 1.0f;
+            O.PD         = Poly;
+            V[t * 3 + c] = O;
+        }
+    }
+    NoteWinding(Frame, 1, Wind[0]->ScreenX + OffX, Wind[0]->ScreenY + OffY, Wind[1]->ScreenX + OffX,
+                Wind[1]->ScreenY + OffY, Wind[2]->ScreenX + OffX, Wind[2]->ScreenY + OffY);
+    GRoundBevelFaces++;
+    GRoundBevelPieces += Fc.Count;
     return 1;
 }
 
@@ -34119,7 +38422,11 @@ static UBOOL RoundedTriangleOut(FBackend& Backend, const FSceneNode* Frame, cons
                                 FLOAT OffX, FLOAT OffY)
 {
     const FRoundDraw& D = GRoundDraw;
-    Backend.SetMeshRun(MeshSag, D.Focal, D.CentreX, D.CentreY, (FLOAT)SpherifierCap(), MeshShape);
+    // The models' curves cut as finely as the spherifier's level asks: MeshSag at High, as many times more as its
+    // level's Sag is the High one's.
+    const FLOAT Sag = MeshSag * (RdxMath::SpherifierSagOf(GRunSpherifier) /
+                                 RdxMath::SpherifierSagOf(RdxMath::Spherifier_High));
+    Backend.SetMeshRun(Sag, D.Focal, D.CentreX, D.CentreY, (FLOAT)SpherifierCap(), MeshShape);
     FSolidVertex* const V = Backend.BeginTriangle(Srv, -1, Mode, bNoSmooth);
     Backend.ClearMeshRun();
     if (!V)
@@ -34132,8 +38439,9 @@ static UBOOL RoundedTriangleOut(FBackend& Backend, const FSceneNode* Frame, cons
         V[i].Depth = P.Point.Z;
         V[i].U     = P.U * InvU;
         V[i].V     = P.V * InvV;
-        V[i].LU    = 0.0f;
-        V[i].LV    = 0.0f;
+        // Where on the face it lies (DSMesh's Lam): the corner's own share one, the others' none.
+        V[i].LU    = (i == 0) ? 1.0f : 0.0f;
+        V[i].LV    = (i == 1) ? 1.0f : 0.0f;
         V[i].R     = RdxMath::GouraudLight(P.Light.X) * Boost;
         V[i].G     = RdxMath::GouraudLight(P.Light.Y) * Boost;
         V[i].B     = RdxMath::GouraudLight(P.Light.Z) * Boost;
@@ -34232,7 +38540,20 @@ static void RoundRelease(FBackend& Backend)
         Backend.SetSurfaceBeam(H.Beam);
         Backend.SetInMirror(H.bInMirror);
         UBOOL bDone = 0;
-        if (D.bLive && D.Frame == H.Frame && D.FrameNo == H.FrameNo && !D.bFlat)
+        // A model of flat parts with its fine bevel: the piece's whole face as the bevel's pieces (MeshBevelOut), as
+        // the draw's own pieces are drawn.
+        if (D.bLive && D.Frame == H.Frame && D.FrameNo == H.FrameNo && D.bFlat && D.Bevel)
+        {
+            FTransTexture* P[MAX_POLY_POINTS];
+            for (INT k = 0; k < H.NumPts; k++)
+                P[k] = (RoundVertexOf(D, H.Orig[k]) >= 0) ? H.Orig[k] : &C[k];
+            static FTransTexture Whole[3];
+            INT Face = -1;
+            if (RoundCutFace(H.Frame, P, H.NumPts, H.OffX, H.OffY, Whole, Face))
+                bDone = MeshBevelOut(Backend, H.Frame, Whole, Face, H.Srv, H.Mode, H.bNoSmooth, H.InvU, H.InvV, H.Boost,
+                                     P, H.OffX, H.OffY) > 0;
+        }
+        else if (D.bLive && D.Frame == H.Frame && D.FrameNo == H.FrameNo && !D.bFlat)
         {
             // The engine hands a cut piece's corners over as new points, the ones it kept of the triangle often among
             // them: a corner is the draw's own where it is one of its samples, else its copy - and the piece is the
@@ -34574,7 +38895,6 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
         }
     }
 
-
     const INT Srv = Backend.PrepareTexture(Info, PolyFlags,
                         RdxMath::SamplesAsColour(RdxMath::BlendFor((unsigned int)PolyFlags)));
     if (Srv < 0)
@@ -34761,11 +39081,13 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
     // The models rounded (Spherifier, RoundPolygon): a mesh triangle known by its model goes over as a patch, cut and
     // bowed out on the card - a solid one, a mask, glass - and so does the whole triangle the engine cut a polygon out
     // of at the view's edge, in the polygon's place. Not one the fog is laid over afterwards (its triangles are flat).
-    // A model of no curve (a decal's quad, the laser sight's spot) is drawn below as ever.
+    // A model of no curve (a decal's quad, the laser sight's spot) is drawn below as ever. Nor in a view narrower than
+    // the screen (SphereViewNarrow): the patch is the whole triangle, which nothing there cuts to the view's picture.
     UBOOL bAllPts = NumPts >= 3;
     for (INT i = 0; i < NumPts && bAllPts; i++)
         bAllPts = Pts[i] != nullptr;
-    if (bAllPts && SpherifierCap() > 0 && !WantsMeshFog(PolyFlags, Mode) && Backend.CanRoundMeshes(Mode))
+    if (bAllPts && SpherifierCap() > 0 && !WantsMeshFog(PolyFlags, Mode) && Backend.CanRoundMeshes(Mode) &&
+        !SphereViewNarrow(Frame))
     {
         // Timed one triangle in RoundTimeSample, its time counted that many times over: the clock itself, asked three
         // times a triangle, came to a good part of what it measured.
@@ -34807,10 +39129,26 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
             Backend.SetSurfaceBeam(CallBeam);
             Backend.SetInMirror(bInMirror);
         }
+        // A face of a model all of flat parts drawn with its fine bevel: its pieces in its place, else the engine's
+        // polygon as ever.
+        if (How && GRoundDraw.Bevel && GRoundDraw.bFlat)
+        {
+            if (MeshBevelOut(Backend, Frame, Whole, Face, Srv, Mode, bNoSmooth, InvU, InvV, Boost, Pts, OffX, OffY) > 0)
+                bRounded = 1;
+            How = 0;
+        }
         for (INT c = 0; c < 3 && How; c++)
             if (!RoundEdgeRef(Backend, *GRoundDraw.Model, Face, c, Ref[c], Size[c], Least[c]))
                 How = 0;
         const FLOAT Poly = How ? RoundPolyRef(Backend, *GRoundDraw.Model, Face) : 0.0f;
+        // A curved model's face with its fine bevel's pieces: each a patch of the face's own; else its patch.
+        if (How && GRoundDraw.Bevel &&
+            MeshBevelPatchesOut(Backend, Frame, Whole, Face, Srv, Mode, bNoSmooth, InvU, InvV, Boost, Ref, Size, Least,
+                                Poly, Pts, OffX, OffY) > 0)
+        {
+            bRounded = 1;
+            How      = 0;
+        }
         if (bTimed)
             GRoundTriSeconds += (appSeconds() - T0) * (DOUBLE)RoundTimeSample;
         if (How && RoundedTriangleOut(Backend, Frame, Whole, Srv, Mode, bNoSmooth, InvU, InvV, Boost, Ref, Size, Least,
@@ -34856,9 +39194,20 @@ void URevisionRenderDevice::DrawGouraudPolygon(FSceneNode* Frame, FTextureInfo& 
                          GRoundCutMissed, GRoundCutUnknown, GRoundHeldRound, GRoundHeldFlat, GRoundHeldRefused,
                          1000.0 * GRoundSeconds / (DOUBLE)Frames, 1000.0 * GRoundTriSeconds / (DOUBLE)Frames,
                          1000.0 * GRoundFindSeconds / (DOUBLE)Frames);
+            if (GRoundSaid >= 0 && Frames > 0 && (GRoundPieceKnown > 0 || GRoundCutStale > 0))
+                RDX_LOGF("models rounded: over the last %i frames, %i draws known from a piece cut at the view's edge "
+                         "(their first polygons all such pieces); %i polygons at the last draw's samples the next "
+                         "model's", Frames, GRoundPieceKnown, GRoundCutStale);
+            if (GRoundSaid >= 0 && Frames > 0 && (GRoundBevelFaces > 0 || GRoundBevelLeft > 0))
+                RDX_LOGF("models bevelled: over the last %i frames, %i faces of models drawn as their fine bevel's %i "
+                         "pieces (a curved model's each a patch of its face), %i left as the engine hands them over or as "
+                         "their whole patch (a piece's corner behind the eye, or no room)", Frames, GRoundBevelFaces,
+                         GRoundBevelPieces, GRoundBevelLeft);
+            GRoundBevelFaces = GRoundBevelPieces = GRoundBevelLeft = 0;
             GRoundSaid = FrameCounter;
             GRoundDone = GRoundDraws = GRoundFlatModel = GRoundNoActor = GRoundNoFace = GRoundGuesses = GRoundFits = 0;
             GRoundInsane = GRoundCut = GRoundCutMissed = GRoundCutUnknown = 0;
+            GRoundPieceKnown = GRoundCutStale = 0;
             GRoundHeldRound = GRoundHeldFlat = GRoundHeldRefused = 0;
             GRoundGuessesBad = GRoundSameFailed = GRoundNotFace = GRoundOffProjection = GRoundGaveUp = 0;
             GRoundSeconds = GRoundFindSeconds = GRoundTriSeconds = 0.0;
@@ -35552,8 +39901,11 @@ void URevisionRenderDevice::DrawTile(FSceneNode* Frame, FTextureInfo& Info,
     const UBOOL bWasSwitched = GHud.bSwitched;
     if (RdxMath::IsHudTile(Frame && Frame->Parent, Z))
     {
-        // The world is over: the plants hidden for it are shown again, before any view the HUD draws.
+        // The world is over: the plants hidden for it are shown again, before any view the HUD draws; the tufts whose
+        // ground stayed hidden drawn by their sheets, as the world's last.
         ShowLevelTrees(Backend, FrameCounter);
+        if (!GHud.bSwitched)
+            DrawTuftSheets(Backend, FrameCounter);
         if (!GHud.bSwitched && !GNoHudSwitch && Backend.BeginHud())
             GHud.bSwitched = 1;
     }

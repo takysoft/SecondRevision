@@ -37,6 +37,8 @@
 // For the process's memory use, logged at every level load. It belongs among the system headers: it has to be
 // compiled with the default packing, like the rest of them.
 #include <psapi.h>
+// The upload heap's buffers counted by part, for the same line - with the system headers, before the engine's.
+#include "UploadCensus.h"
 
 // UObject::operator delete is declared inline and can throw. That is the SDK's design,
 // not our bug, and it fires on every translation unit that includes Engine.h.

@@ -16,15 +16,48 @@ public:
     virtual UBOOL WriteCardBuffer(ID3D12Resource* Dest, UINT64 At, const void* Data, UINT64 Bytes) = 0;
 };
 
+// Whether such a block may be taken (set by the renderer at its start - RenderDevice.cpp's SphereRoomFor, the lists'
+// own): one that would leave the process too little of its address space for the engine is refused too. None: the
+// system's to give or not.
+typedef bool (*FRdxLargeRoomFor)(size_t Bytes);
+inline FRdxLargeRoomFor& RdxLargeRoomFor()
+{
+    static FRdxLargeRoomFor Asked = nullptr;
+    return Asked;
+}
+
 // A large block of the CPU's memory that may be refused (null), where the engine's allocator would end the game ("Ran
 // out of virtual memory"): a large rounded level's lists are tens of megabytes, each in one piece of the 32-bit address
 // space. Freed with RdxFreeLarge.
+// The bytes the large blocks hold at once, for the log's memory line at each level's load.
+inline volatile LONG64& RdxLargeBytesHeld()
+{
+    static volatile LONG64 Held = 0;
+    return Held;
+}
 inline void* RdxAllocLarge(SIZE_T Bytes)
 {
-    return Bytes ? ::VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : nullptr;
+    if (!Bytes || (RdxLargeRoomFor() && !RdxLargeRoomFor()((size_t)Bytes)))
+        return nullptr;
+    void* const Block = ::VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (Block)
+    {
+        // Counted as RdxFreeLarge takes it off: the whole pages the block holds, not the bytes asked for - else every
+        // block let go takes up to a page more off than it put on, and the count runs below nothing.
+        MEMORY_BASIC_INFORMATION Mbi;
+        const SIZE_T             Held = (::VirtualQuery(Block, &Mbi, sizeof(Mbi)) == sizeof(Mbi)) ? Mbi.RegionSize : Bytes;
+        ::InterlockedExchangeAdd64(&RdxLargeBytesHeld(), (LONG64)Held);
+    }
+    return Block;
 }
 inline void RdxFreeLarge(void* Block)
 {
-    if (Block)
-        ::VirtualFree(Block, 0, MEM_RELEASE);
+    if (!Block)
+        return;
+    MEMORY_BASIC_INFORMATION Mbi;
+    SIZE_T                   Bytes = 0;
+    if (::VirtualQuery(Block, &Mbi, sizeof(Mbi)) == sizeof(Mbi))
+        Bytes = Mbi.RegionSize;
+    ::VirtualFree(Block, 0, MEM_RELEASE);
+    ::InterlockedExchangeAdd64(&RdxLargeBytesHeld(), -(LONG64)Bytes);
 }
